@@ -74,6 +74,10 @@ Ao selecionar `q8_0`, o instalador gera `compose.ollama.yaml` com `OLLAMA_FLASH_
 
 No Linux, o instalador detecta GPUs com `nvidia-smi`, instala/configura o NVIDIA Container Toolkit quando necessário e gera `compose.gpu.yaml`. A GPU é reservada ao Ollama; o Docling permanece explicitamente em CPU.
 
+Quando o Docker usa `systemd` com cgroup v2, o instalador adiciona `native.cgroupdriver=cgroupfs` ao `/etc/docker/daemon.json`, preservando as opções existentes e criando um backup. Essa é a mitigação recomendada pela NVIDIA para impedir que containers percam acesso à GPU após reloads do systemd. Como a configuração é global ao Docker, o daemon é reiniciado durante a instalação.
+
+O override de GPU também substitui o healthcheck do Ollama: além de listar os modelos, ele exige que `nvidia-smi` responda dentro do container. Assim, uma perda de acesso à GPU deixa o serviço explicitamente `unhealthy`, em vez de permitir fallback silencioso para CPU.
+
 O `.env` mantém `COMPOSE_FILE` com `compose.yaml` e todos os overrides gerados. Assim, comandos comuns como `docker compose up -d`, inclusive os executados por automações de inicialização após um reboot, continuam aplicando a reserva NVIDIA e a quantização escolhida sem exigir uma nova instalação.
 
 Seleções usam UUID, não índice. Isso evita que mudanças na ordem das placas alterem a GPU escolhida.

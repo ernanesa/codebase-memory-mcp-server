@@ -446,6 +446,10 @@ install_host_ollama() {
 }
 
 configure_nvidia_runtime_command() {
+  local daemon_config='/etc/docker/daemon.json'
+  local daemon_config_backup='/etc/docker/daemon.json.codebase-memory-backup'
+  local daemon_config_candidate
+  local cgroup_driver cgroup_version
   [[ "$OLLAMA_GPU_MODE" != cpu ]] || return 0
   command -v nvidia-smi >/dev/null 2>&1 || fail 'A GPU foi habilitada, mas o driver NVIDIA não está disponível.'
   nvidia-smi -L >/dev/null || fail 'A GPU foi habilitada, mas o driver NVIDIA não respondeu.'
@@ -461,8 +465,35 @@ configure_nvidia_runtime_command() {
   fi
 
   sudo nvidia-ctk runtime configure --runtime=docker
-  sudo systemctl restart docker
+  cgroup_driver="$(sudo docker info --format '{{.CgroupDriver}}' 2>/dev/null || true)"
+  cgroup_version="$(sudo docker info --format '{{.CgroupVersion}}' 2>/dev/null || true)"
+  if [[ "$cgroup_driver" == systemd && "$cgroup_version" == 2 ]]; then
+    info 'Aplicando cgroupfs para evitar que containers NVIDIA percam acesso à GPU após reloads do systemd'
+    daemon_config_candidate="$(mktemp "${TMPDIR:-/tmp}/cbm-docker-daemon.XXXXXX")"
+    sudo test ! -f "$daemon_config" || sudo cat "$daemon_config" >"$daemon_config_candidate"
+    [[ -s "$daemon_config_candidate" ]] || printf '{}\n' >"$daemon_config_candidate"
+    jq '."exec-opts" = (((."exec-opts" // []) + ["native.cgroupdriver=cgroupfs"]) | unique)' \
+      "$daemon_config_candidate" >"${daemon_config_candidate}.merged"
+    mv "${daemon_config_candidate}.merged" "$daemon_config_candidate"
+    sudo dockerd --validate --config-file="$daemon_config_candidate" >/dev/null
+    sudo test ! -f "$daemon_config" || sudo cp "$daemon_config" "$daemon_config_backup"
+    sudo install -m 0644 "$daemon_config_candidate" "$daemon_config"
+    rm -f "$daemon_config_candidate"
+  fi
+
+  if ! sudo systemctl restart docker; then
+    if sudo test -f "$daemon_config_backup"; then
+      warn 'O Docker não reiniciou; restaurando a configuração anterior.'
+      sudo cp "$daemon_config_backup" "$daemon_config"
+      sudo systemctl restart docker
+    fi
+    fail 'Não foi possível reiniciar o Docker após configurar o runtime NVIDIA.'
+  fi
   sudo docker info >/dev/null
+  if [[ "$cgroup_driver" == systemd && "$cgroup_version" == 2 ]]; then
+    [[ "$(sudo docker info --format '{{.CgroupDriver}}')" == cgroupfs ]] || \
+      fail 'O Docker reiniciou, mas não adotou o cgroup driver cgroupfs.'
+  fi
 }
 
 ask_memory_budget() {
@@ -950,6 +981,12 @@ write_ollama_gpu_compose_override() {
       done
     fi
     printf '              capabilities: [gpu]\n'
+    printf '    healthcheck:\n'
+    printf '      test: ["CMD-SHELL", "nvidia-smi >/dev/null 2>&1 && ollama list >/dev/null 2>&1"]\n'
+    printf '      interval: 30s\n'
+    printf '      timeout: 10s\n'
+    printf '      retries: 3\n'
+    printf '      start_period: 30s\n'
   } >"$temporary_file"
   chmod 600 "$temporary_file"
   mv "$temporary_file" "$GPU_COMPOSE_FILE"

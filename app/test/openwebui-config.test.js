@@ -324,6 +324,10 @@ test('instalador sugere Gemma 4, fixa Ollama 0.32.1 e bootstrap usa o contrato a
   assert.match(install, /ask_ollama_gpu/);
   assert.match(install, /nvidia-smi --query-gpu=index,uuid,name,memory\.total/);
   assert.match(install, /nvidia-ctk runtime configure --runtime=docker/);
+  assert.match(install, /native\.cgroupdriver=cgroupfs/);
+  assert.match(install, /dockerd --validate --config-file=/);
+  assert.match(install, /CgroupDriver/);
+  assert.match(install, /CgroupVersion/);
   assert.match(install, /write_ollama_gpu_compose_override/);
   assert.match(install, /write_ollama_quantization_compose_override/);
   assert.match(install, /validate_ollama_gpu_command/);
@@ -591,6 +595,7 @@ fi
     const allGpusOverride = await readFile(path.join(temporaryRoot, 'compose.gpu.yaml'), 'utf8');
     assert.match(allGpusOverride, /count: all/);
     assert.doesNotMatch(allGpusOverride, /device_ids:/);
+    assert.match(allGpusOverride, /nvidia-smi >\/dev\/null 2>&1 && ollama list >\/dev\/null 2>&1/);
   } finally {
     await rm(temporaryRoot, { recursive: true, force: true });
   }
