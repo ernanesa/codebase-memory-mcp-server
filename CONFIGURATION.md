@@ -25,6 +25,7 @@ REPOSITORY_SYNC_CONCURRENCY=3
 OLLAMA_VERSION=0.32.1
 OLLAMA_CHAT_MODEL=gemma4:e2b
 OLLAMA_KV_CACHE_QUANTIZATION=fp16
+OLLAMA_KEEP_ALIVE=-1
 OLLAMA_RUNTIME=docker
 OLLAMA_BASE_URL=http://ollama:11434
 COMPOSE_FILE=/caminho/do/clone/compose.yaml:/caminho/do/clone/compose.gpu.yaml
@@ -55,6 +56,7 @@ RAG_TOP_K_RERANKER=8
 | `REPOSITORY_SYNC_CONCURRENCY` | Sincronizações Git simultâneas, entre 1 e 20. |
 | `OLLAMA_CHAT_MODEL` | Modelo de chat baixado pelo instalador. |
 | `OLLAMA_KV_CACHE_QUANTIZATION` | Quantização do cache K/V: `fp16` (padrão) ou `q8_0`. |
+| `OLLAMA_KEEP_ALIVE` | Residência dos modelos: `-1` (indefinida), `30m` ou `5m` (padrão do Ollama). |
 | `OLLAMA_RUNTIME` | `docker` ou `host` no macOS. |
 | `COMPOSE_FILE` | Manifests base e overrides gerados que todo comando Compose deve carregar. |
 | `OLLAMA_GPU_MODE` | `cpu`, `all`, `selected` ou `metal`. |
@@ -68,7 +70,7 @@ RAG_TOP_K_RERANKER=8
 
 Execute novamente `./install.sh` após alterações que exijam recriação dos serviços.
 
-Ao selecionar `q8_0`, o instalador gera `compose.ollama.yaml` com `OLLAMA_FLASH_ATTENTION=1` e `OLLAMA_KV_CACHE_TYPE=q8_0`. No modo host do macOS, os mesmos valores são adicionados ao LaunchAgent. A seleção `fp16` remove essas configurações e deixa o Ollama usar seu padrão, sem adicionar as duas variáveis ao serviço.
+O instalador gera `compose.ollama.yaml` com `OLLAMA_KEEP_ALIVE` e, ao selecionar residência indefinida, limita a dois modelos simultâneos com `OLLAMA_MAX_LOADED_MODELS=2`. Ao selecionar `q8_0`, o mesmo override recebe `OLLAMA_FLASH_ATTENTION=1` e `OLLAMA_KV_CACHE_TYPE=q8_0`. No modo host do macOS, os valores equivalentes são adicionados ao LaunchAgent.
 
 ## GPU NVIDIA
 
