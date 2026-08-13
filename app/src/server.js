@@ -762,11 +762,22 @@ function pumpSyncQueue() {
         const currentCommit = (await run('git', ['rev-parse', 'HEAD'], { cwd: item.path })).stdout.trim();
         item.commit = currentCommit.slice(0, 7);
         item.lastSyncAt = new Date().toISOString();
-        item.syncStatus = 'idle';
         job.changed = previousCommit !== currentCommit;
+        if (job.changed) item.indexPending = true;
+        if (item.indexPending) {
+          log(job.changed
+            ? '\nRepositório atualizado; iniciando reindexação...\n'
+            : '\nTentando novamente a reindexação pendente...\n');
+          await indexRepository(item, log);
+          delete item.indexPending;
+          job.indexed = true;
+          log('\nReindexação concluída.\n');
+        } else {
+          log('\nRepositório sem alterações.\n');
+        }
+        item.syncStatus = 'idle';
         job.status = 'completed';
         job.progress = 100;
-        log(job.changed ? '\nRepositório atualizado; o watcher processará as alterações.\n' : '\nRepositório sem alterações.\n');
       } catch (error) {
         item.syncStatus = 'error';
         item.syncError = error.message;
@@ -878,11 +889,12 @@ async function runWorkspaceSync(selectedWorkspace, source = 'schedule') {
     const results = await Promise.all(completions);
     const failed = results.filter(job => job.status === 'failed').length;
     const changed = results.filter(job => job.changed).length;
+    const indexed = results.filter(job => job.indexed).length;
     const unchanged = results.filter(job => job.status === 'completed' && !job.changed).length;
     parent.status = failed ? 'failed' : 'completed';
     parent.progress = 100;
     parent.finishedAt = new Date().toISOString();
-    parent.log += `${changed} atualizado(s), ${unchanged} sem alterações, ${failed} falha(s), ${skipped} ignorado(s).`;
+    parent.log += `${changed} atualizado(s), ${indexed} reindexado(s), ${unchanged} sem alterações, ${failed} falha(s), ${skipped} ignorado(s).`;
     const schedule = selectedWorkspace.updateSchedule;
     schedule.lastRunAt = parent.finishedAt;
     schedule.lastRunStatus = parent.status;

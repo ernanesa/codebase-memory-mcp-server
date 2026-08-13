@@ -102,6 +102,20 @@ test('painel persiste operações por sete dias e navega pelo histórico paginad
   assert.match(styles, /\.jobs-pagination \{/);
 });
 
+test('sincronização Git reindexa alterações sem depender de watcher', async () => {
+  const [server, browser, install] = await Promise.all([
+    readFile(path.join(root, 'app/src/server.js'), 'utf8'),
+    readFile(path.join(root, 'app/public/app.js'), 'utf8'),
+    readFile(path.join(root, 'install.sh'), 'utf8')
+  ]);
+  assert.match(server, /if \(job\.changed\) item\.indexPending = true/);
+  assert.match(server, /if \(item\.indexPending\) \{[\s\S]*await indexRepository\(item, log\)[\s\S]*delete item\.indexPending/);
+  assert.match(server, /\$\{indexed\} reindexado\(s\)/);
+  assert.doesNotMatch(server, /watcher processará as alterações/);
+  assert.match(browser, /reindexa automaticamente os repositórios que receberem alterações/);
+  assert.doesNotMatch(install, /config set auto_watch/);
+});
+
 test('proxy é o único ponto de entrada e publica Open WebUI, admin, Grafana e MCP', async () => {
   const [compose, nginx, install] = await Promise.all([
     readFile(path.join(root, 'compose.yaml'), 'utf8'),

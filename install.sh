@@ -1286,7 +1286,6 @@ configure_codebase_memory_command() {
   source "$ENV_FILE"
   set +a
   "$CBM_BIN" config set auto_index false
-  "$CBM_BIN" config set auto_watch true
 }
 
 docker_compose() {
