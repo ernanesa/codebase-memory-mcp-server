@@ -1,8 +1,9 @@
 import http from 'node:http';
 import { readFile, mkdir, rename, writeFile } from 'node:fs/promises';
 import path from 'node:path';
-import { changesAffectTarget, createServiceAccountAssertion, fileChecksum, folderRoot, fullReconciliationDue, GOOGLE_FOLDER_MIME, isTargetDue, MANAGED_ROOT, migrateTargetSchedule, nextRunAt, normalizeTargetInput, publicTarget, sanitizeDriveName, scheduledSlot } from './lib.js';
+import { changesAffectTarget, createServiceAccountAssertion, fileChecksum, folderRoot, fullReconciliationDue, GOOGLE_FOLDER_MIME, isTargetDue, MANAGED_ROOT, migrateTargetSchedule, migrateTargetSources, nextRunAt, normalizeTargetInput, publicTarget, sanitizeDriveName, scheduledSlot } from './lib.js';
 import { gauge, increment, log, metricsText, observe, timed } from './observability.js';
+import { buildLinkDocument, DEFAULT_LINK_MAX_BYTES, DEFAULT_LINK_MAX_REDIRECTS, DEFAULT_LINK_TIMEOUT_MS, fetchWebLink, validateWebLinkDestination, WEB_LINK_ROOT, webLinkSourceKey } from './web-links.js';
 
 const PORT = Number(process.env.PORT || 3002);
 const DATA_DIR = process.env.SYNC_DATA_DIR || '/data';
@@ -18,6 +19,9 @@ const HISTORY_LIMIT = 200;
 const FULL_RECONCILIATION_HOURS = Math.max(1, Number.parseInt(process.env.KNOWLEDGE_SYNC_FULL_RECONCILIATION_HOURS || '168', 10) || 168);
 const HTTP_RETRY_ATTEMPTS = Math.max(1, Math.min(6, Number.parseInt(process.env.KNOWLEDGE_SYNC_HTTP_RETRY_ATTEMPTS || '3', 10) || 3));
 const CITATION_METADATA_VERSION = 1;
+const LINK_TIMEOUT_MS = Math.max(1_000, Number.parseInt(process.env.KNOWLEDGE_SYNC_LINK_TIMEOUT_MS || String(DEFAULT_LINK_TIMEOUT_MS), 10) || DEFAULT_LINK_TIMEOUT_MS);
+const LINK_MAX_BYTES = Math.max(1_024, Number.parseInt(process.env.KNOWLEDGE_SYNC_LINK_MAX_BYTES || String(DEFAULT_LINK_MAX_BYTES), 10) || DEFAULT_LINK_MAX_BYTES);
+const LINK_MAX_REDIRECTS = Math.max(0, Math.min(10, Number.parseInt(process.env.KNOWLEDGE_SYNC_LINK_MAX_REDIRECTS || String(DEFAULT_LINK_MAX_REDIRECTS), 10) || DEFAULT_LINK_MAX_REDIRECTS));
 
 await mkdir(DATA_DIR, { recursive: true });
 const apiToken = (await readFile(API_TOKEN_FILE, 'utf8')).trim();
@@ -96,12 +100,13 @@ function persist() {
   return persistence;
 }
 
-let scheduleMigrationNeeded = state.version < 3;
+let scheduleMigrationNeeded = state.version < 4;
 state.targets = state.targets.map(target => {
   const migration = migrateTargetSchedule(target, DEFAULT_SYNC_TIMEZONE);
   scheduleMigrationNeeded ||= migration.changed;
-  const migrated = migration.target;
-  migrated.files ||= {};
+  const sourceMigration = migrateTargetSources(migration.target);
+  scheduleMigrationNeeded ||= sourceMigration.changed;
+  const migrated = sourceMigration.target;
   migrated.directories ||= {};
   migrated.scannedFolderIds ||= (migrated.folders || []).map(folder => folder.id);
   for (const file of Object.values(migrated.files)) {
@@ -112,7 +117,7 @@ state.targets = state.targets.map(target => {
   }
   return migrated;
 });
-state.version = 3;
+state.version = 4;
 if (scheduleMigrationNeeded) await persist();
 
 function isBusy(knowledgeBaseId) {
@@ -468,13 +473,19 @@ async function uploadFile(target, entry, content, directoryId) {
     knowledge_id: target.knowledgeBaseId,
     file_hash: entry.checksum,
     directory_id: directoryId,
-    source: 'google-drive',
-    drive_file_id: entry.driveFileId,
-    drive_folder_id: entry.folderId,
+    source: entry.sourceType || 'google-drive',
+    drive_file_id: entry.driveFileId || null,
+    drive_folder_id: entry.folderId || null,
     source_url: entry.canonicalUrl,
+    final_url: entry.finalUrl || null,
+    source_description: entry.description || null,
+    content_type: entry.mimeType || null,
+    etag: entry.etag || null,
+    last_modified: entry.lastModified || null,
     original_name: entry.originalName,
     managed_path: entry.managedPath,
     modified_time: entry.modifiedTime,
+    fetched_at: entry.fetchedAt || null,
     ingested_at: new Date().toISOString()
   }));
   const response = await openwebui('/files/', { method: 'POST', body: form });
@@ -504,6 +515,7 @@ function recordHistory(target, run) {
 
 async function processManifestEntry(target, entry, counters, operationId, force = false) {
   const previous = target.files[entry.sourceKey];
+  const sourceMetric = entry.sourceType === 'web-link' ? 'knowledge_sync_links_total' : 'drive_sync_files_total';
   if (!force
     && previous?.fileId
     && previous.status !== 'failed'
@@ -512,21 +524,29 @@ async function processManifestEntry(target, entry, counters, operationId, force 
     && previous.filename === entry.filename
     && previous.originalName === entry.originalName
     && previous.canonicalUrl === entry.canonicalUrl
+    && (previous.description || '') === (entry.description || '')
     && previous.citationMetadataVersion === CITATION_METADATA_VERSION) {
     previous.modifiedTime = entry.modifiedTime;
     previous.size = entry.size;
+    previous.finalUrl = entry.finalUrl || previous.finalUrl || null;
+    previous.etag = entry.etag || null;
+    previous.lastModified = entry.lastModified || null;
+    previous.fetchedAt = entry.fetchedAt || previous.fetchedAt || null;
+    previous.lastAttemptAt = new Date().toISOString();
     counters.unchanged += 1;
+    increment(sourceMetric, { operation: 'unchanged', status: 'completed' });
     return;
   }
 
   const attemptedAt = new Date().toISOString();
   const started = performance.now();
   try {
-    const content = await timed('drive_download_duration_seconds', {}, () => downloadDriveFile(entry));
+    const content = entry.content || await timed('drive_download_duration_seconds', {}, () => downloadDriveFile(entry));
     const directoryId = await ensureDirectory(target, entry.managedPath || MANAGED_ROOT);
     const newFileId = await timed('openwebui_ingestion_duration_seconds', { status: 'attempt' }, () => uploadFile(target, entry, content, directoryId));
     target.files[entry.sourceKey] = {
       fileId: newFileId,
+      sourceType: entry.sourceType || 'google-drive',
       driveFileId: entry.driveFileId,
       folderId: entry.folderId,
       checksum: entry.checksum,
@@ -534,6 +554,11 @@ async function processManifestEntry(target, entry, counters, operationId, force 
       filename: entry.filename,
       originalName: entry.originalName,
       canonicalUrl: entry.canonicalUrl,
+      finalUrl: entry.finalUrl || null,
+      description: entry.description || '',
+      etag: entry.etag || null,
+      lastModified: entry.lastModified || null,
+      fetchedAt: entry.fetchedAt || null,
       citationMetadataVersion: CITATION_METADATA_VERSION,
       mimeType: entry.mimeType,
       exportMime: entry.exportMime,
@@ -552,20 +577,21 @@ async function processManifestEntry(target, entry, counters, operationId, force 
         target.files[entry.sourceKey].cleanupError = null;
       } catch (error) {
         target.files[entry.sourceKey].cleanupError = error.message;
-        increment('drive_sync_files_total', { operation: 'cleanup', status: 'failed' });
+        increment(sourceMetric, { operation: 'cleanup', status: 'failed' });
         log('warn', 'previous_file_cleanup_failed', { operationId, knowledgeBaseId: target.knowledgeBaseId, sourceKey: entry.sourceKey, error: error.message });
       }
       counters.modified += 1;
-      increment('drive_sync_files_total', { operation: 'modified', status: 'completed' });
+      increment(sourceMetric, { operation: 'modified', status: 'completed' });
     } else {
       counters.added += 1;
-      increment('drive_sync_files_total', { operation: 'added', status: 'completed' });
+      increment(sourceMetric, { operation: 'added', status: 'completed' });
     }
     await persist();
     log('info', 'file_processed', { operationId, knowledgeBaseId: target.knowledgeBaseId, sourceKey: entry.sourceKey, durationMs: Math.round(performance.now() - started) });
   } catch (error) {
     target.files[entry.sourceKey] = {
       ...(previous || {}),
+      sourceType: entry.sourceType || previous?.sourceType || 'google-drive',
       driveFileId: entry.driveFileId,
       folderId: entry.folderId,
       checksum: entry.checksum,
@@ -573,6 +599,11 @@ async function processManifestEntry(target, entry, counters, operationId, force 
       filename: entry.filename,
       originalName: entry.originalName,
       canonicalUrl: entry.canonicalUrl,
+      finalUrl: entry.finalUrl || previous?.finalUrl || null,
+      description: entry.description || '',
+      etag: entry.etag || previous?.etag || null,
+      lastModified: entry.lastModified || previous?.lastModified || null,
+      fetchedAt: entry.fetchedAt || previous?.fetchedAt || null,
       mimeType: entry.mimeType,
       exportMime: entry.exportMime,
       modifiedTime: entry.modifiedTime,
@@ -583,8 +614,75 @@ async function processManifestEntry(target, entry, counters, operationId, force 
       durationMs: Math.round(performance.now() - started)
     };
     counters.failed += 1;
-    increment('drive_sync_files_total', { operation: previous?.fileId ? 'modified' : 'added', status: 'failed' });
+    increment(sourceMetric, { operation: previous?.fileId ? 'modified' : 'added', status: 'failed' });
     log('error', 'file_processing_failed', { operationId, knowledgeBaseId: target.knowledgeBaseId, sourceKey: entry.sourceKey, error: error.message });
+    await persist();
+  }
+}
+
+async function processWebLink(target, link, counters, operationId, force = false) {
+  const sourceKey = webLinkSourceKey(link.url);
+  const previous = target.files[sourceKey];
+  const descriptionChanged = previous?.description !== link.description;
+  const attemptedAt = new Date().toISOString();
+  try {
+    const fetched = await timed('web_link_fetch_duration_seconds', {}, () => fetchWebLink(link.url, {
+      timeoutMs: LINK_TIMEOUT_MS,
+      maxBytes: LINK_MAX_BYTES,
+      maxRedirects: LINK_MAX_REDIRECTS,
+      etag: !force && !descriptionChanged && previous?.status !== 'failed' ? previous?.etag : null,
+      lastModified: !force && !descriptionChanged && previous?.status !== 'failed' ? previous?.lastModified : null
+    }));
+    if (fetched.notModified && previous?.fileId) {
+      Object.assign(previous, {
+        status: 'indexed',
+        error: null,
+        etag: fetched.etag,
+        lastModified: fetched.lastModified,
+        finalUrl: fetched.finalUrl,
+        lastAttemptAt: attemptedAt
+      });
+      counters.unchanged += 1;
+      increment('knowledge_sync_links_total', { operation: 'unchanged', status: 'completed' });
+      await persist();
+      return;
+    }
+    const document = buildLinkDocument(link, fetched);
+    const entry = {
+      sourceKey,
+      sourceType: 'web-link',
+      canonicalUrl: link.url,
+      finalUrl: fetched.finalUrl,
+      description: link.description,
+      etag: fetched.etag,
+      lastModified: fetched.lastModified,
+      fetchedAt: new Date().toISOString(),
+      checksum: document.checksum,
+      content: document.content,
+      filename: document.filename,
+      originalName: document.originalName,
+      managedPath: `${WEB_LINK_ROOT}/${sanitizeDriveName(new URL(link.url).hostname, 'site')}`,
+      mimeType: fetched.mimeType,
+      modifiedTime: fetched.lastModified || null,
+      size: fetched.size
+    };
+    await processManifestEntry(target, entry, counters, operationId, force || descriptionChanged);
+  } catch (error) {
+    target.files[sourceKey] = {
+      ...(previous || {}),
+      sourceType: 'web-link',
+      canonicalUrl: link.url,
+      description: link.description,
+      filename: previous?.filename || `${new URL(link.url).hostname}.txt`,
+      originalName: previous?.originalName || new URL(link.url).hostname,
+      managedPath: previous?.managedPath || `${WEB_LINK_ROOT}/${sanitizeDriveName(new URL(link.url).hostname, 'site')}`,
+      status: 'failed',
+      error: error.message,
+      lastAttemptAt: attemptedAt
+    };
+    counters.failed += 1;
+    increment('knowledge_sync_links_total', { operation: previous?.fileId ? 'modified' : 'added', status: 'failed' });
+    log('error', 'web_link_processing_failed', { operationId, knowledgeBaseId: target.knowledgeBaseId, sourceKey, url: link.url, error: error.message });
     await persist();
   }
 }
@@ -594,7 +692,7 @@ function completeRun(target, trigger, status, startedAt, counters, extra = {}) {
   target.lastRunAt = finishedAt;
   target.lastRunStatus = status;
   target.lastRunSummary = counters;
-  target.lastError = status === 'completed' ? null : `${counters.failed} arquivo(s) falharam.`;
+  target.lastError = status === 'completed' ? null : `${counters.failed} conteúdo(s) falharam.`;
   recordHistory(target, { trigger, status, startedAt, finishedAt, durationMs: Date.parse(finishedAt) - Date.parse(startedAt), ...counters, ...extra });
   return finishedAt;
 }
@@ -604,74 +702,99 @@ async function executeTarget(target, trigger) {
   const operationId = crypto.randomUUID();
   const counters = { added: 0, modified: 0, deleted: 0, unchanged: 0, failed: 0 };
   gauge('drive_sync_queue_size', queued.size);
+  gauge('knowledge_sync_queue_size', queued.size);
   log('info', 'sync_started', { operationId, knowledgeBaseId: target.knowledgeBaseId, trigger });
   try {
-    const managedFiles = Object.values(target.files || {});
-    const hasFailedFiles = managedFiles.some(file => file.status === 'failed');
-    const hasOutdatedCitationMetadata = managedFiles.some(file => file.citationMetadataVersion !== CITATION_METADATA_VERSION);
-    if (target.changePageToken && !hasFailedFiles && !hasOutdatedCitationMetadata && !fullReconciliationDue(target, new Date(), FULL_RECONCILIATION_HOURS)) {
-      try {
-        const changeSet = await timed('drive_changes_scan_duration_seconds', {}, () => listDriveChanges(target.changePageToken));
-        if (!changesAffectTarget(target, changeSet.changes)) {
-          target.changePageToken = changeSet.newStartPageToken;
-          completeRun(target, trigger, 'completed', startedAt, counters, { mode: 'incremental', inspectedChanges: changeSet.changes.length });
-          await persist();
-          increment('drive_sync_runs_total', { status: 'completed', mode: 'incremental' });
-          observe('drive_sync_duration_seconds', (Date.now() - Date.parse(startedAt)) / 1000, { status: 'completed', mode: 'incremental' });
-          log('info', 'sync_completed', { operationId, knowledgeBaseId: target.knowledgeBaseId, mode: 'incremental', inspectedChanges: changeSet.changes.length });
-          return counters;
-        }
-      } catch (error) {
-        log('warn', 'changes_fast_path_failed', { operationId, knowledgeBaseId: target.knowledgeBaseId, error: error.message });
-      }
-    }
-
-    let reconciliationPageToken = null;
-    try { reconciliationPageToken = await getStartPageToken(); }
-    catch (error) { log('warn', 'changes_token_unavailable', { operationId, knowledgeBaseId: target.knowledgeBaseId, error: error.message }); }
-
     const bases = await listKnowledgeBases();
     const knowledge = bases.find(item => item.id === target.knowledgeBaseId);
     if (!knowledge) throw new Error('Knowledge Base não encontrada ou sem acesso de escrita.');
     target.knowledgeBaseName = knowledge.name;
 
-    const manifest = [];
-    const scannedFolderIds = new Set();
-    for (const configuredFolder of target.folders) {
-      const metadata = await getDriveFile(configuredFolder.id);
-      if (metadata.trashed || metadata.mimeType !== GOOGLE_FOLDER_MIME) throw new Error(`A pasta ${configuredFolder.name} não está disponível.`);
-      configuredFolder.name = sanitizeDriveName(metadata.name, configuredFolder.name);
-      const scanned = await scanFolder(configuredFolder, configuredFolder.id, '', new Set(), scannedFolderIds);
-      const basePath = folderRoot(configuredFolder);
-      manifest.push(...scanned.map(entry => ({ ...entry, managedPath: [basePath, entry.path].filter(Boolean).join('/') })));
-    }
-
-    if (manifest.length === 0 && Object.keys(target.files).length > 0) {
-      throw new Error('O Drive retornou uma origem vazia. Os arquivos existentes foram preservados por segurança.');
-    }
-
-    const currentKeys = new Set(manifest.map(entry => entry.sourceKey));
-    for (const entry of manifest) {
-      await processManifestEntry(target, entry, counters, operationId);
-    }
-
-    const removed = Object.entries(target.files).filter(([sourceKey]) => !currentKeys.has(sourceKey));
-    for (const [sourceKey, previous] of removed) {
+    const stageErrors = [];
+    const currentLinkKeys = new Set((target.links || []).map(link => webLinkSourceKey(link.url)));
+    for (const link of target.links || []) await processWebLink(target, link, counters, operationId);
+    const removedLinks = Object.entries(target.files).filter(([sourceKey, file]) => file.sourceType === 'web-link' && !currentLinkKeys.has(sourceKey));
+    for (const [sourceKey, previous] of removedLinks) {
       if (previous.fileId) await cleanupFiles(target.knowledgeBaseId, [previous.fileId]);
       delete target.files[sourceKey];
       counters.deleted += 1;
-      increment('drive_sync_files_total', { operation: 'deleted', status: 'completed' });
+      increment('knowledge_sync_links_total', { operation: 'deleted', status: 'completed' });
       await persist();
     }
 
-    target.scannedFolderIds = [...scannedFolderIds];
-    target.lastFullScanAt = new Date().toISOString();
-    if (reconciliationPageToken) target.changePageToken = reconciliationPageToken;
+    const configuredFolders = target.folders || [];
+    if (configuredFolders.length) {
+      try {
+        const managedDriveFiles = Object.values(target.files || {}).filter(file => (file.sourceType || 'google-drive') === 'google-drive');
+        const hasFailedFiles = managedDriveFiles.some(file => file.status === 'failed');
+        const hasOutdatedCitationMetadata = managedDriveFiles.some(file => file.citationMetadataVersion !== CITATION_METADATA_VERSION);
+        let skipFullDriveScan = false;
+        if (target.changePageToken && !hasFailedFiles && !hasOutdatedCitationMetadata && !fullReconciliationDue(target, new Date(), FULL_RECONCILIATION_HOURS)) {
+          try {
+            const changeSet = await timed('drive_changes_scan_duration_seconds', {}, () => listDriveChanges(target.changePageToken));
+            if (!changesAffectTarget(target, changeSet.changes)) {
+              target.changePageToken = changeSet.newStartPageToken;
+              skipFullDriveScan = true;
+            }
+          } catch (error) {
+            log('warn', 'changes_fast_path_failed', { operationId, knowledgeBaseId: target.knowledgeBaseId, error: error.message });
+          }
+        }
+        if (!skipFullDriveScan) {
+          let reconciliationPageToken = null;
+          try { reconciliationPageToken = await getStartPageToken(); }
+          catch (error) { log('warn', 'changes_token_unavailable', { operationId, knowledgeBaseId: target.knowledgeBaseId, error: error.message }); }
+          const manifest = [];
+          const scannedFolderIds = new Set();
+          for (const configuredFolder of configuredFolders) {
+            const metadata = await getDriveFile(configuredFolder.id);
+            if (metadata.trashed || metadata.mimeType !== GOOGLE_FOLDER_MIME) throw new Error(`A pasta ${configuredFolder.name} não está disponível.`);
+            configuredFolder.name = sanitizeDriveName(metadata.name, configuredFolder.name);
+            const scanned = await scanFolder(configuredFolder, configuredFolder.id, '', new Set(), scannedFolderIds);
+            const basePath = folderRoot(configuredFolder);
+            manifest.push(...scanned.map(entry => ({ ...entry, sourceType: 'google-drive', managedPath: [basePath, entry.path].filter(Boolean).join('/') })));
+          }
+          if (manifest.length === 0 && managedDriveFiles.length > 0) throw new Error('O Drive retornou uma origem vazia. Os arquivos existentes foram preservados por segurança.');
+          const currentDriveKeys = new Set(manifest.map(entry => entry.sourceKey));
+          for (const entry of manifest) await processManifestEntry(target, entry, counters, operationId);
+          const removedDriveFiles = Object.entries(target.files).filter(([sourceKey, file]) => (file.sourceType || 'google-drive') === 'google-drive' && !currentDriveKeys.has(sourceKey));
+          for (const [sourceKey, previous] of removedDriveFiles) {
+            if (previous.fileId) await cleanupFiles(target.knowledgeBaseId, [previous.fileId]);
+            delete target.files[sourceKey];
+            counters.deleted += 1;
+            increment('drive_sync_files_total', { operation: 'deleted', status: 'completed' });
+            await persist();
+          }
+          target.scannedFolderIds = [...scannedFolderIds];
+          target.lastFullScanAt = new Date().toISOString();
+          if (reconciliationPageToken) target.changePageToken = reconciliationPageToken;
+        }
+      } catch (error) {
+        counters.failed += 1;
+        stageErrors.push(`Google Drive: ${error.message}`);
+        log('error', 'drive_stage_failed', { operationId, knowledgeBaseId: target.knowledgeBaseId, error: error.message });
+      }
+    } else {
+      const removedDriveFiles = Object.entries(target.files).filter(([, file]) => (file.sourceType || 'google-drive') === 'google-drive');
+      for (const [sourceKey, previous] of removedDriveFiles) {
+        if (previous.fileId) await cleanupFiles(target.knowledgeBaseId, [previous.fileId]);
+        delete target.files[sourceKey];
+        counters.deleted += 1;
+        await persist();
+      }
+      target.changePageToken = null;
+      target.scannedFolderIds = [];
+    }
+
     const status = counters.failed ? 'partial' : 'completed';
-    completeRun(target, trigger, status, startedAt, counters, { mode: 'full' });
+    completeRun(target, trigger, status, startedAt, counters, { mode: configuredFolders.length ? (target.links?.length ? 'mixed' : 'drive') : 'links' });
+    if (stageErrors.length) target.lastError = stageErrors.join(' · ');
     await persist();
-    increment('drive_sync_runs_total', { status, mode: 'full' });
-    observe('drive_sync_duration_seconds', (Date.now() - Date.parse(startedAt)) / 1000, { status, mode: 'full' });
+    const mode = configuredFolders.length ? (target.links?.length ? 'mixed' : 'drive') : 'links';
+    increment('drive_sync_runs_total', { status, mode });
+    increment('knowledge_sync_runs_total', { status, mode });
+    observe('drive_sync_duration_seconds', (Date.now() - Date.parse(startedAt)) / 1000, { status, mode });
+    observe('knowledge_sync_duration_seconds', (Date.now() - Date.parse(startedAt)) / 1000, { status, mode });
     log('info', 'sync_completed', { operationId, knowledgeBaseId: target.knowledgeBaseId, status, ...counters });
     return counters;
   } catch (error) {
@@ -682,7 +805,9 @@ async function executeTarget(target, trigger) {
     recordHistory(target, { trigger, status: 'failed', startedAt, finishedAt, durationMs: Date.parse(finishedAt) - Date.parse(startedAt), error: error.message, ...counters });
     await persist();
     increment('drive_sync_runs_total', { status: 'failed', mode: 'full' });
+    increment('knowledge_sync_runs_total', { status: 'failed', mode: 'full' });
     observe('drive_sync_duration_seconds', (Date.now() - Date.parse(startedAt)) / 1000, { status: 'failed', mode: 'full' });
+    observe('knowledge_sync_duration_seconds', (Date.now() - Date.parse(startedAt)) / 1000, { status: 'failed', mode: 'full' });
     log('error', 'sync_failed', { operationId, knowledgeBaseId: target.knowledgeBaseId, error: error.message });
     throw error;
   }
@@ -711,11 +836,15 @@ function runTarget(knowledgeBaseId, trigger = 'manual', scheduledFor = null) {
   };
   executionQueue = executionQueue.then(operation, operation);
   gauge('drive_sync_queue_size', queued.size);
+  gauge('knowledge_sync_queue_size', queued.size);
 }
 
 function publicManagedFile(sourceKey, file) {
   return {
     sourceKey,
+    sourceType: file.sourceType || 'google-drive',
+    sourceUrl: file.canonicalUrl || null,
+    description: file.description || '',
     driveFileId: file.driveFileId,
     folderId: file.folderId,
     filename: file.filename,
@@ -736,29 +865,39 @@ function runFileReprocess(knowledgeBaseId, sourceKey) {
   if (!target) throw new Error('Vínculo não encontrado.');
   if (isBusy(knowledgeBaseId)) throw new Error('Esta Knowledge Base já está na fila de sincronização.');
   const stored = target.files[sourceKey];
-  if (!stored) throw new Error('Arquivo gerenciado não encontrado.');
+  if (!stored) throw new Error('Conteúdo gerenciado não encontrado.');
   queued.add(knowledgeBaseId);
   gauge('drive_sync_queue_size', queued.size);
+  gauge('knowledge_sync_queue_size', queued.size);
   const operation = async () => {
     queued.delete(knowledgeBaseId);
     running.add(knowledgeBaseId);
     gauge('drive_sync_queue_size', queued.size);
+    gauge('knowledge_sync_queue_size', queued.size);
     const operationId = crypto.randomUUID();
     const startedAt = new Date().toISOString();
     const counters = { added: 0, modified: 0, deleted: 0, unchanged: 0, failed: 0 };
     try {
-      const metadata = await getDriveFile(stored.driveFileId);
-      if (metadata.trashed || metadata.mimeType === GOOGLE_FOLDER_MIME) throw new Error('O arquivo não está mais disponível no Google Drive.');
-      const configuredFolder = target.folders.find(folder => folder.id === stored.folderId) || { id: stored.folderId, name: stored.folderId };
-      const entry = downloadableFile(metadata, '', configuredFolder);
-      if (!entry) throw new Error('Este tipo de arquivo do Google Drive não pode ser exportado.');
-      entry.sourceKey = sourceKey;
-      entry.managedPath = stored.managedPath;
-      await processManifestEntry(target, entry, counters, operationId, true);
+      if (stored.sourceType === 'web-link') {
+        const link = (target.links || []).find(item => webLinkSourceKey(item.url) === sourceKey);
+        if (!link) throw new Error('O link não está mais vinculado a esta base.');
+        await processWebLink(target, link, counters, operationId, true);
+      } else {
+        const metadata = await getDriveFile(stored.driveFileId);
+        if (metadata.trashed || metadata.mimeType === GOOGLE_FOLDER_MIME) throw new Error('O arquivo não está mais disponível no Google Drive.');
+        const configuredFolder = target.folders.find(folder => folder.id === stored.folderId) || { id: stored.folderId, name: stored.folderId };
+        const entry = downloadableFile(metadata, '', configuredFolder);
+        if (!entry) throw new Error('Este tipo de arquivo do Google Drive não pode ser exportado.');
+        entry.sourceKey = sourceKey;
+        entry.sourceType = 'google-drive';
+        entry.managedPath = stored.managedPath;
+        await processManifestEntry(target, entry, counters, operationId, true);
+      }
       const status = counters.failed ? 'partial' : 'completed';
       completeRun(target, 'file-reprocess', status, startedAt, counters, { mode: 'single-file', sourceKey });
       await persist();
       increment('drive_sync_runs_total', { status, mode: 'single-file' });
+      increment('knowledge_sync_runs_total', { status, mode: 'single-file' });
     } catch (error) {
       const file = target.files[sourceKey];
       if (file) Object.assign(file, { status: 'failed', error: error.message, lastAttemptAt: new Date().toISOString() });
@@ -838,13 +977,15 @@ async function route(request, response, url) {
     return json(response, 200, { knowledgeBases: await listKnowledgeBases() });
   }
   if (request.method === 'GET' && url.pathname === '/api/folders') {
+    const credentials = await refreshGoogleCredentials(false);
+    if (!credentials) return json(response, 200, { folders: [], serviceAccountEmail: null, configured: false });
     const search = String(url.searchParams.get('search') || '').trim().toLocaleLowerCase('pt-BR');
     const folders = await listDriveFiles(`mimeType = '${GOOGLE_FOLDER_MIME}' and trashed = false`);
     const visible = folders
       .filter(folder => !search || folder.name.toLocaleLowerCase('pt-BR').includes(search) || folder.id.toLowerCase().includes(search))
       .map(folder => ({ id: folder.id, name: folder.name, parents: folder.parents || [] }))
       .sort((a, b) => a.name.localeCompare(b.name, 'pt-BR'));
-    return json(response, 200, { folders: visible, serviceAccountEmail: googleCredentials.client_email });
+    return json(response, 200, { folders: visible, serviceAccountEmail: googleCredentials.client_email, configured: true });
   }
   if (request.method === 'GET' && url.pathname === '/api/targets') {
     return json(response, 200, { targets: state.targets.map(item => publicTarget(item, isBusy(item.knowledgeBaseId))) });
@@ -864,6 +1005,21 @@ async function route(request, response, url) {
       await persist();
     });
     return json(response, 200, { paused: state.targets.length });
+  }
+  if (request.method === 'POST' && url.pathname === '/api/targets/drive-credentials-removed') {
+    let paused = 0;
+    await withMutation(async () => {
+      const now = new Date().toISOString();
+      for (const target of state.targets) {
+        if ((target.folders || []).length && !(target.links || []).length) {
+          target.enabled = false;
+          target.updatedAt = now;
+          paused += 1;
+        }
+      }
+      await persist();
+    });
+    return json(response, 200, { paused });
   }
 
   const filesMatch = url.pathname.match(/^\/api\/targets\/([A-Za-z0-9_-]+)\/files(?:\/(.+)\/(reprocess|retry))?$/);
@@ -886,6 +1042,7 @@ async function route(request, response, url) {
     const bases = await listKnowledgeBases();
     const knowledge = bases.find(item => item.id === input.knowledgeBaseId);
     if (!knowledge || !knowledge.writeAccess) throw new Error('Knowledge Base não encontrada ou sem permissão de escrita.');
+    for (const link of input.links) await validateWebLinkDestination(link.url);
     const validatedFolders = [];
     const validatedMetadata = [];
     for (const folder of input.folders) {
@@ -898,8 +1055,8 @@ async function route(request, response, url) {
     await withMutation(async () => {
       const existing = state.targets.find(item => item.knowledgeBaseId === input.knowledgeBaseId);
       const now = new Date().toISOString();
-      if (existing) Object.assign(existing, input, { folders: validatedFolders, knowledgeBaseName: knowledge.name, updatedAt: now, lastError: null });
-      else state.targets.push({ ...input, folders: validatedFolders, knowledgeBaseName: knowledge.name, files: {}, directories: {}, createdAt: now, updatedAt: now, lastRunAt: null, lastRunStatus: null, lastRunSummary: null, lastError: null });
+      if (existing) Object.assign(existing, input, { folders: validatedFolders, links: input.links, knowledgeBaseName: knowledge.name, updatedAt: now, lastError: null });
+      else state.targets.push({ ...input, folders: validatedFolders, links: input.links, knowledgeBaseName: knowledge.name, files: {}, directories: {}, createdAt: now, updatedAt: now, lastRunAt: null, lastRunStatus: null, lastRunSummary: null, lastError: null });
       await persist();
     });
     const target = state.targets.find(item => item.knowledgeBaseId === input.knowledgeBaseId);
@@ -927,8 +1084,9 @@ async function route(request, response, url) {
 }
 
 async function checkSchedules() {
-  if (!await refreshGoogleCredentials(false)) return;
+  const credentials = await refreshGoogleCredentials(false);
   for (const target of state.targets) {
+    if (!credentials && (target.folders || []).length && !(target.links || []).length) continue;
     if (isTargetDue(target) && !isBusy(target.knowledgeBaseId)) {
       try { runTarget(target.knowledgeBaseId, 'schedule', scheduledSlot(target)); }
       catch (error) { log('error', 'schedule_enqueue_failed', { knowledgeBaseId: target.knowledgeBaseId, error: error.message }); }

@@ -10,7 +10,7 @@ Ambiente autogerenciado para disponibilizar repositórios a clientes MCP e mante
 - Open WebUI com chat e RAG híbrido;
 - embeddings multilíngues com `bge-m3` e reranking;
 - extração de documentos, OCR adaptativo e tabelas com Docling em CPU;
-- sincronização incremental Drive → Knowledge Base por cron;
+- sincronização incremental de pastas do Drive e links HTTPS → Knowledge Base por cron;
 - citações do Drive abrem diretamente o arquivo original, respeitando a conta Google e as permissões do usuário;
 - `kb_exec` expõe IDs e caminhos canônicos e tolera caminhos abreviados não ambíguos;
 - reprocessamento seletivo, histórico por arquivo e detecção incremental via Drive Changes API;
@@ -107,7 +107,7 @@ Guarde tokens em variáveis de ambiente ou armazenamento seguro. Não os version
 ## Como os documentos são processados
 
 ```text
-Upload ou Google Drive
+Upload, Google Drive ou links HTTPS
         ↓
 Open WebUI → Docling CPU → Markdown estruturado
         ↓
@@ -116,7 +116,7 @@ Ollama/bge-m3 → busca híbrida → reranker → chat
 
 O Docling usa OCR somente onde necessário (`do_ocr=true`, `force_ocr=false`), mantém tabelas em modo preciso e não possui volume próprio. Seus modelos vêm na imagem; documentos, chunks e vetores persistem no Open WebUI.
 
-A sincronização do Drive usa cron por Knowledge Base. O padrão `30 * * * *` verifica mudanças no minuto 30 de cada hora. Bases vencidas entram em uma fila sequencial para limitar o consumo de recursos.
+A sincronização de fontes usa cron por Knowledge Base. O padrão `30 * * * *` verifica mudanças no minuto 30 de cada hora. Bases vencidas entram em uma fila sequencial para limitar o consumo de recursos. Links públicos são coletados sem crawling ou JavaScript, com descrição opcional incluída nos embeddings.
 
 ## Documentação
 

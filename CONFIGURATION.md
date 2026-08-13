@@ -166,3 +166,13 @@ codebase-memory-mcp-server/
 ```
 
 Mantenha o clone no mesmo caminho depois da instalação, pois `.env` contém caminhos absolutos.
+
+### Sincronização de links
+
+Cada vínculo de Knowledge Base pode combinar pastas do Google Drive e links HTTPS públicos no mesmo agendamento. O worker aceita HTML estático, JSON, XML, Markdown e texto. Não há crawling, execução de JavaScript ou autenticação por link.
+
+| Variável | Padrão | Descrição |
+|---|---:|---|
+| `KNOWLEDGE_SYNC_LINK_TIMEOUT_MS` | `30000` | Timeout por requisição de link, em milissegundos. |
+| `KNOWLEDGE_SYNC_LINK_MAX_BYTES` | `10485760` | Tamanho máximo da resposta antes da extração. |
+| `KNOWLEDGE_SYNC_LINK_MAX_REDIRECTS` | `5` | Número máximo de redirecionamentos HTTPS. |

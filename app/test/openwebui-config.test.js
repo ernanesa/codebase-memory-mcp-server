@@ -229,6 +229,8 @@ cases = [
     File('Legado.txt', {'data': {'source': 'google-drive', 'source_name': 'Documento legado', 'source_url': 'https://drive.google.com/open?id=abc'}}),
     File('manual.pdf', {'data': {'source': 'manual', 'original_name': 'Falso', 'source_url': 'https://docs.google.com/document/d/abc/edit'}}),
     File('Documento.txt', {'data': {'source': 'google-drive', 'original_name': 'Documento', 'source_url': 'https://example.com/phishing'}}),
+    File('API X.txt', {'data': {'source': 'web-link', 'original_name': 'API X', 'source_url': 'https://api.example.com/openapi.json'}}),
+    File('Inseguro.txt', {'data': {'source': 'web-link', 'original_name': 'Inseguro', 'source_url': 'http://example.com'}}),
 ]
 print(json.dumps([module.get_file_citation_metadata(item) for item in cases]))
 `;
@@ -237,7 +239,9 @@ print(json.dumps([module.get_file_citation_metadata(item) for item in cases]))
     { name: 'Documento', source: 'https://docs.google.com/document/d/abc/edit' },
     { name: 'Documento legado', source: 'https://drive.google.com/open?id=abc' },
     { name: 'manual.pdf', source: 'manual.pdf' },
-    { name: 'Documento', source: 'Documento.txt' }
+    { name: 'Documento', source: 'Documento.txt' },
+    { name: 'API X', source: 'https://api.example.com/openapi.json' },
+    { name: 'Inseguro', source: 'Inseguro.txt' }
   ]);
 });
 
@@ -264,7 +268,7 @@ test('presets de exemplo selecionam o padrão e carregam parâmetros e integraç
   assert.match(manifest.models[1].params.system, /acesso administrativo total/);
 });
 
-test('painel administra vínculos entre pastas e Knowledge Bases pelo BFF interno', async () => {
+test('painel administra vínculos entre fontes e Knowledge Bases pelo BFF interno', async () => {
   const [html, browser, styles, server] = await Promise.all([
     readFile(path.join(root, 'app/public/index.html'), 'utf8'),
     readFile(path.join(root, 'app/public/app.js'), 'utf8'),
@@ -272,7 +276,11 @@ test('painel administra vínculos entre pastas e Knowledge Bases pelo BFF intern
     readFile(path.join(root, 'app/src/server.js'), 'utf8')
   ]);
   assert.match(html, /data-view="knowledge-sync"/);
-  assert.match(browser, /Vincular pastas/);
+  assert.match(browser, /Vincular fontes/);
+  assert.match(browser, /data-link-url/);
+  assert.match(browser, /data-link-description/);
+  assert.match(browser, /add-knowledge-link/);
+  assert.match(browser, /links:currentKnowledgeLinks\(\)/);
   assert.match(browser, /run-knowledge-sync/);
   assert.match(browser, /delete-knowledge-sync/);
   assert.match(browser, /drive-credentials-file/);

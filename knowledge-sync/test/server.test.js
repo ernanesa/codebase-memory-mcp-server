@@ -273,6 +273,11 @@ test('worker mantém arquivos de uma pasta dentro da Knowledge Base vinculada', 
     assert.equal(response.status, 202, await response.text());
     for (let attempt = 0; attempt < 100 && uploads.length < 2; attempt += 1) await new Promise(resolve => setTimeout(resolve, 25));
     assert.equal(uploads.length, 2);
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      const current = await fetch(`${workerUrl}/api/targets`, { headers }).then(value => value.json());
+      if (!current.targets[0]?.running) break;
+      await new Promise(resolve => setTimeout(resolve, 25));
+    }
 
     modifiedTime = '2026-01-02T00:00:00Z';
     fileContent = 'segunda versão';

@@ -67,7 +67,7 @@ Sem credencial, o worker responde ao painel, mas não consulta o Google nem exec
 <summary style="font-size: 1.5em; font-weight: bold;">Enviar a Service Account pelo painel</summary>
 
 1. Em qualquer computador com acesso ao servidor, abra `http://<servidor>:8080/admin/`.
-2. Entre em **Bases e Drive**.
+2. Entre em **Bases e fontes**.
 3. Clique em **Configurar Google Drive**.
 4. Use **Arquivo da Service Account** para selecionar o JSON baixado do Google Cloud. Como alternativa avançada, abra **Ou cole o conteúdo do JSON**.
 5. Confira o e-mail e o projeto mostrados na prévia e clique em **Salvar credencial**.
@@ -88,7 +88,7 @@ A opção **Remover** apaga o arquivo do servidor e pausa os vínculos existente
 
 1. Crie as Knowledge Bases desejadas no Open WebUI.
 2. Associe cada modelo somente à sua respectiva base.
-3. Em **Bases e Drive**, localize a Knowledge Base e clique em **Vincular pastas**.
+3. Em **Bases e fontes**, localize a Knowledge Base e clique em **Vincular fontes**.
 4. Selecione uma ou mais pastas acessíveis à Service Account.
 5. Preencha os cinco campos do cron e o fuso horário. O padrão `30 * * * *` executa no minuto 30 de cada hora.
 6. Use **Sincronizar agora** para antecipar a primeira execução e acompanhe o histórico.
@@ -133,7 +133,7 @@ O Picker permite que usuários importem arquivos manualmente pelo menu de anexos
 2. Configure a tela de consentimento em **Google Auth Platform** e adicione os escopos `drive.readonly` e `drive.file`.
 3. Crie um OAuth Client do tipo **Web application** e cadastre a origem usada para acessar o Open WebUI.
 4. Crie uma API Key restrita ao site e às APIs Google Drive e Google Picker.
-5. Abra `http://<servidor>:8080/admin/` e entre em **Bases e Drive**.
+5. Abra `http://<servidor>:8080/admin/` e entre em **Bases e fontes**.
 6. No card **Integração do Open WebUI**, clique em **Configurar Picker**.
 7. Informe o OAuth Client ID e a API Key e clique em **Salvar e ativar**.
 8. Recarregue abas do Open WebUI que já estavam abertas.

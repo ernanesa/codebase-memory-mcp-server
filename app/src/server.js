@@ -948,7 +948,7 @@ async function routeApi(request, response, url) {
       return json(response, 200, result.result);
     }
     if (request.method === 'DELETE') {
-      await knowledgeSyncRequest('/api/targets/pause-all', { method: 'POST', payload: {} });
+      await knowledgeSyncRequest('/api/targets/drive-credentials-removed', { method: 'POST', payload: {} });
       await removeGoogleServiceAccount();
       const status = await knowledgeSyncRequest('/api/status');
       return json(response, 200, status.result);

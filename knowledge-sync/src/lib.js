@@ -1,4 +1,5 @@
 import { createSign, createHash } from 'node:crypto';
+import { normalizeLinkInput } from './web-links.js';
 
 export const GOOGLE_FOLDER_MIME = 'application/vnd.google-apps.folder';
 export const MANAGED_ROOT = 'Google Drive (gerenciado)';
@@ -179,9 +180,10 @@ export function normalizeTargetInput(payload) {
   const cron = parseCronExpression(payload?.cron || legacyIntervalToCron(payload?.intervalMinutes ?? 60)).expression;
   const timezone = validateTimezone(payload?.timezone || DEFAULT_TIMEZONE);
   if (!knowledgeBaseId || !/^[A-Za-z0-9_-]+$/.test(knowledgeBaseId)) throw new Error('Knowledge Base inválida.');
-  if (!Array.isArray(payload?.folders) || payload.folders.length === 0) throw new Error('Selecione pelo menos uma pasta do Google Drive.');
+  if (payload?.folders !== undefined && !Array.isArray(payload.folders)) throw new Error('A lista de pastas do Google Drive é inválida.');
+  if (payload?.links !== undefined && !Array.isArray(payload.links)) throw new Error('A lista de links é inválida.');
   const seen = new Set();
-  const folders = payload.folders.map(folder => {
+  const folders = (payload.folders || []).map(folder => {
     const id = String(folder?.id || '').trim();
     const name = sanitizeDriveName(folder?.name, 'Pasta do Drive');
     if (!id || !/^[A-Za-z0-9_-]+$/.test(id)) throw new Error('Uma das pastas selecionadas possui ID inválido.');
@@ -189,7 +191,15 @@ export function normalizeTargetInput(payload) {
     seen.add(id);
     return { id, name };
   });
-  return { knowledgeBaseId, knowledgeBaseName, folders, enabled, cron, timezone };
+  const seenLinks = new Set();
+  const links = (payload.links || []).map(link => {
+    const normalized = normalizeLinkInput(link);
+    if (seenLinks.has(normalized.url)) throw new Error('O mesmo link foi informado mais de uma vez.');
+    seenLinks.add(normalized.url);
+    return normalized;
+  });
+  if (!folders.length && !links.length) throw new Error('Selecione pelo menos uma pasta do Google Drive ou adicione um link.');
+  return { knowledgeBaseId, knowledgeBaseName, folders, links, enabled, cron, timezone };
 }
 
 export function nextRunAt(target, from = new Date()) {
@@ -227,12 +237,28 @@ export function migrateTargetSchedule(target, defaultTimezone = DEFAULT_TIMEZONE
   return { target: migrated, changed };
 }
 
+export function migrateTargetSources(target) {
+  let changed = false;
+  const migrated = { ...target };
+  if (!Array.isArray(migrated.folders)) { migrated.folders = []; changed = true; }
+  if (!Array.isArray(migrated.links)) { migrated.links = []; changed = true; }
+  if (!migrated.files || typeof migrated.files !== 'object') { migrated.files = {}; changed = true; }
+  migrated.files = Object.fromEntries(Object.entries(migrated.files).map(([sourceKey, file]) => {
+    if (file.sourceType) return [sourceKey, file];
+    changed = true;
+    return [sourceKey, { ...file, sourceType: 'google-drive' }];
+  }));
+  return { target: migrated, changed };
+}
+
 export function publicTarget(target, running = false) {
   const { files: _files, directories: _directories, changePageToken: _changePageToken, scannedFolderIds: _scannedFolderIds, ...visible } = target;
   const files = Object.values(target.files || {});
   return {
     ...visible,
     managedFileCount: files.length,
+    managedDriveFileCount: files.filter(file => (file.sourceType || 'google-drive') === 'google-drive').length,
+    managedLinkCount: files.filter(file => file.sourceType === 'web-link').length,
     failedFileCount: files.filter(file => file.status === 'failed').length,
     running,
     scheduleDescription: describeCron(target.cron),

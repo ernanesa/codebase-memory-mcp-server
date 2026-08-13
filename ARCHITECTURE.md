@@ -13,7 +13,9 @@ Clientes MCP ──► Cloudflare Tunnel ──► hostname MCP ──► AgentG
                                       │
                                       └── controle de tokens e projetos permitidos
 
-Google Drive ──► knowledge-sync ──► Open WebUI
+Google Drive ──┐
+               ├─► knowledge-sync ──► Open WebUI
+Links HTTPS ───┘
                                          │
                               ┌──────────┴──────────┐
                               ▼                     ▼
@@ -33,7 +35,7 @@ Google Drive ──► knowledge-sync ──► Open WebUI
 | `open-webui` | Mantém chats, Knowledge Bases, arquivos, chunks e índice vetorial. |
 | `docling` | Converte documentos, executa OCR adaptativo e extrai tabelas. |
 | `ollama` | Executa o modelo de chat e o embedding `bge-m3`. |
-| `knowledge-sync` | Detecta mudanças no Drive e envia apenas arquivos alterados. |
+| `knowledge-sync` | Detecta mudanças no Drive, coleta links HTTPS e envia apenas conteúdos alterados. |
 
 ## Pipeline de documentos
 
@@ -50,9 +52,13 @@ Google Drive ──► knowledge-sync ──► Open WebUI
 
 Para arquivos sincronizados, o `knowledge-sync` solicita o `webViewLink` fornecido pela API do Drive e o envia ao Open WebUI junto com o nome original. O arquivo exportado (`.txt`, `.csv` ou `.pdf`) continua sendo a representação interna usada por Docling e pelos embeddings, mas os chunks registram o documento do Drive como fonte canônica.
 
+Links públicos HTTPS podem ser vinculados à mesma Knowledge Base, com descrição opcional. Em cada execução do cron, o worker faz uma requisição condicional com `ETag` e `Last-Modified`, extrai HTML estático, JSON, XML, Markdown ou texto, acrescenta a descrição ao documento e reindexa somente quando o conteúdo semântico muda. Cada cadastro representa uma única URL: não há crawling, autenticação nem execução de JavaScript.
+
+O coletor bloqueia credenciais na URL, localhost, redes privadas ou reservadas e revalida DNS e cada redirecionamento. Os limites padrão são 30 segundos, cinco redirecionamentos e 10 MiB. Falhas preservam a última versão indexada e tornam a execução parcial.
+
 Ao clicar no marcador ou na lista de fontes, o frontend exibe o nome original como rótulo e abre o arquivo original em uma nova aba, sem expor o URL como texto nem exibir o modal técnico de chunks e scores. O link não contém credenciais da Service Account: o Google valida a conta ativa no navegador e as permissões próprias do usuário. Uploads manuais e fontes sem URL canônica mantêm o endpoint interno do Open WebUI como fallback.
 
-Somente URLs HTTPS retornadas nos hosts `docs.google.com` e `drive.google.com` são aceitas como fontes do Drive. A versão do metadata da citação é persistida por arquivo; depois desta funcionalidade ser instalada, uma reconciliação completa reenvia automaticamente uma única vez os arquivos antigos que ainda não possuem a versão atual.
+Somente URLs HTTPS retornadas nos hosts `docs.google.com` e `drive.google.com` são aceitas como fontes do Drive. Documentos de links usam a URL HTTPS validada pelo coletor. A versão do metadata da citação é persistida por arquivo; depois desta funcionalidade ser instalada, uma reconciliação completa reenvia automaticamente uma única vez os arquivos antigos que ainda não possuem a versão atual.
 
 A abertura no trecho exato não é garantida. O pipeline preserva páginas quando o extrator as fornece, mas Google Docs, Sheets e Slides exigem identificadores estruturais que as exportações atuais em texto ou CSV não mantêm.
 

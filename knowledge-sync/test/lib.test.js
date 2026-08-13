@@ -1,26 +1,33 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { changesAffectTarget, fileChecksum, folderRoot, fullReconciliationDue, isTargetDue, legacyIntervalToCron, migrateTargetSchedule, nextRunAt, normalizeTargetInput, sanitizeDriveName } from '../src/lib.js';
+import { changesAffectTarget, fileChecksum, folderRoot, fullReconciliationDue, isTargetDue, legacyIntervalToCron, migrateTargetSchedule, migrateTargetSources, nextRunAt, normalizeTargetInput, sanitizeDriveName } from '../src/lib.js';
 
-test('normaliza um vínculo entre pasta e Knowledge Base', () => {
+test('normaliza um vínculo entre pasta, links e Knowledge Base', () => {
   assert.deepEqual(normalizeTargetInput({
     knowledgeBaseId: 'kb_A-1',
     knowledgeBaseName: 'Base A',
     folders: [{ id: 'folder_A-1', name: 'Pasta A' }],
+    links: [{ url: 'https://example.com/docs#rotas', description: ' Rotas da API ' }],
     cron: '30 * * * *',
     timezone: 'America/Maceio'
   }), {
     knowledgeBaseId: 'kb_A-1',
     knowledgeBaseName: 'Base A',
     folders: [{ id: 'folder_A-1', name: 'Pasta A' }],
+    links: [{ url: 'https://example.com/docs', description: 'Rotas da API' }],
     cron: '30 * * * *',
     timezone: 'America/Maceio',
     enabled: true
   });
 });
 
-test('rejeita vínculo sem pastas, cron inválido e fuso inválido', () => {
-  assert.throws(() => normalizeTargetInput({ knowledgeBaseId: 'kb', folders: [], cron: '30 * * * *' }), /pelo menos uma pasta/);
+test('aceita vínculo somente com links e rejeita vínculo vazio, duplicado ou inválido', () => {
+  const linkOnly = normalizeTargetInput({ knowledgeBaseId: 'kb', links: [{ url: 'https://example.com/a' }], cron: '30 * * * *' });
+  assert.equal(linkOnly.folders.length, 0);
+  assert.equal(linkOnly.links[0].description, '');
+  assert.throws(() => normalizeTargetInput({ knowledgeBaseId: 'kb', folders: [], links: [], cron: '30 * * * *' }), /pelo menos uma pasta.*ou adicione um link/);
+  assert.throws(() => normalizeTargetInput({ knowledgeBaseId: 'kb', links: [{ url: 'https://example.com/a' }, { url: 'https://example.com/a#b' }] }), /mesmo link/);
+  assert.throws(() => normalizeTargetInput({ knowledgeBaseId: 'kb', links: [{ url: 'http://example.com' }] }), /HTTPS/);
   assert.throws(() => normalizeTargetInput({ knowledgeBaseId: 'kb', folders: [{ id: 'folder', name: 'Pasta' }], cron: 'inválido' }), /cinco campos/);
   assert.throws(() => normalizeTargetInput({ knowledgeBaseId: 'kb', folders: [{ id: 'folder', name: 'Pasta' }], cron: '30 * * * *', timezone: 'Marte/Olympus' }), /Fuso horário inválido/);
 });
@@ -54,6 +61,15 @@ test('migra intervalo legado preservando os casos comuns', () => {
   const migration = migrateTargetSchedule({ intervalMinutes: 60 }, 'America/Maceio');
   assert.deepEqual(migration.target, { cron: '30 * * * *', timezone: 'America/Maceio' });
   assert.equal(migration.changed, true);
+});
+
+test('migra manifesto legado do Drive sem alterar IDs ou checksums', () => {
+  const legacy = { folders: [{ id: 'folder' }], files: { 'folder:file': { fileId: 'uploaded-1', checksum: 'md5:abc' } } };
+  const migration = migrateTargetSources(legacy);
+  assert.equal(migration.changed, true);
+  assert.deepEqual(migration.target.links, []);
+  assert.deepEqual(migration.target.files['folder:file'], { fileId: 'uploaded-1', checksum: 'md5:abc', sourceType: 'google-drive' });
+  assert.equal('links' in legacy, false);
 });
 
 test('identifica alterações relacionadas aos arquivos e diretórios conhecidos', () => {
