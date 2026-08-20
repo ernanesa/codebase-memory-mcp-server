@@ -7,6 +7,7 @@ set -eu
 : "${WEBUI_ADMIN_EMAIL:?WEBUI_ADMIN_EMAIL não configurado}"
 : "${WEBUI_ADMIN_PASSWORD:?WEBUI_ADMIN_PASSWORD não configurado}"
 : "${OLLAMA_CHAT_MODEL:=gemma4:e2b}"
+: "${OLLAMA_CONTEXT_LENGTH:=64000}"
 : "${OLLAMA_EMBEDDING_MODEL:=bge-m3}"
 : "${RAG_RERANKING_MODEL:=}"
 : "${RAG_RERANKING_BATCH_SIZE:=4}"
@@ -126,9 +127,10 @@ curl -fsS "$OPENWEBUI_URL/api/v1/configs/tool_servers" \
 unset mcp_system_token mcp_admin_connection tool_servers_payload
 echo "MCP Admin validado, ativo e configurado com acesso total"
 
-models_payload="$(jq --arg knowledge_id "$knowledge_id" --arg chat_model "$OLLAMA_CHAT_MODEL" '
+models_payload="$(jq --arg knowledge_id "$knowledge_id" --arg chat_model "$OLLAMA_CHAT_MODEL" --argjson context_length "$OLLAMA_CONTEXT_LENGTH" '
   .models |= map(
     .base_model_id = $chat_model
+    | .params.num_ctx = $context_length
     | if .id == "business-model-sample" then
         .meta.knowledge = [{id:$knowledge_id,name:"Knowledge Base Sample",type:"collection"}]
       else . end

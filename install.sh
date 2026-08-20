@@ -32,6 +32,7 @@ OPENWEBUI_PREVIOUS_PASSWORD=''
 OPENWEBUI_DESIRED_PASSWORD=''
 OLLAMA_VERSION='0.32.1'
 OLLAMA_CHAT_MODEL='gemma4:e2b'
+OLLAMA_CONTEXT_LENGTH='64000'
 OLLAMA_KV_CACHE_QUANTIZATION='fp16'
 OLLAMA_KEEP_ALIVE='5m'
 OLLAMA_RUNTIME='docker'
@@ -50,7 +51,7 @@ SYSTEM_ARCHITECTURE="$(uname -m)"
 BREW_BIN=''
 OLLAMA_BIN=''
 ACTIVE_PHASE='Preparação'
-CONFIG_TOTAL_STEPS=8
+CONFIG_TOTAL_STEPS=9
 
 if [[ -t 1 ]]; then
   COLOR_BLUE='\033[0;34m'
@@ -391,6 +392,8 @@ configure_host_ollama_command() {
     printf '%s\n' '    <string>0.0.0.0:11434</string>'
     printf '%s\n' '    <key>OLLAMA_KEEP_ALIVE</key>'
     printf '    <string>%s</string>\n' "$OLLAMA_KEEP_ALIVE"
+    printf '%s\n' '    <key>OLLAMA_CONTEXT_LENGTH</key>'
+    printf '    <string>%s</string>\n' "$OLLAMA_CONTEXT_LENGTH"
     if [[ "$OLLAMA_KEEP_ALIVE" == '-1' ]]; then
       printf '%s\n' '    <key>OLLAMA_MAX_LOADED_MODELS</key>'
       printf '%s\n' '    <string>2</string>'
@@ -641,6 +644,29 @@ ask_ollama_model() {
   success "Modelo selecionado: ${OLLAMA_CHAT_MODEL}"
 }
 
+ask_ollama_context_length() {
+  local existing_context_length context_length
+  existing_context_length="$(read_existing_environment_value OLLAMA_CONTEXT_LENGTH)"
+  if [[ "$existing_context_length" =~ ^[1-9][0-9]*$ ]]; then
+    OLLAMA_CONTEXT_LENGTH="$existing_context_length"
+  else
+    OLLAMA_CONTEXT_LENGTH='64000'
+  fi
+
+  show_config_step 4 'Tamanho do contexto' 'Defina o número máximo de tokens de contexto usados pelo Ollama. Valores maiores consomem mais memória.'
+  while true; do
+    prompt_value "Tokens de contexto (padrão: ${OLLAMA_CONTEXT_LENGTH}):"
+    read -r context_length
+    context_length="${context_length:-$OLLAMA_CONTEXT_LENGTH}"
+    if [[ "$context_length" =~ ^[1-9][0-9]*$ ]]; then
+      OLLAMA_CONTEXT_LENGTH="$context_length"
+      break
+    fi
+    warn 'Informe um número inteiro maior que zero.'
+  done
+  success "Tamanho do contexto do Ollama: ${OLLAMA_CONTEXT_LENGTH} tokens"
+}
+
 ask_ollama_quantization() {
   local choice default_choice existing_quantization
   existing_quantization="$(read_existing_environment_value OLLAMA_KV_CACHE_QUANTIZATION)"
@@ -649,7 +675,7 @@ ask_ollama_quantization() {
     *) OLLAMA_KV_CACHE_QUANTIZATION='fp16' ;;
   esac
 
-  show_config_step 4 'Quantização do cache K/V' 'Escolha o equilíbrio entre precisão e consumo de memória do Ollama.'
+  show_config_step 5 'Quantização do cache K/V' 'Escolha o equilíbrio entre precisão e consumo de memória do Ollama.'
   print_option 1 'fp16' 'Maior precisão e uso de memória; padrão do Ollama'
   print_option 2 'q8_0' 'Aproximadamente metade da memória, com pequena perda de precisão'
   printf '\n'
@@ -676,7 +702,7 @@ ask_ollama_keep_alive() {
     *) OLLAMA_KEEP_ALIVE='5m' ;;
   esac
 
-  show_config_step 5 'Residência dos modelos' 'Defina por quanto tempo os modelos permanecem carregados na memória da GPU.'
+  show_config_step 6 'Residência dos modelos' 'Defina por quanto tempo os modelos permanecem carregados na memória da GPU.'
   print_option 1 'Sempre' 'Recomendado para servidor dedicado; mantém até dois modelos carregados'
   print_option 2 '30 minutos' 'Equilíbrio entre latência e liberação de VRAM'
   print_option 3 '5 minutos' 'Comportamento padrão do Ollama'
@@ -712,7 +738,7 @@ ask_ollama_gpu() {
   OLLAMA_GPU_MODE='cpu'
   OLLAMA_GPU_DEVICE_IDS=''
 
-  show_config_step 6 'Aceleração de hardware' 'O instalador detectará automaticamente os recursos disponíveis.'
+  show_config_step 7 'Aceleração de hardware' 'O instalador detectará automaticamente os recursos disponíveis.'
 
   if [[ "$OLLAMA_RUNTIME" == host ]]; then
     if [[ "$SYSTEM_ARCHITECTURE" == arm64 || "$SYSTEM_ARCHITECTURE" == aarch64 ]]; then
@@ -836,7 +862,7 @@ ask_proxy_access() {
   suggested_email="${OPENWEBUI_PREVIOUS_EMAIL:-$(read_existing_environment_value ADMIN_EMAIL)}"
   [[ "$suggested_email" == *@*.* ]] || suggested_email='joao@exemplo.com'
 
-  show_config_step 7 'Acesso administrativo' 'Esta credencial será usada no painel, no Open WebUI e no Grafana.'
+  show_config_step 8 'Acesso administrativo' 'Esta credencial será usada no painel, no Open WebUI e no Grafana.'
   printf "${COLOR_MUTED}A senha não será exibida durante a digitação.${COLOR_RESET}\n\n"
   while true; do
     prompt_value "E-mail administrativo (padrão: ${suggested_email}):"
@@ -925,7 +951,7 @@ ask_public_urls() {
   grafana_suggested="${grafana_suggested:-http://grafana.localhost:8080}"
   mcp_suggested="${mcp_suggested:-http://mcp.localhost:8080}"
 
-  show_config_step 8 'Endereços públicos' 'Cada serviço público usa um hostname próprio e opera na raiz, sem prefixo de caminho.'
+  show_config_step 9 'Endereços públicos' 'Cada serviço público usa um hostname próprio e opera na raiz, sem prefixo de caminho.'
   printf "${COLOR_MUTED}Use somente protocolo, domínio e porta opcional. Em produção, informe\n"
   printf "as quatro origens HTTPS publicadas pelo túnel.${COLOR_RESET}\n\n"
   ask_public_url OPENWEBUI_PUBLIC_URL 'Open WebUI' "$openwebui_suggested"
@@ -960,6 +986,7 @@ confirm_configuration() {
   printf '  Memória        %s MB\n' "$CBM_MEM_BUDGET_MB"
   printf '  Ollama         %s\n' "$ollama_execution"
   printf '  Modelo         %s\n' "$OLLAMA_CHAT_MODEL"
+  printf '  Contexto       %s tokens\n' "$OLLAMA_CONTEXT_LENGTH"
   printf '  Cache K/V      %s\n' "$OLLAMA_KV_CACHE_QUANTIZATION"
   printf '  Modelos em RAM %s\n' "$OLLAMA_KEEP_ALIVE"
   printf '  Aceleração     %s\n' "$ollama_acceleration"
@@ -1049,6 +1076,7 @@ write_ollama_quantization_compose_override() {
     printf '  ollama:\n'
     printf '    environment:\n'
     printf '      OLLAMA_KEEP_ALIVE: "%s"\n' "$OLLAMA_KEEP_ALIVE"
+    printf '      OLLAMA_CONTEXT_LENGTH: "%s"\n' "$OLLAMA_CONTEXT_LENGTH"
     if [[ "$OLLAMA_KEEP_ALIVE" == '-1' ]]; then
       printf '      OLLAMA_MAX_LOADED_MODELS: "2"\n'
     fi
@@ -1225,10 +1253,10 @@ create_environment_file() {
   admin_public_host="$(public_url_host "$admin_public_url")"
   grafana_public_host="$(public_url_host "$grafana_public_url")"
   mcp_public_host="$(public_url_host "$mcp_public_url")"
-  printf 'CBM_CACHE_DIR=%s\nCBM_ALLOWED_ROOT=%s\nCBM_MEM_BUDGET_MB=%s\nCBM_HOST_BIN=%s\nLOCAL_UID=%s\nLOCAL_GID=%s\nUI_PORT=%s\nOPENWEBUI_PUBLIC_URL=%s\nOPENWEBUI_PUBLIC_HOST=%s\nADMIN_PUBLIC_URL=%s\nADMIN_PUBLIC_HOST=%s\nGRAFANA_PUBLIC_URL=%s\nGRAFANA_PUBLIC_HOST=%s\nMCP_PUBLIC_URL=%s\nMCP_PUBLIC_HOST=%s\nWORKSPACE_TIMEZONE=%s\nREPOSITORY_SYNC_CONCURRENCY=%s\nADMIN_EMAIL=%s\nADMIN_USERNAME=%s\nOLLAMA_VERSION=%s\nOLLAMA_CHAT_MODEL=%s\nOLLAMA_KV_CACHE_QUANTIZATION=%s\nOLLAMA_KEEP_ALIVE=%s\nOLLAMA_RUNTIME=%s\nOLLAMA_BASE_URL=%s\nCOMPOSE_FILE=%s\nCOMPOSE_PROFILES=%s\nOLLAMA_GPU_MODE=%s\nOLLAMA_GPU_DEVICE_IDS=%s\nDOCLING_VERSION=%s\nDOCLING_CPU_THREADS=%s\nRAG_RERANKING_MODEL=%s\nRAG_RERANKING_BATCH_SIZE=%s\nRAG_TOP_K=%s\nRAG_TOP_K_RERANKER=%s\n' \
+  printf 'CBM_CACHE_DIR=%s\nCBM_ALLOWED_ROOT=%s\nCBM_MEM_BUDGET_MB=%s\nCBM_HOST_BIN=%s\nLOCAL_UID=%s\nLOCAL_GID=%s\nUI_PORT=%s\nOPENWEBUI_PUBLIC_URL=%s\nOPENWEBUI_PUBLIC_HOST=%s\nADMIN_PUBLIC_URL=%s\nADMIN_PUBLIC_HOST=%s\nGRAFANA_PUBLIC_URL=%s\nGRAFANA_PUBLIC_HOST=%s\nMCP_PUBLIC_URL=%s\nMCP_PUBLIC_HOST=%s\nWORKSPACE_TIMEZONE=%s\nREPOSITORY_SYNC_CONCURRENCY=%s\nADMIN_EMAIL=%s\nADMIN_USERNAME=%s\nOLLAMA_VERSION=%s\nOLLAMA_CHAT_MODEL=%s\nOLLAMA_CONTEXT_LENGTH=%s\nOLLAMA_KV_CACHE_QUANTIZATION=%s\nOLLAMA_KEEP_ALIVE=%s\nOLLAMA_RUNTIME=%s\nOLLAMA_BASE_URL=%s\nCOMPOSE_FILE=%s\nCOMPOSE_PROFILES=%s\nOLLAMA_GPU_MODE=%s\nOLLAMA_GPU_DEVICE_IDS=%s\nDOCLING_VERSION=%s\nDOCLING_CPU_THREADS=%s\nRAG_RERANKING_MODEL=%s\nRAG_RERANKING_BATCH_SIZE=%s\nRAG_TOP_K=%s\nRAG_TOP_K_RERANKER=%s\n' \
     "$CACHE_DIR" "$REPOSITORIES_DIR" "$CBM_MEM_BUDGET_MB" "$CBM_CONTAINER_BIN" "$(id -u)" "$(id -g)" "$ui_port" \
     "$openwebui_public_url" "$openwebui_public_host" "$admin_public_url" "$admin_public_host" "$grafana_public_url" "$grafana_public_host" "$mcp_public_url" "$mcp_public_host" \
-    "$workspace_timezone" "$repository_sync_concurrency" "$ADMIN_EMAIL" "$ADMIN_USERNAME" "$OLLAMA_VERSION" "$OLLAMA_CHAT_MODEL" "$OLLAMA_KV_CACHE_QUANTIZATION" "$OLLAMA_KEEP_ALIVE" "$OLLAMA_RUNTIME" "$OLLAMA_BASE_URL" "$compose_file" "$compose_profiles" "$OLLAMA_GPU_MODE" "$OLLAMA_GPU_DEVICE_IDS" "$DOCLING_VERSION" "$DOCLING_CPU_THREADS" "$RAG_RERANKING_MODEL" "$RAG_RERANKING_BATCH_SIZE" "$RAG_TOP_K" "$RAG_TOP_K_RERANKER" >"$temporary_file"
+    "$workspace_timezone" "$repository_sync_concurrency" "$ADMIN_EMAIL" "$ADMIN_USERNAME" "$OLLAMA_VERSION" "$OLLAMA_CHAT_MODEL" "$OLLAMA_CONTEXT_LENGTH" "$OLLAMA_KV_CACHE_QUANTIZATION" "$OLLAMA_KEEP_ALIVE" "$OLLAMA_RUNTIME" "$OLLAMA_BASE_URL" "$compose_file" "$compose_profiles" "$OLLAMA_GPU_MODE" "$OLLAMA_GPU_DEVICE_IDS" "$DOCLING_VERSION" "$DOCLING_CPU_THREADS" "$RAG_RERANKING_MODEL" "$RAG_RERANKING_BATCH_SIZE" "$RAG_TOP_K" "$RAG_TOP_K_RERANKER" >"$temporary_file"
   chmod 600 "$temporary_file"
   mv "$temporary_file" "$ENV_FILE"
   success "Arquivo .env gerado com caminhos absolutos"
@@ -1797,7 +1825,7 @@ show_summary() {
   printf '  Endpoint MCP          %s/\n' "$mcp_public_url"
   printf "\n${COLOR_BOLD}CONFIGURAÇÃO${COLOR_RESET}\n"
   printf '  Administrador         %s\n' "$ADMIN_EMAIL"
-  printf '  Ollama                %s · cache K/V %s · residência %s · %s · %s\n' "$OLLAMA_CHAT_MODEL" "$OLLAMA_KV_CACHE_QUANTIZATION" "$OLLAMA_KEEP_ALIVE" "$ollama_execution" "$ollama_acceleration"
+  printf '  Ollama                %s · contexto %s tokens · cache K/V %s · residência %s · %s · %s\n' "$OLLAMA_CHAT_MODEL" "$OLLAMA_CONTEXT_LENGTH" "$OLLAMA_KV_CACHE_QUANTIZATION" "$OLLAMA_KEEP_ALIVE" "$ollama_execution" "$ollama_acceleration"
   printf '  Memória               %s MB\n' "$CBM_MEM_BUDGET_MB"
   printf '  Repositórios          %s\n' "$REPOSITORIES_DIR"
   printf '  Arquivo de ambiente   %s\n' "$ENV_FILE"
@@ -1815,6 +1843,7 @@ main() {
   ask_memory_budget
   ask_ollama_runtime
   ask_ollama_model
+  ask_ollama_context_length
   ask_ollama_quantization
   ask_ollama_keep_alive
   ask_ollama_gpu

@@ -250,7 +250,7 @@ test('presets de exemplo selecionam o padrão e carregam parâmetros e integraç
   assert.deepEqual(manifest.models.map(model => model.id), ['business-model-sample', 'code-model-sample']);
   for (const model of manifest.models) {
     assert.equal(model.base_model_id, 'gemma4:e2b');
-    assert.equal(model.params.num_ctx, 32768);
+    assert.equal(model.params.num_ctx, 64000);
     assert.equal(model.params.function_calling, 'native');
   }
   assert.equal(manifest.models[0].params.temperature, 0.3);
@@ -330,13 +330,16 @@ test('instalador sugere Gemma 4, fixa Ollama 0.32.1 e bootstrap usa o contrato a
   const compose = await readFile(path.join(root, 'compose.yaml'), 'utf8');
   assert.match(install, /OLLAMA_VERSION='0\.32\.1'/);
   assert.match(install, /OLLAMA_CHAT_MODEL='gemma4:e2b'/);
+  assert.match(install, /OLLAMA_CONTEXT_LENGTH='64000'/);
   assert.match(install, /DOCLING_VERSION='v1\.26\.0'/);
   assert.match(install, /DOCLING_CPU_THREADS='6'/);
   assert.match(install, /RAG_RERANKING_MODEL='BAAI\/bge-reranker-v2-m3'/);
   assert.match(install, /gemma4:e4b \(Gemma 4 Effective 4B\)/);
   assert.match(compose, /OLLAMA_VERSION:-0\.32\.1/);
   assert.match(compose, /OLLAMA_CHAT_MODEL:-gemma4:e2b/);
+  assert.match(compose, /OLLAMA_CONTEXT_LENGTH:-64000/);
   assert.match(install, /ask_ollama_model/);
+  assert.match(install, /ask_ollama_context_length/);
   assert.match(install, /ask_ollama_quantization/);
   assert.match(install, /ask_ollama_keep_alive/);
   assert.match(install, /ask_ollama_runtime/);
@@ -465,6 +468,25 @@ test('seletor de quantização usa fp16 por padrão e preserva q8_0 na reinstala
   }
 });
 
+test('seletor de contexto usa 64000 por padrão e preserva o valor na reinstalação', async () => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), 'cbm-ollama-context-install-'));
+  try {
+    await copyFile(path.join(root, 'install.sh'), path.join(temporaryRoot, 'install.sh'));
+    const selectionFile = path.join(temporaryRoot, 'selection');
+    await execFileAsync('bash', ['-c', `
+      source "$1"
+      ask_ollama_context_length <<< $'\\n'
+      printf '%s\\n' "$OLLAMA_CONTEXT_LENGTH" >"$2"
+      printf 'OLLAMA_CONTEXT_LENGTH=128000\\n' >"$(dirname "$1")/.env"
+      ask_ollama_context_length <<< $'\\n'
+      printf '%s\\n' "$OLLAMA_CONTEXT_LENGTH" >>"$2"
+    `, 'test', path.join(temporaryRoot, 'install.sh'), selectionFile]);
+    assert.equal(await readFile(selectionFile, 'utf8'), '64000\n128000\n');
+  } finally {
+    await rm(temporaryRoot, { recursive: true, force: true });
+  }
+});
+
 test('override persiste residência dos modelos e adiciona quantização somente em q8_0', async () => {
   const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), 'cbm-ollama-quantization-compose-'));
   try {
@@ -481,6 +503,7 @@ test('override persiste residência dos modelos e adiciona quantização somente
     assert.match(override, /OLLAMA_FLASH_ATTENTION: "1"/);
     assert.match(override, /OLLAMA_KV_CACHE_TYPE: q8_0/);
     assert.match(override, /OLLAMA_KEEP_ALIVE: "-1"/);
+    assert.match(override, /OLLAMA_CONTEXT_LENGTH: "64000"/);
     assert.match(override, /OLLAMA_MAX_LOADED_MODELS: "2"/);
 
     await execFileAsync('bash', ['-c', `
@@ -535,6 +558,7 @@ test('reinstalação grava e preserva OLLAMA_VERSION no ambiente', async () => {
     const environment = await readFile(path.join(temporaryRoot, '.env'), 'utf8');
     assert.match(environment, /^OLLAMA_VERSION=0\.31\.2$/m);
     assert.match(environment, /^OLLAMA_CHAT_MODEL=gemma4:e2b$/m);
+    assert.match(environment, /^OLLAMA_CONTEXT_LENGTH=64000$/m);
     assert.match(environment, /^OLLAMA_KV_CACHE_QUANTIZATION=fp16$/m);
     assert.match(environment, /^OLLAMA_KEEP_ALIVE=5m$/m);
     assert.match(environment, /^OLLAMA_RUNTIME=docker$/m);
@@ -764,6 +788,7 @@ test('modo host registra um LaunchAgent persistente para o Ollama', async () => 
     assert.match(launchAgent, /<key>OLLAMA_FLASH_ATTENTION<\/key>\s*<string>1<\/string>/);
     assert.match(launchAgent, /<key>OLLAMA_KV_CACHE_TYPE<\/key>\s*<string>q8_0<\/string>/);
     assert.match(launchAgent, /<key>OLLAMA_KEEP_ALIVE<\/key>\s*<string>-1<\/string>/);
+    assert.match(launchAgent, /<key>OLLAMA_CONTEXT_LENGTH<\/key>\s*<string>64000<\/string>/);
     assert.match(launchAgent, /<key>OLLAMA_MAX_LOADED_MODELS<\/key>\s*<string>2<\/string>/);
     assert.match(launchAgent, /<key>RunAtLoad<\/key>\s*<true\/>/);
     assert.match(launchAgent, /<key>KeepAlive<\/key>\s*<true\/>/);
