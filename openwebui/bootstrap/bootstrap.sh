@@ -39,6 +39,10 @@ wait_for() {
 pull_model() {
   model="$1"
   echo "Garantindo modelo Ollama: $model"
+  if curl -fsS "$OLLAMA_URL/api/tags" | jq -e --arg m "$model" '.models[]? | select(.name == $m or .model == $m)' >/dev/null 2>&1; then
+    echo "Modelo Ollama $model já disponível localmente"
+    return 0
+  fi
   curl -fsS "$OLLAMA_URL/api/pull" \
     -H 'content-type: application/json' \
     -d "$(jq -cn --arg model "$model" '{model:$model,stream:false}')" >/dev/null
