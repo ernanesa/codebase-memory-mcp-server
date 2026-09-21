@@ -18,7 +18,7 @@ test('Compose inclui Ollama, Docling, Open WebUI, bootstrap e worker permanente'
   assert.match(compose, /CONTENT_EXTRACTION_ENGINE: docling/);
   assert.match(compose, /RAG_EMBEDDING_MODEL: bge-m3/);
   assert.match(compose, /DOCLING_SERVER_URL: http:\/\/docling:5001/);
-  assert.match(compose, /docling-serve-cpu:\$\{DOCLING_VERSION:-v1\.26\.0\}/);
+  assert.match(compose, /docling-serve-cpu:\$\{DOCLING_VERSION:-v1\.34\.0\}/);
   assert.match(compose, /DOCLING_DEVICE: cpu/);
   assert.match(compose, /DOCLING_SERVE_ENG_LOC_NUM_WORKERS: "1"/);
   assert.match(compose, /DOCLING_SERVE_ENG_LOC_SHARE_MODELS: "true"/);
@@ -336,7 +336,7 @@ test('instalador sugere Gemma 4, fixa Ollama 0.32.1 e bootstrap usa o contrato a
   assert.match(install, /DOCLING_CPU_THREADS='6'/);
   assert.match(install, /RAG_RERANKING_MODEL='BAAI\/bge-reranker-v2-m3'/);
   assert.match(install, /gemma4:e4b \(Gemma 4 Effective 4B\)/);
-  assert.match(compose, /OLLAMA_VERSION:-0\.32\.1/);
+  assert.match(compose, /OLLAMA_VERSION:-0\.34\.2/);
   assert.match(compose, /OLLAMA_CHAT_MODEL:-gemma4:e2b/);
   assert.match(compose, /OLLAMA_CONTEXT_LENGTH:-64000/);
   assert.match(install, /ask_ollama_model/);
