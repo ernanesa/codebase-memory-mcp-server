@@ -13,7 +13,9 @@ import {
   pruneArchitecturePayload,
   pruneSnippetPayload,
   applyPayloadPruning,
-  FACADE_TOOLS
+  FACADE_TOOLS,
+  resolveProjectAlias,
+  DUPLICATE_RAW_TOOLS
 } from '../src/mcp-guardrail.js';
 
 const scopedAccess = {
@@ -301,4 +303,135 @@ test('servidor gRPC executa mapeamento facade em CheckRequest e poda em CheckRes
   const parsedContent = JSON.parse(mutatedResponse.content[0].text);
   assert.deepEqual(parsedContent.callers.map(c => c.name), ['ApiGateway']);
 });
+
+test('resolveProjectAlias resolve apelidos e nomes curtos para o ID canônico', () => {
+  const known = new Set([
+    'data-repositories-claps-clapsapi-gestor',
+    'data-repositories-claps-clapsapi-autorizador',
+    'data-repositories-pagueon-pagueonapi-recorrente',
+    'data-repositories-pagueon-front-pagueon-front'
+  ]);
+
+  // Correspondência exata
+  assert.equal(resolveProjectAlias('data-repositories-claps-clapsapi-gestor', known), 'data-repositories-claps-clapsapi-gestor');
+
+  // Case-insensitive
+  assert.equal(resolveProjectAlias('DATA-REPOSITORIES-CLAPS-CLAPSAPI-GESTOR', known), 'data-repositories-claps-clapsapi-gestor');
+
+  // Nome curto com sufixo
+  assert.equal(resolveProjectAlias('clapsapi-gestor', known), 'data-repositories-claps-clapsapi-gestor');
+  assert.equal(resolveProjectAlias('pagueonapi-recorrente', known), 'data-repositories-pagueon-pagueonapi-recorrente');
+
+  // Notação com barra
+  assert.equal(resolveProjectAlias('claps/clapsapi-gestor', known), 'data-repositories-claps-clapsapi-gestor');
+  assert.equal(resolveProjectAlias('pagueon/front', known), 'data-repositories-pagueon-front-pagueon-front');
+
+  // Inexistente
+  assert.equal(resolveProjectAlias('projeto-desconhecido', known), null);
+  assert.equal(resolveProjectAlias('', known), null);
+  assert.equal(resolveProjectAlias(null, known), null);
+});
+
+test('filterToolsListResult com pruneDuplicates expõe apenas facade e ferramentas essenciais', () => {
+  const allTools = {
+    tools: [
+      { name: 'search_graph' },
+      { name: 'search_code' },
+      { name: 'trace_path' },
+      { name: 'get_code_snippet' },
+      { name: 'get_graph_schema' },
+      { name: 'detect_changes' },
+      { name: 'query_graph' },
+      { name: 'get_architecture' },
+      { name: 'list_projects' },
+      { name: 'index_status' }
+    ]
+  };
+
+  const pruned = filterToolsListResult(allTools, { includeFacade: true, pruneDuplicates: true });
+  const names = pruned.tools.map(t => t.name);
+
+  // Deve conter as ferramentas facade
+  assert.ok(names.includes('code_search_surgical'));
+  assert.ok(names.includes('trace_symbol'));
+  assert.ok(names.includes('get_symbol_snippet'));
+
+  // Deve conter as essenciais
+  assert.ok(names.includes('get_architecture'));
+  assert.ok(names.includes('list_projects'));
+  assert.ok(names.includes('index_status'));
+
+  // NÃO deve conter as duplicadas brutas
+  for (const raw of DUPLICATE_RAW_TOOLS) {
+    assert.equal(names.includes(raw), false, `Ferramenta bruta duplicada ${raw} deveria ter sido podada`);
+  }
+});
+
+test('authorizeToolCall resolve apelido de projeto e autoriza com sucesso', () => {
+  const accessWithAliases = {
+    system: false,
+    allowedProjects: new Set(['data-repositories-claps-clapsapi-gestor']),
+    knownProjects: new Set([
+      'data-repositories-claps-clapsapi-gestor',
+      'data-repositories-pagueon-pagueonapi-recorrente'
+    ])
+  };
+
+  const res = authorizeToolCall({
+    name: 'code_search_surgical',
+    arguments: { project: 'clapsapi-gestor', query: 'Processar' }
+  }, accessWithAliases);
+
+  assert.equal(res.allowed, true);
+  assert.equal(res.resolvedProject, 'data-repositories-claps-clapsapi-gestor');
+
+  // Projeto não autorizado
+  const deniedRes = authorizeToolCall({
+    name: 'code_search_surgical',
+    arguments: { project: 'pagueonapi-recorrente', query: 'Processar' }
+  }, accessWithAliases);
+  assert.equal(deniedRes.allowed, false);
+  assert.match(deniedRes.reason, /não possui acesso/);
+});
+
+test('servidor gRPC resolve apelido em CheckRequest e muta project para canônico', async t => {
+  const aliasAccess = {
+    system: false,
+    allowedProjects: new Set(['data-repositories-claps-clapsapi-gestor']),
+    knownProjects: new Set(['data-repositories-claps-clapsapi-gestor'])
+  };
+
+  const server = await startMcpGuardrailServer(userId => userId === 'user-alias' ? aliasAccess : null, '127.0.0.1:0');
+  t.after(() => new Promise(resolve => server.tryShutdown(resolve)));
+  const protoRoot = path.resolve(import.meta.dirname, '..', 'proto');
+  const definition = protoLoader.loadSync(path.join(protoRoot, 'ext_mcp.proto'), {
+    includeDirs: [protoRoot],
+    keepCase: false,
+    longs: String,
+    enums: String,
+    defaults: false,
+    oneofs: true
+  });
+  const descriptor = grpc.loadPackageDefinition(definition);
+  const Client = descriptor.agentgateway.dev.ext_mcp.ExtMcp;
+  const client = new Client(`127.0.0.1:${server.boundPort}`, grpc.credentials.createInsecure());
+  t.after(() => client.close());
+
+  const reqResult = await new Promise((resolve, reject) => client.CheckRequest({
+    method: 'tools/call',
+    metadataContext: { fields: { userId: { stringValue: 'user-alias' } } },
+    mcpRequest: Buffer.from(JSON.stringify({
+      name: 'code_search_surgical',
+      arguments: { project: 'claps/clapsapi-gestor', query: 'ProcessarContrato' }
+    }))
+  }, (error, response) => error ? reject(error) : resolve(response)));
+
+  assert.ok(reqResult.mutated);
+  const mutated = JSON.parse(reqResult.mutated);
+  assert.equal(mutated.name, 'search_graph');
+  assert.equal(mutated.arguments.project, 'data-repositories-claps-clapsapi-gestor');
+  assert.equal(mutated.arguments.query, 'ProcessarContrato');
+  assert.equal(reqResult.metadata.fields.resolvedProject.stringValue, 'data-repositories-claps-clapsapi-gestor');
+});
+
 

@@ -6,7 +6,8 @@ set -eu
 : "${OLLAMA_URL:?OLLAMA_URL não configurada}"
 : "${WEBUI_ADMIN_EMAIL:?WEBUI_ADMIN_EMAIL não configurado}"
 : "${WEBUI_ADMIN_PASSWORD:?WEBUI_ADMIN_PASSWORD não configurado}"
-: "${OLLAMA_CHAT_MODEL:=gemma4:e2b}"
+: "${OLLAMA_CHAT_MODEL:=qwen2.5-coder:14b-instruct-q4_0}"
+: "${OLLAMA_BUSINESS_MODEL:=ornith15-9b-ad:latest}"
 : "${OLLAMA_CONTEXT_LENGTH:=64000}"
 : "${OLLAMA_EMBEDDING_MODEL:=bge-m3}"
 : "${RAG_RERANKING_MODEL:=}"
@@ -46,6 +47,7 @@ pull_model() {
 wait_for "Ollama" "$OLLAMA_URL/api/tags"
 wait_for "Open WebUI" "$OPENWEBUI_URL/health"
 pull_model "$OLLAMA_CHAT_MODEL"
+[ "$OLLAMA_BUSINESS_MODEL" = "$OLLAMA_CHAT_MODEL" ] || pull_model "$OLLAMA_BUSINESS_MODEL"
 pull_model "$OLLAMA_EMBEDDING_MODEL"
 
 auth_payload="$(jq -cn --arg email "$WEBUI_ADMIN_EMAIL" --arg password "$WEBUI_ADMIN_PASSWORD" '{email:$email,password:$password}')"
@@ -127,9 +129,9 @@ curl -fsS "$OPENWEBUI_URL/api/v1/configs/tool_servers" \
 unset mcp_system_token mcp_admin_connection tool_servers_payload
 echo "MCP Admin validado, ativo e configurado com acesso total"
 
-models_payload="$(jq --arg knowledge_id "$knowledge_id" --arg chat_model "$OLLAMA_CHAT_MODEL" --argjson context_length "$OLLAMA_CONTEXT_LENGTH" '
+models_payload="$(jq --arg knowledge_id "$knowledge_id" --arg chat_model "$OLLAMA_CHAT_MODEL" --arg business_model "$OLLAMA_BUSINESS_MODEL" --argjson context_length "$OLLAMA_CONTEXT_LENGTH" '
   .models |= map(
-    .base_model_id = $chat_model
+    (if .id == "business-model-sample" then .base_model_id = $business_model else .base_model_id = $chat_model end)
     | .params.num_ctx = $context_length
     | if .id == "business-model-sample" then
         .meta.knowledge = [{id:$knowledge_id,name:"Knowledge Base Sample",type:"collection"}]
