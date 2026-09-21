@@ -31,6 +31,8 @@ services:
       CBM_ALLOWED_ROOT: /data/repositories
       CBM_CACHE_DIR: /data/cache
       CBM_MEM_BUDGET_MB: "${CBM_MEM_BUDGET_MB}"
+      CBM_SQLITE_MMAP_SIZE: "${CBM_SQLITE_MMAP_SIZE:-2147483648}"
+      CBM_WORKERS: "${CBM_WORKERS:-4}"
     volumes:
       - ./data/agentgateway:/config
       - ./repositories:/data/repositories:ro
