@@ -248,8 +248,9 @@ print(json.dumps([module.get_file_citation_metadata(item) for item in cases]))
 test('presets de exemplo selecionam o padrão e carregam parâmetros e integrações esperados', async () => {
   const manifest = JSON.parse(await readFile(path.join(root, 'openwebui/bootstrap/models.json'), 'utf8'));
   assert.deepEqual(manifest.models.map(model => model.id), ['business-model-sample', 'code-model-sample']);
+  assert.equal(manifest.models[0].base_model_id, 'ornith15-9b-ad:latest');
+  assert.equal(manifest.models[1].base_model_id, 'qwen2.5-coder:14b-instruct-q4_0');
   for (const model of manifest.models) {
-    assert.equal(model.base_model_id, 'gemma4:e2b');
     assert.equal(model.params.num_ctx, 64000);
     assert.equal(model.params.function_calling, 'native');
   }

@@ -167,14 +167,98 @@ export function filterListProjectsResult(result, allowedProjects) {
   return filterProjectPayload(filtered, allowedProjects);
 }
 
-export function filterToolsListResult(result, { includeFacade = false } = {}) {
+export const DUPLICATE_RAW_TOOLS = new Set([
+  'search_graph',
+  'search_code',
+  'trace_path',
+  'get_code_snippet',
+  'get_graph_schema',
+  'detect_changes',
+  'query_graph'
+]);
+
+export function filterToolsListResult(result, { includeFacade = false, pruneDuplicates = false } = {}) {
   if (!Array.isArray(result?.tools)) return result;
-  const filtered = result.tools.filter(tool => MCP_ANALYSIS_TOOLS.has(tool?.name));
+  let filtered = result.tools.filter(tool => MCP_ANALYSIS_TOOLS.has(tool?.name));
+  if (pruneDuplicates) {
+    filtered = filtered.filter(tool => !DUPLICATE_RAW_TOOLS.has(tool?.name));
+  }
   if (!includeFacade) return { ...result, tools: filtered };
 
   const existingNames = new Set(filtered.map(t => t?.name));
   const toAdd = FACADE_TOOL_DEFINITIONS.filter(t => !existingNames.has(t.name));
   return { ...result, tools: [...filtered, ...toAdd] };
+}
+
+export function resolveProjectAlias(requestedProject, knownProjects) {
+  if (!requestedProject || typeof requestedProject !== 'string') return null;
+  if (!knownProjects) return null;
+
+  const trimmed = requestedProject.trim();
+  if (!trimmed) return null;
+
+  const knownList = knownProjects instanceof Set
+    ? Array.from(knownProjects)
+    : (Array.isArray(knownProjects) ? knownProjects : []);
+
+  if (knownList.length === 0) return null;
+
+  if (knownProjects instanceof Set && knownProjects.has(trimmed)) return trimmed;
+  if (Array.isArray(knownProjects) && knownProjects.includes(trimmed)) return trimmed;
+
+  const lowerTrimmed = trimmed.toLowerCase();
+  for (const kp of knownList) {
+    if (typeof kp === 'string' && kp.toLowerCase() === lowerTrimmed) {
+      return kp;
+    }
+  }
+
+  const clean = str => String(str).toLowerCase().replace(/[/\\_.:\s]+/g, '-').replace(/^-+|-+$/g, '');
+  const target = clean(lowerTrimmed);
+  if (!target) return null;
+
+  const candidates = [];
+  for (const kp of knownList) {
+    if (typeof kp !== 'string') continue;
+    const normKp = clean(kp);
+    const strippedKp = normKp.replace(/^data-repositories-/, '');
+
+    if (normKp === target || strippedKp === target) {
+      return kp;
+    }
+
+    if (strippedKp.endsWith(`-${target}`) || normKp.endsWith(`-${target}`)) {
+      candidates.push(kp);
+    }
+  }
+
+  if (candidates.length === 1) {
+    return candidates[0];
+  }
+  if (candidates.length > 1) {
+    candidates.sort((a, b) => a.length - b.length);
+    return candidates[0];
+  }
+
+  const loose = [];
+  for (const kp of knownList) {
+    if (typeof kp !== 'string') continue;
+    const normKp = clean(kp);
+    const strippedKp = normKp.replace(/^data-repositories-/, '');
+    if (strippedKp.includes(target) || normKp.includes(target)) {
+      loose.push(kp);
+    }
+  }
+
+  if (loose.length === 1) {
+    return loose[0];
+  }
+  if (loose.length > 1) {
+    loose.sort((a, b) => a.length - b.length);
+    return loose[0];
+  }
+
+  return null;
 }
 
 export function isTestFileOrSymbol(item) {
@@ -390,28 +474,37 @@ export function mapFacadeRequest(params) {
 }
 
 export function authorizeToolCall(params, access) {
-  if (access?.system === true) return { allowed: true, toolName: params?.name };
-  if (!access) return { allowed: false, reason: 'Credencial sem cadastro de acesso MCP.' };
-
   const toolName = String(params?.name || '');
   const args = params?.arguments && typeof params.arguments === 'object' ? params.arguments : {};
+  const rawProject = typeof args.project === 'string' ? args.project : '';
+  const knownProjects = access?.knownProjects || access?.allowedProjects;
+
+  let resolvedProject = rawProject;
+  if (rawProject && knownProjects) {
+    const alias = resolveProjectAlias(rawProject, knownProjects);
+    if (alias) {
+      resolvedProject = alias;
+    }
+  }
+
+  if (access?.system === true) return { allowed: true, toolName: params?.name, resolvedProject };
+  if (!access) return { allowed: false, reason: 'Credencial sem cadastro de acesso MCP.' };
+
   if (!MCP_ANALYSIS_TOOLS.has(toolName)) {
     return { allowed: false, reason: `A ferramenta ${toolName || 'informada'} não está disponível para tokens individuais.` };
   }
-  if (toolName === 'list_projects') return { allowed: true, toolName };
+  if (toolName === 'list_projects') return { allowed: true, toolName, resolvedProject };
   if ((toolName === 'trace_path' || toolName === 'trace_symbol') && args.mode === 'cross_service') {
     return { allowed: false, reason: `${toolName} em modo cross_service pode atravessar repositórios e exige a credencial de sistema.` };
   }
-  const project = typeof args.project === 'string' ? args.project : '';
-  if (!project) return { allowed: false, reason: `A ferramenta ${toolName} exige o projeto do repositório.` };
-  const knownProjects = access.knownProjects || access.allowedProjects;
-  if (!knownProjects.has(project)) {
-    return { allowed: false, reason: `O repositório do projeto ${project} não existe ou ainda não foi indexado.` };
+  if (!rawProject) return { allowed: false, reason: `A ferramenta ${toolName} exige o projeto do repositório.` };
+  if (!knownProjects || !knownProjects.has(resolvedProject)) {
+    return { allowed: false, reason: `O repositório do projeto ${rawProject} não existe ou ainda não foi indexado.` };
   }
-  if (!access.allowedProjects.has(project)) {
-    return { allowed: false, reason: `O usuário não possui acesso ao repositório do projeto ${project}.` };
+  if (!access.allowedProjects.has(resolvedProject)) {
+    return { allowed: false, reason: `O usuário não possui acesso ao repositório do projeto ${rawProject}.` };
   }
-  return { allowed: true, toolName };
+  return { allowed: true, toolName, resolvedProject };
 }
 
 export function createMcpGuardrailHandlers(resolveAccess) {
@@ -425,14 +518,23 @@ export function createMcpGuardrailHandlers(resolveAccess) {
         const decision = authorizeToolCall(params, resolveAccess(userId));
         if (!decision.allowed) return callback(null, permissionDenied(decision.reason));
 
-        const mapResult = mapFacadeRequest(params);
-        if (mapResult.mapped) {
+        const requestParams = structuredClone(params);
+        if (decision.resolvedProject && requestParams.arguments && typeof requestParams.arguments === 'object') {
+          requestParams.arguments.project = decision.resolvedProject;
+        }
+
+        const mapResult = mapFacadeRequest(requestParams);
+        const shouldMutate = mapResult.mapped || (decision.resolvedProject && decision.resolvedProject !== params?.arguments?.project);
+
+        if (shouldMutate) {
+          const finalParams = mapResult.mapped ? mapResult.params : requestParams;
           return callback(null, {
-            mutated: Buffer.from(JSON.stringify(mapResult.params)),
+            mutated: Buffer.from(JSON.stringify(finalParams)),
             metadata: structToProto({
               toolName: mapResult.backendTool,
-              facadeTool: mapResult.facadeTool,
-              originalTool: params.name || ''
+              facadeTool: mapResult.facadeTool || '',
+              originalTool: params.name || '',
+              resolvedProject: decision.resolvedProject || ''
             })
           });
         }
@@ -441,7 +543,8 @@ export function createMcpGuardrailHandlers(resolveAccess) {
           pass: {},
           metadata: structToProto({
             toolName: decision.toolName || '',
-            originalTool: params.name || ''
+            originalTool: params.name || '',
+            resolvedProject: decision.resolvedProject || ''
           })
         });
       } catch (error) {
@@ -457,7 +560,7 @@ export function createMcpGuardrailHandlers(resolveAccess) {
 
         const result = parseJsonBuffer(call.request.mcpResponse || call.request.mcp_response, 'A resposta MCP');
         if (call.request.method === 'tools/list') {
-          return callback(null, { mutated: Buffer.from(JSON.stringify(filterToolsListResult(result, { includeFacade: true }))) });
+          return callback(null, { mutated: Buffer.from(JSON.stringify(filterToolsListResult(result, { includeFacade: true, pruneDuplicates: true }))) });
         }
 
         const toolName = String(metadata.toolName || '');

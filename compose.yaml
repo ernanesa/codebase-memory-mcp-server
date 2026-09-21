@@ -137,6 +137,10 @@ services:
     image: ollama/ollama:${OLLAMA_VERSION:-0.32.1}
     profiles: ["ollama-docker"]
     restart: unless-stopped
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
     volumes:
       - ollama-data:/root/.ollama
     ports:
@@ -177,6 +181,10 @@ services:
       context: ./openwebui
     image: codebase-memory-open-webui:0.11.0-google-drive-config
     restart: unless-stopped
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
     depends_on:
       docling:
         condition: service_healthy
@@ -226,6 +234,7 @@ services:
       OPENWEBUI_URL: http://open-webui:8080
       OLLAMA_URL: "${OLLAMA_BASE_URL:-http://ollama:11434}"
       OLLAMA_CHAT_MODEL: "${OLLAMA_CHAT_MODEL:-gemma4:e2b}"
+      OLLAMA_BUSINESS_MODEL: "${OLLAMA_BUSINESS_MODEL:-ornith15-9b-ad:latest}"
       OLLAMA_CONTEXT_LENGTH: "${OLLAMA_CONTEXT_LENGTH:-64000}"
       OLLAMA_EMBEDDING_MODEL: bge-m3
       RAG_RERANKING_MODEL: "${RAG_RERANKING_MODEL-BAAI/bge-reranker-v2-m3}"
