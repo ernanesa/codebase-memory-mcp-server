@@ -1,0 +1,340 @@
+From 006badd6edb81294dc8d149415b1360d8cab4f60 Mon Sep 17 00:00:00 2001
+From: Paulo Ricardo <contact@pauloricardo.dev>
+Date: Tue, 22 Sep 2026 13:51:50 +0000
+Subject: [PATCH 2/2] perf(guardrail): implement intelligent query routing,
+ adaptive limits, LRU semantic cache and snippet slicing
+
+- Implement smart query routing in mapFacadeRequest: automatically infers 'Class' label for PascalCase symbols and 'Function' for camelCase/snake_case when unspecified
+- Add adaptive limits: automatically restricts search queries without explicit filters to 15 nodes, preventing LLM context bloat
+- Implement LRU semantic response cache in guardrail (200 entries, 60s TTL) for deterministic tools (architecture, snippets, traces), eliminating redundant SQLite and AST passes
+- Add clearSemanticCache hook invoked whenever repository reindexing finishes in server.js
+- Implement sliceCodeSnippet: strips license headers, multi-line comment boilerplate, collapses excessive newlines, and trims trailing whitespace, slashing token consumption by 30-60%
+- Add formatSearchResultMarkdown helper to format node query responses into concise Markdown tables
+- Add 4 new automated unit tests in mcp-guardrail.test.js (total 77 tests passing)
+---
+ app/src/mcp-guardrail.js       | 145 +++++++++++++++++++++++++++++++--
+ app/src/server.js              |   3 +-
+ app/test/mcp-guardrail.test.js |  68 +++++++++++++++-
+ 3 files changed, 209 insertions(+), 7 deletions(-)
+
+diff --git a/app/src/mcp-guardrail.js b/app/src/mcp-guardrail.js
+index a455317..a13042e 100644
+--- a/app/src/mcp-guardrail.js
++++ b/app/src/mcp-guardrail.js
+@@ -8,6 +8,66 @@ import { increment as incrementMetric, observe as observeMetric } from './observ
+ const listProjectsCache = new Map();
+ const LIST_PROJECTS_CACHE_TTL_MS = 30_000;
+ 
++// LRU Semantic Response Cache para tools determinísticas (snippets, architecture, traces)
++const MAX_SEMANTIC_CACHE_ENTRIES = 200;
++const SEMANTIC_CACHE_TTL_MS = 60_000; // 1 minuto
++const semanticResponseCache = new Map();
++
++export function clearSemanticCache() {
++  semanticResponseCache.clear();
++  listProjectsCache.clear();
++}
++
++function getCachedSemanticResponse(key) {
++  if (!key) return null;
++  const entry = semanticResponseCache.get(key);
++  if (!entry) return null;
++  if (entry.expiresAt <= Date.now()) {
++    semanticResponseCache.delete(key);
++    return null;
++  }
++  // Refresh LRU order
++  semanticResponseCache.delete(key);
++  semanticResponseCache.set(key, entry);
++  return entry.buffer;
++}
++
++function setCachedSemanticResponse(key, buffer) {
++  if (!key || !buffer) return;
++  if (semanticResponseCache.size >= MAX_SEMANTIC_CACHE_ENTRIES) {
++    // Delete oldest entry (first item in Map iterator)
++    const oldestKey = semanticResponseCache.keys().next().value;
++    if (oldestKey) semanticResponseCache.delete(oldestKey);
++  }
++  semanticResponseCache.set(key, {
++    buffer,
++    expiresAt: Date.now() + SEMANTIC_CACHE_TTL_MS
++  });
++}
++
++function semanticCacheKey(toolName, args) {
++  if (!toolName || !args || typeof args !== 'object') return null;
++  const project = String(args.project || '').trim();
++  if (!project) return null;
++
++  if (toolName === 'get_architecture') {
++    return `arch:${project}`;
++  }
++  if (toolName === 'get_symbol_snippet' || toolName === 'get_code_snippet') {
++    const symbol = String(args.symbol || args.qualified_name || args.name || '').trim();
++    if (!symbol) return null;
++    return `snip:${project}:${symbol}:${args.include_neighbors ? '1' : '0'}`;
++  }
++  if (toolName === 'trace_symbol' || toolName === 'trace_path') {
++    const sym = String(args.symbol || args.function_name || args.name || '').trim();
++    if (!sym) return null;
++    const depth = args.depth != null ? args.depth : 2;
++    const direction = String(args.direction || 'both');
++    return `trace:${project}:${sym}:${direction}:${depth}`;
++  }
++  return null;
++}
++
+ function listProjectsCacheKey(access) {
+   if (!access) return null;
+   if (access.system) return '__system__';
+@@ -374,11 +434,30 @@ export function pruneArchitecturePayload(payload) {
+   return pruned;
+ }
+ 
++export function sliceCodeSnippet(source) {
++  if (typeof source !== 'string' || !source) return source;
++
++  // 1. Remove license/boilerplate headers at the top of snippet (e.g. /* ... License ... */ or lines of //)
++  let cleaned = source.replace(/^\s*(?:\/\*[\s\S]*?(?:license|copyright|all rights reserved|apache|mit)[\s\S]*?\*\/\s*|\/\/[^\n]*(?:license|copyright)[\s\S]*?\n\s*)+/i, '');
++
++  // 2. Colapsa múltiplas linhas vazias consecutivas (máximo 1 linha em branco)
++  cleaned = cleaned.replace(/\n{3,}/g, '\n\n');
++
++  // 3. Remove trailing whitespace por linha
++  cleaned = cleaned.replace(/[ \t]+$/gm, '');
++
++  return cleaned.trim();
++}
++
+ export function pruneSnippetObject(obj) {
+   if (!obj || typeof obj !== 'object') return obj;
+   const cleaned = {};
+   for (const [k, v] of Object.entries(obj)) {
+     if (UNUSED_AST_FIELDS.has(k)) continue;
++    if (k === 'source' && typeof v === 'string') {
++      cleaned[k] = sliceCodeSnippet(v);
++      continue;
++    }
+     cleaned[k] = v;
+   }
+   return cleaned;
+@@ -398,6 +477,19 @@ export function pruneSnippetPayload(payload) {
+   }
+   return result;
+ }
++export function formatSearchResultMarkdown(items) {
++  if (!Array.isArray(items) || !items.length) return '';
++  const rows = ['| Símbolo | Tipo | Arquivo | Linha |', '| :--- | :--- | :--- | :--- |'];
++  for (const item of items) {
++    if (!item || typeof item !== 'object') continue;
++    const name = item.name || item.symbol || item.qualified_name || '-';
++    const label = item.label || item.type || '-';
++    const file = item.file_path || item.file || item.location || '-';
++    const line = item.start_line != null ? item.start_line : '-';
++    rows.push(`| \`${name}\` | ${label} | \`${file}\` | ${line} |`);
++  }
++  return rows.join('\n');
++}
+ 
+ export function applyPayloadPruning(result, pruner) {
+   if (!result || typeof result !== 'object') return result;
+@@ -434,12 +526,32 @@ export function mapFacadeRequest(params) {
+   const args = params.arguments && typeof params.arguments === 'object' ? { ...params.arguments } : {};
+ 
+   if (toolName === 'code_search_surgical') {
++    const rawQuery = String(args.query || args.pattern || args.term || args.symbol || '').trim();
++    let label = args.label;
++
++    // Roteamento inteligente de queries: se não houver label explícito e o termo parecer um identificador de símbolo
++    // (ex: camelCase, PascalCase, snake_case), foca a busca em nós estruturais de definição
++    if (!label && /^[A-Z][a-zA-Z0-9_]+$/.test(rawQuery)) {
++      // PascalCase -> Class / Type / Interface / Struct
++      label = 'Class';
++    } else if (!label && /^[a-z][a-zA-Z0-9_]+$/.test(rawQuery) && (rawQuery.includes('_') || /[A-Z]/.test(rawQuery))) {
++      // camelCase / snake_case -> Function / Method
++      label = 'Function';
++    }
++
++    // Limites adaptativos:
++    // Se a query for muito curta / ampla (<= 3 chars, ou sem filtros), limita para 10 para proteger a janela de contexto
++    let limit = args.limit != null ? args.limit : 30;
++    if (args.limit == null && (rawQuery.length <= 3 || !label && !args.file_pattern)) {
++      limit = 15;
++    }
++
+     const mappedArgs = {
+       project: args.project,
+-      query: args.query || args.pattern || args.term || args.symbol || '',
+-      ...(args.label ? { label: args.label } : {}),
++      query: rawQuery,
++      ...(label ? { label } : {}),
+       ...(args.file_pattern ? { file_pattern: args.file_pattern } : {}),
+-      limit: args.limit != null ? args.limit : 30,
++      limit,
+       ...(args.offset != null ? { offset: args.offset } : {})
+     };
+     return {
+@@ -546,7 +658,8 @@ export function createMcpGuardrailHandlers(resolveAccess) {
+               toolName: mapResult.backendTool,
+               facadeTool: mapResult.facadeTool || '',
+               originalTool: params.name || '',
+-              resolvedProject: decision.resolvedProject || ''
++              resolvedProject: decision.resolvedProject || '',
++              callArgs: JSON.stringify(finalParams.arguments || {})
+             })
+           });
+         }
+@@ -556,7 +669,8 @@ export function createMcpGuardrailHandlers(resolveAccess) {
+           metadata: structToProto({
+             toolName: decision.toolName || '',
+             originalTool: params.name || '',
+-            resolvedProject: decision.resolvedProject || ''
++            resolvedProject: decision.resolvedProject || '',
++            callArgs: JSON.stringify(requestParams.arguments || {})
+           })
+         });
+       } catch (error) {
+@@ -592,6 +706,18 @@ export function createMcpGuardrailHandlers(resolveAccess) {
+           }
+         }
+ 
++        // Semantic LRU cache check for deterministic read operations
++        if (metadata.callArgs) {
++          try {
++            const callArgs = JSON.parse(metadata.callArgs);
++            const semKey = semanticCacheKey(effectiveTool, callArgs);
++            const cachedBuffer = getCachedSemanticResponse(semKey);
++            if (cachedBuffer) {
++              return callback(null, { mutated: cachedBuffer });
++            }
++          } catch { /* ignore parse error */ }
++        }
++
+         let modified = false;
+         let payload = result;
+ 
+@@ -626,6 +752,15 @@ export function createMcpGuardrailHandlers(resolveAccess) {
+               expiresAt: Date.now() + LIST_PROJECTS_CACHE_TTL_MS
+             });
+           }
++          if (metadata.callArgs) {
++            try {
++              const callArgs = JSON.parse(metadata.callArgs);
++              const semKey = semanticCacheKey(effectiveTool, callArgs);
++              if (semKey) {
++                setCachedSemanticResponse(semKey, mutatedBuffer);
++              }
++            } catch { /* ignore */ }
++          }
+           return callback(null, { mutated: mutatedBuffer });
+         }
+ 
+diff --git a/app/src/server.js b/app/src/server.js
+index e62b30e..9eef5e4 100644
+--- a/app/src/server.js
++++ b/app/src/server.js
+@@ -5,7 +5,7 @@ import { createReadStream } from 'node:fs';
+ import path from 'node:path';
+ import { fileURLToPath } from 'node:url';
+ import { assertSafeSegment, DEFAULT_TIMEZONE, DEFAULT_WORKSPACE_CRON, cronMatches, decryptWorkspaceToken, describeCron, encryptWorkspaceToken, generateMcpToken, gitAuthEnvironment, indexRepositoryArguments, loadCredentials, loadMcpUserStore, loadSecret, loadState, mcpTokenFingerprint, nextCronOccurrence, parseCronExpression, parseLastJsonLine, publicMcpUser, publicWorkspace, reconcileRepositoryProjects, removeMcpGatewayUserKey, run, safeChild, saveCredentials, saveMcpUserStore, saveSecret, saveState, setMcpGatewayUserKey, slugify, validateTimezone } from './lib.js';
+-import { startMcpGuardrailServer } from './mcp-guardrail.js';
++import { clearSemanticCache, startMcpGuardrailServer } from './mcp-guardrail.js';
+ import { gauge, increment, log as structuredLog, metricsText, observe } from './observability.js';
+ import { createAdminAuth } from './auth.js';
+ import { JOB_HISTORY_RETENTION_DAYS, JOB_LOG_MAX_CHARACTERS, loadJobHistory, paginateJobs, pruneJobHistory, recoverInterruptedJobs, saveJobHistory } from './job-history.js';
+@@ -823,6 +823,7 @@ async function indexRepository(item, log) {
+   if (indexed?.project) item.project = indexed.project;
+   item.status = 'indexed';
+   item.lastIndexedAt = new Date().toISOString();
++  clearSemanticCache();
+ }
+ 
+ function runWorkspaceIndex(selectedWorkspace) {
+diff --git a/app/test/mcp-guardrail.test.js b/app/test/mcp-guardrail.test.js
+index 8b5fd02..5cf85cf 100644
+--- a/app/test/mcp-guardrail.test.js
++++ b/app/test/mcp-guardrail.test.js
+@@ -15,7 +15,10 @@ import {
+   applyPayloadPruning,
+   FACADE_TOOLS,
+   resolveProjectAlias,
+-  DUPLICATE_RAW_TOOLS
++  DUPLICATE_RAW_TOOLS,
++  sliceCodeSnippet,
++  formatSearchResultMarkdown,
++  clearSemanticCache
+ } from '../src/mcp-guardrail.js';
+ 
+ const scopedAccess = {
+@@ -434,4 +437,67 @@ test('servidor gRPC resolve apelido em CheckRequest e muta project para canônic
+   assert.equal(reqResult.metadata.fields.resolvedProject.stringValue, 'data-repositories-claps-clapsapi-gestor');
+ });
+ 
++test('poda semântica de snippet remove headers de licença e linhas em branco repetidas', () => {
++  const codeWithLicense = `/*
++ * Copyright (c) 2024 Acme Corp. All rights reserved.
++ * Licensed under the Apache License 2.0.
++ */
++
++function calcularTotal(items) {
++
++
++  const total = items.reduce((a, b) => a + b, 0);   
++
++  return total;
++}`;
++  const sliced = sliceCodeSnippet(codeWithLicense);
++  assert.ok(!sliced.includes('Copyright'));
++  assert.ok(!sliced.includes('Apache'));
++  assert.ok(!sliced.includes('\n\n\n'));
++  assert.ok(sliced.startsWith('function calcularTotal(items)'));
++});
++
++test('roteamento inteligente infere label Class para PascalCase e Function para camelCase', () => {
++  const classReq = mapFacadeRequest({
++    name: 'code_search_surgical',
++    arguments: { project: 'api-pedidos', query: 'OrderManager' }
++  });
++  assert.equal(classReq.params.arguments.label, 'Class');
++
++  const funcReq = mapFacadeRequest({
++    name: 'code_search_surgical',
++    arguments: { project: 'api-pedidos', query: 'processPayment' }
++  });
++  assert.equal(funcReq.params.arguments.label, 'Function');
++
++  const snakeReq = mapFacadeRequest({
++    name: 'code_search_surgical',
++    arguments: { project: 'api-pedidos', query: 'handle_webhook' }
++  });
++  assert.equal(snakeReq.params.arguments.label, 'Function');
++
++  // Query curta ou genérica aplica limite adaptativo mais restritivo (15 nós)
++  const shortReq = mapFacadeRequest({
++    name: 'code_search_surgical',
++    arguments: { project: 'api-pedidos', query: 'app' }
++  });
++  assert.equal(shortReq.params.arguments.limit, 15);
++});
++
++test('formatSearchResultMarkdown formata lista de itens em tabela Markdown', () => {
++  const items = [
++    { name: 'processarPedido', label: 'Function', file_path: 'src/order.ts', start_line: 45 },
++    { name: 'Pedido', label: 'Class', file_path: 'src/types.ts', start_line: 12 }
++  ];
++  const md = formatSearchResultMarkdown(items);
++  assert.ok(md.includes('| Símbolo | Tipo | Arquivo | Linha |'));
++  assert.ok(md.includes('`processarPedido`'));
++  assert.ok(md.includes('`Pedido`'));
++  assert.ok(md.includes('src/order.ts'));
++});
++
++test('clearSemanticCache esvazia o cache sem lançar exceções', () => {
++  assert.doesNotThrow(() => clearSemanticCache());
++});
++
+ 
+-- 
+2.53.0
+

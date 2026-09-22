@@ -1,0 +1,60 @@
+From bda2d1cad4116907704d1d98640b9ecc87588a37 Mon Sep 17 00:00:00 2001
+From: Paulo Ricardo <contact@pauloricardo.dev>
+Date: Mon, 21 Sep 2026 20:05:23 +0000
+Subject: [PATCH 5/9] chore: bump @grpc/grpc-js patch version and sync test
+ assertions with compose.yaml version bumps
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- Update @grpc/grpc-js 1.14.4 → 1.14.5 (zero breaking changes)
+- Sync test assertions: Docling v1.26.0 → v1.34.0, Ollama 0.32.1 → 0.34.2
+  (compose.yaml was already updated independently; tests now reflect reality)
+---
+ app/package-lock.json             | 7 +++----
+ app/test/openwebui-config.test.js | 4 ++--
+ 2 files changed, 5 insertions(+), 6 deletions(-)
+
+diff --git a/app/package-lock.json b/app/package-lock.json
+index e8d19f4..66d9c7f 100644
+--- a/app/package-lock.json
++++ b/app/package-lock.json
+@@ -16,10 +16,9 @@
+       }
+     },
+     "node_modules/@grpc/grpc-js": {
+-      "version": "1.14.4",
+-      "resolved": "https://registry.npmjs.org/@grpc/grpc-js/-/grpc-js-1.14.4.tgz",
+-      "integrity": "sha512-k9Dj3DV/itK9D06Y8f190Qgop7/Ui+D0njFV3LHMPwPT75DpXLQohE9Wmz0QElrJnzsjB7KPWiKJbOl7IPDArQ==",
+-      "license": "Apache-2.0",
++      "version": "1.14.5",
++      "resolved": "https://registry.npmjs.org/@grpc/grpc-js/-/grpc-js-1.14.5.tgz",
++      "integrity": "sha512-7VZM+SVdEcUUqSQeNI3zM8Qs/BhQKZndPo2h5VkYkAM8Iz0wJIa8mKV5ekQGqG8UUsnkQ0NMxIxwkIHYvj0qOw==",
+       "dependencies": {
+         "@grpc/proto-loader": "^0.8.0",
+         "@js-sdsl/ordered-map": "^4.4.2"
+diff --git a/app/test/openwebui-config.test.js b/app/test/openwebui-config.test.js
+index 5ec0c03..cef7156 100644
+--- a/app/test/openwebui-config.test.js
++++ b/app/test/openwebui-config.test.js
+@@ -18,7 +18,7 @@ test('Compose inclui Ollama, Docling, Open WebUI, bootstrap e worker permanente'
+   assert.match(compose, /CONTENT_EXTRACTION_ENGINE: docling/);
+   assert.match(compose, /RAG_EMBEDDING_MODEL: bge-m3/);
+   assert.match(compose, /DOCLING_SERVER_URL: http:\/\/docling:5001/);
+-  assert.match(compose, /docling-serve-cpu:\$\{DOCLING_VERSION:-v1\.26\.0\}/);
++  assert.match(compose, /docling-serve-cpu:\$\{DOCLING_VERSION:-v1\.34\.0\}/);
+   assert.match(compose, /DOCLING_DEVICE: cpu/);
+   assert.match(compose, /DOCLING_SERVE_ENG_LOC_NUM_WORKERS: "1"/);
+   assert.match(compose, /DOCLING_SERVE_ENG_LOC_SHARE_MODELS: "true"/);
+@@ -336,7 +336,7 @@ test('instalador sugere Gemma 4, fixa Ollama 0.32.1 e bootstrap usa o contrato a
+   assert.match(install, /DOCLING_CPU_THREADS='6'/);
+   assert.match(install, /RAG_RERANKING_MODEL='BAAI\/bge-reranker-v2-m3'/);
+   assert.match(install, /gemma4:e4b \(Gemma 4 Effective 4B\)/);
+-  assert.match(compose, /OLLAMA_VERSION:-0\.32\.1/);
++  assert.match(compose, /OLLAMA_VERSION:-0\.34\.2/);
+   assert.match(compose, /OLLAMA_CHAT_MODEL:-gemma4:e2b/);
+   assert.match(compose, /OLLAMA_CONTEXT_LENGTH:-64000/);
+   assert.match(install, /ask_ollama_model/);
+-- 
+2.53.0
+

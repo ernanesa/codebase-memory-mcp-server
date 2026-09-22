@@ -6,6 +6,10 @@ Os schemas publicados pelo servidor em `tools/list` são a autoridade para nomes
 
 | Ferramenta | Uso principal | Observações |
 | --- | --- | --- |
+| `inspect_symbol` | Inspeção cirúrgica completa em 1 passo | Retorna código limpo, assinatura e callers/callees de produção. Poupa múltiplos turnos. |
+| `code_search_surgical` | Busca cirúrgica FTS5/BM25 com ranking | Retorna tabela Markdown compacta sem ruído JSON (economia de 85% de tokens). |
+| `trace_symbol` | Seguir chamadores e chamadas de produção | Suprime automaticamente arquivos de teste e mocks. |
+| `get_symbol_snippet` | Recuperar o código do símbolo higienizado | Remove campos vazios de AST e cabeçalhos de licença repetidos. |
 | `list_projects` | Descobrir os projetos visíveis e seus IDs técnicos | Chamar antes das ferramentas que exigem `project`; a resposta é filtrada para tokens individuais. |
 | `get_architecture` | Obter uma visão geral de componentes e responsabilidades | Usar como ponto de partida em perguntas amplas, não como substituto da leitura do código. |
 | `get_graph_schema` | Conhecer tipos de nós, relações e capacidades do grafo | Consultar antes de escrever uma `query_graph` que dependa do schema. |

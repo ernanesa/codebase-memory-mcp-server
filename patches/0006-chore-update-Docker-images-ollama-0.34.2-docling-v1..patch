@@ -1,0 +1,62 @@
+From 49fdbb44c3845c2e95293c6ce98a20f58f7d7d68 Mon Sep 17 00:00:00 2001
+From: Paulo Ricardo <contact@pauloricardo.dev>
+Date: Mon, 21 Sep 2026 20:06:09 +0000
+Subject: [PATCH 6/9] chore: update Docker images - ollama 0.34.2, docling
+ v1.34.0, grafana 12.4.11, prometheus v3.14.0, nginx 1.30
+
+---
+ compose.yaml | 10 +++++-----
+ 1 file changed, 5 insertions(+), 5 deletions(-)
+
+diff --git a/compose.yaml b/compose.yaml
+index e37ac71..8122676 100644
+--- a/compose.yaml
++++ b/compose.yaml
+@@ -102,7 +102,7 @@ services:
+       start_period: 5s
+ 
+   proxy:
+-    image: nginx:1.27-alpine
++    image: nginx:1.30-alpine
+     user: "${LOCAL_UID}:${LOCAL_GID}"
+     restart: unless-stopped
+     entrypoint: ["/bin/sh", "-c"]
+@@ -134,7 +134,7 @@ services:
+       start_period: 5s
+ 
+   ollama:
+-    image: ollama/ollama:${OLLAMA_VERSION:-0.32.1}
++    image: ollama/ollama:${OLLAMA_VERSION:-0.34.2}
+     profiles: ["ollama-docker"]
+     restart: unless-stopped
+     ulimits:
+@@ -153,7 +153,7 @@ services:
+       start_period: 15s
+ 
+   docling:
+-    image: quay.io/docling-project/docling-serve-cpu:${DOCLING_VERSION:-v1.26.0}
++    image: quay.io/docling-project/docling-serve-cpu:${DOCLING_VERSION:-v1.34.0}
+     restart: unless-stopped
+     environment:
+       DOCLING_SERVE_ENABLE_UI: "false"
+@@ -284,7 +284,7 @@ services:
+       start_period: 10s
+ 
+   prometheus:
+-    image: prom/prometheus:v3.7.3
++    image: prom/prometheus:v3.14.0
+     profiles: ["monitoring"]
+     restart: unless-stopped
+     command: ["--config.file=/etc/prometheus/prometheus.yml", "--storage.tsdb.path=/prometheus", "--storage.tsdb.retention.time=30d"]
+@@ -295,7 +295,7 @@ services:
+       - "9090"
+ 
+   grafana:
+-    image: grafana/grafana:12.3.1
++    image: grafana/grafana:12.4.11
+     profiles: ["monitoring"]
+     restart: unless-stopped
+     depends_on:
+-- 
+2.53.0
+

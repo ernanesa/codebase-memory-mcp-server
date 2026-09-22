@@ -1,0 +1,728 @@
+From 5c4951de4a553decc75bd8feca3f432a0088e461 Mon Sep 17 00:00:00 2001
+From: Paulo Ricardo <contact@pauloricardo.dev>
+Date: Mon, 21 Sep 2026 18:20:12 +0000
+Subject: [PATCH 1/9] feat(mcp): implement SOTA facade, payload pruning and
+ SQLite WAL optimization
+
+---
+ app/src/mcp-guardrail.js              | 357 +++++++++++++++++++++++++-
+ app/test/mcp-guardrail.test.js        | 203 ++++++++++++++-
+ scripts/optimize-sqlite-databases.mjs |  80 ++++++
+ 3 files changed, 627 insertions(+), 13 deletions(-)
+ create mode 100755 scripts/optimize-sqlite-databases.mjs
+
+diff --git a/app/src/mcp-guardrail.js b/app/src/mcp-guardrail.js
+index 9f3aae1..0d1b655 100644
+--- a/app/src/mcp-guardrail.js
++++ b/app/src/mcp-guardrail.js
+@@ -16,7 +16,81 @@ export const MCP_ANALYSIS_TOOLS = new Set([
+   'search_code',
+   'list_projects',
+   'index_status',
+-  'detect_changes'
++  'detect_changes',
++  'code_search_surgical',
++  'trace_symbol',
++  'get_symbol_snippet'
++]);
++
++export const FACADE_TOOLS = new Set([
++  'code_search_surgical',
++  'trace_symbol',
++  'get_symbol_snippet'
++]);
++
++export const FACADE_TOOL_DEFINITIONS = [
++  {
++    name: 'code_search_surgical',
++    description: 'Busca cirúrgica FTS5 no grafo de conhecimento do código (definições, métodos, funções, rotas e símbolos) com ranking BM25.',
++    inputSchema: {
++      type: 'object',
++      properties: {
++        project: { type: 'string', description: 'Nome do projeto/repositório indexado.' },
++        query: { type: 'string', description: 'Termo de busca cirúrgica ou símbolo a localizar via FTS5/BM25.' },
++        label: { type: 'string', description: 'Filtro opcional por tipo de nó (Function, Method, Class, Route, etc).' },
++        file_pattern: { type: 'string', description: 'Filtro opcional por padrão de caminho de arquivo.' },
++        limit: { type: 'number', description: 'Limite máximo de resultados (padrão 200).' }
++      },
++      required: ['project', 'query']
++    }
++  },
++  {
++    name: 'trace_symbol',
++    description: 'Rastreamento cirúrgico de callers e callees de um símbolo no grafo, com supressão automática de arquivos e fixtures de teste.',
++    inputSchema: {
++      type: 'object',
++      properties: {
++        project: { type: 'string', description: 'Nome do projeto/repositório indexado.' },
++        symbol: { type: 'string', description: 'Nome do símbolo ou função a ser rastreado.' },
++        direction: { type: 'string', enum: ['both', 'callers', 'callees'], description: 'Direção do rastreamento (padrão: both).' },
++        depth: { type: 'number', description: 'Profundidade máxima de saltos (padrão: 2).' }
++      },
++      required: ['project', 'symbol']
++    }
++  },
++  {
++    name: 'get_symbol_snippet',
++    description: 'Recupera o código fonte e metadados essenciais de um símbolo, higienizado sem propriedades de AST redundantes ou vazias.',
++    inputSchema: {
++      type: 'object',
++      properties: {
++        project: { type: 'string', description: 'Nome do projeto/repositório indexado.' },
++        symbol: { type: 'string', description: 'Nome do símbolo ou qualified_name.' },
++        include_neighbors: { type: 'boolean', description: 'Se deve incluir nós vizinhos no grafo.' }
++      },
++      required: ['project', 'symbol']
++    }
++  }
++];
++
++export const UNUSED_AST_FIELDS = new Set([
++  'complexity',
++  'cognitive',
++  'loop_count',
++  'loop_depth',
++  'self_recursive',
++  'param_count',
++  'max_access_depth',
++  'linear_scan_in_loop',
++  'alloc_in_loop',
++  'recursion_in_loop',
++  'unguarded_recursion',
++  'lines',
++  'is_exported',
++  'is_test',
++  'is_entry_point',
++  'transitive_loop_depth',
++  'recursive'
+ ]);
+ 
+ function valueFromProto(value) {
+@@ -93,9 +167,226 @@ export function filterListProjectsResult(result, allowedProjects) {
+   return filterProjectPayload(filtered, allowedProjects);
+ }
+ 
+-export function filterToolsListResult(result) {
++export function filterToolsListResult(result, { includeFacade = false } = {}) {
+   if (!Array.isArray(result?.tools)) return result;
+-  return { ...result, tools: result.tools.filter(tool => MCP_ANALYSIS_TOOLS.has(tool?.name)) };
++  const filtered = result.tools.filter(tool => MCP_ANALYSIS_TOOLS.has(tool?.name));
++  if (!includeFacade) return { ...result, tools: filtered };
++
++  const existingNames = new Set(filtered.map(t => t?.name));
++  const toAdd = FACADE_TOOL_DEFINITIONS.filter(t => !existingNames.has(t.name));
++  return { ...result, tools: [...filtered, ...toAdd] };
++}
++
++export function isTestFileOrSymbol(item) {
++  if (!item || typeof item !== 'object') return false;
++  if (item.is_test === true) return true;
++
++  const paths = [
++    item.file_path,
++    item.filePath,
++    item.file,
++    item.path,
++    item.location
++  ].filter(s => typeof s === 'string' && s.length > 0);
++
++  for (const p of paths) {
++    if (
++      /\.spec\.[a-z0-9]+$/i.test(p) ||
++      /\.test\.[a-z0-9]+$/i.test(p) ||
++      /[._-]test\.[a-z0-9]+$/i.test(p) ||
++      /[^/\\]+test\.py$/i.test(p) ||
++      /[^/\\]+_test\.py$/i.test(p) ||
++      /test_[^/\\]+\.py$/i.test(p) ||
++      /[^/\\]+Tests?\.cs$/i.test(p) ||
++      /(^|[/\\])__tests__([/\\]|$)/i.test(p) ||
++      /(^|[/\\])tests?([/\\]|$)/i.test(p)
++    ) {
++      return true;
++    }
++  }
++
++  const qn = typeof item.qualified_name === 'string' ? item.qualified_name : (typeof item.qn === 'string' ? item.qn : '');
++  if (qn) {
++    if (
++      /(^|[._])tests?([._]|$)/i.test(qn) ||
++      /\.Test\./i.test(qn) ||
++      /\.Tests\./i.test(qn) ||
++      /Tests?(\.|$)/i.test(qn) ||
++      /Test\.[^.]*Tests/i.test(qn)
++    ) {
++      return true;
++    }
++  }
++
++  const name = typeof item.name === 'string' ? item.name : '';
++  if (name && /(^test_|_test$|Tests?$)/i.test(name)) {
++    return true;
++  }
++
++  return false;
++}
++
++export function pruneTracePayload(payload) {
++  if (!payload || typeof payload !== 'object') return payload;
++  const pruned = { ...payload };
++  if (Array.isArray(pruned.callers)) {
++    pruned.callers = pruned.callers.filter(c => !isTestFileOrSymbol(c));
++  }
++  if (Array.isArray(pruned.callees)) {
++    pruned.callees = pruned.callees.filter(c => !isTestFileOrSymbol(c));
++  }
++  if (Array.isArray(pruned.paths)) {
++    pruned.paths = pruned.paths.filter(p => !isTestFileOrSymbol(p));
++  }
++  return pruned;
++}
++
++export function pruneArchitecturePayload(payload) {
++  if (!payload || typeof payload !== 'object') return payload;
++  const pruned = { ...payload };
++
++  if (Array.isArray(pruned.file_tree)) {
++    const fileTree = pruned.file_tree;
++    const totalFiles = fileTree.filter(f => f.type === 'file' || f.children === 0).length;
++    const totalDirs = fileTree.filter(f => f.type === 'dir' || f.children > 0).length;
++    const topLevel = fileTree.filter(f => {
++      const parts = String(f.path || '').split('/').filter(Boolean);
++      return parts.length <= 1;
++    }).slice(0, 25);
++
++    delete pruned.file_tree;
++    pruned.file_summary = {
++      total_files: totalFiles,
++      total_directories: totalDirs,
++      root_structure: topLevel
++    };
++  }
++
++  if (Array.isArray(pruned.clusters)) {
++    const validClusters = pruned.clusters.filter(c => {
++      if (!c || typeof c !== 'object') return false;
++      const members = typeof c.members === 'number' ? c.members : (Array.isArray(c.members) ? c.members.length : 0);
++      const topNodes = Array.isArray(c.top_nodes) ? c.top_nodes.length : 0;
++      return members > 0 || topNodes > 0;
++    });
++    if (validClusters.length > 0) {
++      pruned.clusters = validClusters;
++    } else {
++      delete pruned.clusters;
++    }
++  }
++
++  return pruned;
++}
++
++export function pruneSnippetObject(obj) {
++  if (!obj || typeof obj !== 'object') return obj;
++  const cleaned = {};
++  for (const [k, v] of Object.entries(obj)) {
++    if (UNUSED_AST_FIELDS.has(k)) continue;
++    cleaned[k] = v;
++  }
++  return cleaned;
++}
++
++export function pruneSnippetPayload(payload) {
++  if (!payload || typeof payload !== 'object') return payload;
++  if (Array.isArray(payload)) {
++    return payload.map(pruneSnippetObject);
++  }
++  const result = pruneSnippetObject(payload);
++  if (Array.isArray(result.results)) {
++    result.results = result.results.map(pruneSnippetObject);
++  }
++  if (Array.isArray(result.suggestions)) {
++    result.suggestions = result.suggestions.map(pruneSnippetObject);
++  }
++  return result;
++}
++
++export function applyPayloadPruning(result, pruner) {
++  if (!result || typeof result !== 'object') return result;
++  const pruned = structuredClone(result);
++
++  if (pruned.structuredContent) {
++    pruned.structuredContent = pruner(pruned.structuredContent);
++  }
++
++  if (Array.isArray(pruned.content)) {
++    pruned.content = pruned.content.map(item => {
++      if (item?.type !== 'text' || typeof item.text !== 'string') return item;
++      try {
++        const parsed = JSON.parse(item.text);
++        return { ...item, text: JSON.stringify(pruner(parsed)) };
++      } catch {
++        return item;
++      }
++    });
++  }
++
++  if (!pruned.structuredContent && !Array.isArray(pruned.content)) {
++    return pruner(pruned);
++  }
++
++  return pruned;
++}
++
++export function mapFacadeRequest(params) {
++  if (!params || typeof params !== 'object') {
++    return { mapped: false, facadeTool: null, backendTool: String(params?.name || ''), params };
++  }
++  const toolName = String(params.name || '');
++  const args = params.arguments && typeof params.arguments === 'object' ? { ...params.arguments } : {};
++
++  if (toolName === 'code_search_surgical') {
++    const mappedArgs = {
++      project: args.project,
++      query: args.query || args.pattern || args.term || args.symbol || '',
++      ...(args.label ? { label: args.label } : {}),
++      ...(args.file_pattern ? { file_pattern: args.file_pattern } : {}),
++      ...(args.limit != null ? { limit: args.limit } : {}),
++      ...(args.offset != null ? { offset: args.offset } : {})
++    };
++    return {
++      mapped: true,
++      facadeTool: 'code_search_surgical',
++      backendTool: 'search_graph',
++      params: { ...params, name: 'search_graph', arguments: mappedArgs }
++    };
++  }
++
++  if (toolName === 'trace_symbol') {
++    const mappedArgs = {
++      project: args.project,
++      function_name: args.symbol || args.function_name || args.name || '',
++      direction: args.direction || 'both',
++      depth: args.depth != null ? args.depth : 2,
++      mode: args.mode || 'calls',
++      include_tests: false
++    };
++    return {
++      mapped: true,
++      facadeTool: 'trace_symbol',
++      backendTool: 'trace_path',
++      params: { ...params, name: 'trace_path', arguments: mappedArgs }
++    };
++  }
++
++  if (toolName === 'get_symbol_snippet') {
++    const mappedArgs = {
++      project: args.project,
++      qualified_name: args.symbol || args.qualified_name || args.name || '',
++      ...(args.include_neighbors != null ? { include_neighbors: args.include_neighbors } : {})
++    };
++    return {
++      mapped: true,
++      facadeTool: 'get_symbol_snippet',
++      backendTool: 'get_code_snippet',
++      params: { ...params, name: 'get_code_snippet', arguments: mappedArgs }
++    };
++  }
++
++  return { mapped: false, facadeTool: null, backendTool: toolName, params };
+ }
+ 
+ export function authorizeToolCall(params, access) {
+@@ -108,8 +399,8 @@ export function authorizeToolCall(params, access) {
+     return { allowed: false, reason: `A ferramenta ${toolName || 'informada'} não está disponível para tokens individuais.` };
+   }
+   if (toolName === 'list_projects') return { allowed: true, toolName };
+-  if (toolName === 'trace_path' && args.mode === 'cross_service') {
+-    return { allowed: false, reason: 'trace_path em modo cross_service pode atravessar repositórios e exige a credencial de sistema.' };
++  if ((toolName === 'trace_path' || toolName === 'trace_symbol') && args.mode === 'cross_service') {
++    return { allowed: false, reason: `${toolName} em modo cross_service pode atravessar repositórios e exige a credencial de sistema.` };
+   }
+   const project = typeof args.project === 'string' ? args.project : '';
+   if (!project) return { allowed: false, reason: `A ferramenta ${toolName} exige o projeto do repositório.` };
+@@ -133,7 +424,26 @@ export function createMcpGuardrailHandlers(resolveAccess) {
+         const params = parseJsonBuffer(call.request.mcpRequest || call.request.mcp_request, 'A chamada MCP');
+         const decision = authorizeToolCall(params, resolveAccess(userId));
+         if (!decision.allowed) return callback(null, permissionDenied(decision.reason));
+-        callback(null, { pass: {}, metadata: structToProto({ toolName: decision.toolName || '' }) });
++
++        const mapResult = mapFacadeRequest(params);
++        if (mapResult.mapped) {
++          return callback(null, {
++            mutated: Buffer.from(JSON.stringify(mapResult.params)),
++            metadata: structToProto({
++              toolName: mapResult.backendTool,
++              facadeTool: mapResult.facadeTool,
++              originalTool: params.name || ''
++            })
++          });
++        }
++
++        callback(null, {
++          pass: {},
++          metadata: structToProto({
++            toolName: decision.toolName || '',
++            originalTool: params.name || ''
++          })
++        });
+       } catch (error) {
+         callback(null, invalidRequest(error.message));
+       }
+@@ -143,23 +453,46 @@ export function createMcpGuardrailHandlers(resolveAccess) {
+       try {
+         const metadata = structFromProto(call.request.metadataContext || call.request.metadata_context);
+         const access = resolveAccess(String(metadata.userId || ''));
+-        if (access?.system === true) return callback(null, { pass: {} });
+-        if (!access) return callback(null, permissionDenied('Credencial sem cadastro de acesso MCP.'));
++        if (!access && !metadata.userId) return callback(null, permissionDenied('Credencial sem cadastro de acesso MCP.'));
+ 
+         const result = parseJsonBuffer(call.request.mcpResponse || call.request.mcp_response, 'A resposta MCP');
+         if (call.request.method === 'tools/list') {
+-          return callback(null, { mutated: Buffer.from(JSON.stringify(filterToolsListResult(result))) });
++          return callback(null, { mutated: Buffer.from(JSON.stringify(filterToolsListResult(result, { includeFacade: true }))) });
+         }
++
+         const toolName = String(metadata.toolName || '');
++        const facadeTool = String(metadata.facadeTool || '');
++        const effectiveTool = facadeTool || toolName;
++
++        let modified = false;
++        let payload = result;
++
++        if (effectiveTool === 'trace_path' || effectiveTool === 'trace_symbol') {
++          payload = applyPayloadPruning(payload, pruneTracePayload);
++          modified = true;
++        } else if (effectiveTool === 'get_architecture') {
++          payload = applyPayloadPruning(payload, pruneArchitecturePayload);
++          modified = true;
++        } else if (effectiveTool === 'get_code_snippet' || effectiveTool === 'get_symbol_snippet') {
++          payload = applyPayloadPruning(payload, pruneSnippetPayload);
++          modified = true;
++        }
++
+         const hasProjects = projectEntries(result?.structuredContent)
+           || result?.content?.some(item => {
+             if (item?.type !== 'text' || typeof item.text !== 'string') return false;
+             try { return Boolean(projectEntries(JSON.parse(item.text))); } catch { return false; }
+           });
+-        if (toolName === 'list_projects' || hasProjects) {
+-          const filtered = filterListProjectsResult(result, access.allowedProjects);
+-          return callback(null, { mutated: Buffer.from(JSON.stringify(filtered)) });
++
++        if ((effectiveTool === 'list_projects' || hasProjects) && access?.system !== true) {
++          payload = filterListProjectsResult(payload, access ? access.allowedProjects : new Set());
++          modified = true;
+         }
++
++        if (modified) {
++          return callback(null, { mutated: Buffer.from(JSON.stringify(payload)) });
++        }
++
+         callback(null, { pass: {} });
+       } catch (error) {
+         callback(null, invalidRequest(error.message));
+diff --git a/app/test/mcp-guardrail.test.js b/app/test/mcp-guardrail.test.js
+index a724616..561f113 100644
+--- a/app/test/mcp-guardrail.test.js
++++ b/app/test/mcp-guardrail.test.js
+@@ -3,7 +3,18 @@ import assert from 'node:assert/strict';
+ import grpc from '@grpc/grpc-js';
+ import protoLoader from '@grpc/proto-loader';
+ import path from 'node:path';
+-import { authorizeToolCall, filterListProjectsResult, filterToolsListResult, startMcpGuardrailServer } from '../src/mcp-guardrail.js';
++import {
++  authorizeToolCall,
++  filterListProjectsResult,
++  filterToolsListResult,
++  startMcpGuardrailServer,
++  mapFacadeRequest,
++  pruneTracePayload,
++  pruneArchitecturePayload,
++  pruneSnippetPayload,
++  applyPayloadPruning,
++  FACADE_TOOLS
++} from '../src/mcp-guardrail.js';
+ 
+ const scopedAccess = {
+   system: false,
+@@ -101,3 +112,193 @@ test('servidor gRPC implementa o protocolo ExtMcp esperado pelo AgentGateway', a
+   }, (error, response) => error ? reject(error) : resolve(response)));
+   assert.deepEqual(JSON.parse(filtered.mutated).structuredContent.projects.map(item => item.name), ['api-pedidos']);
+ });
++
++test('ferramentas facade são reconhecidas e autorizadas pelo guardrail', () => {
++  for (const name of FACADE_TOOLS) {
++    assert.equal(authorizeToolCall({ name, arguments: { project: 'api-pedidos' } }, scopedAccess).allowed, true);
++    assert.match(authorizeToolCall({ name, arguments: { project: 'api-financeiro' } }, scopedAccess).reason, /não possui acesso/);
++    assert.match(authorizeToolCall({ name, arguments: {} }, scopedAccess).reason, /exige o projeto/);
++  }
++  assert.equal(authorizeToolCall({ name: 'trace_symbol', arguments: { project: 'api-pedidos', mode: 'cross_service' } }, scopedAccess).allowed, false);
++});
++
++test('mapeamento transparente de ferramentas facade em mapFacadeRequest', () => {
++  const surgical = mapFacadeRequest({
++    name: 'code_search_surgical',
++    arguments: { project: 'api-pedidos', query: 'ProcessarPedido', label: 'Method' }
++  });
++  assert.equal(surgical.mapped, true);
++  assert.equal(surgical.backendTool, 'search_graph');
++  assert.equal(surgical.params.name, 'search_graph');
++  assert.equal(surgical.params.arguments.query, 'ProcessarPedido');
++  assert.equal(surgical.params.arguments.label, 'Method');
++
++  const trace = mapFacadeRequest({
++    name: 'trace_symbol',
++    arguments: { project: 'api-pedidos', symbol: 'CriarPedido', direction: 'callers' }
++  });
++  assert.equal(trace.mapped, true);
++  assert.equal(trace.backendTool, 'trace_path');
++  assert.equal(trace.params.name, 'trace_path');
++  assert.equal(trace.params.arguments.function_name, 'CriarPedido');
++  assert.equal(trace.params.arguments.direction, 'callers');
++  assert.equal(trace.params.arguments.include_tests, false);
++
++  const snippet = mapFacadeRequest({
++    name: 'get_symbol_snippet',
++    arguments: { project: 'api-pedidos', symbol: 'api-pedidos.Services.OrderService.Create' }
++  });
++  assert.equal(snippet.mapped, true);
++  assert.equal(snippet.backendTool, 'get_code_snippet');
++  assert.equal(snippet.params.name, 'get_code_snippet');
++  assert.equal(snippet.params.arguments.qualified_name, 'api-pedidos.Services.OrderService.Create');
++
++  const native = mapFacadeRequest({ name: 'list_projects', arguments: {} });
++  assert.equal(native.mapped, false);
++});
++
++test('poda de trace_path / trace_symbol filtra callers e callees de arquivos de teste', () => {
++  const rawTrace = {
++    function: 'Processar',
++    callers: [
++      { name: 'WorkerService', file_path: 'src/services/worker.ts', qualified_name: 'App.WorkerService' },
++      { name: 'TestProcessar', file_path: 'test/worker.spec.ts', qualified_name: 'App.Test.WorkerSpec' },
++      { name: 'OrderServiceTest', file_path: 'tests/OrderTest.cs', qualified_name: 'App.Tests.OrderServiceTest' },
++      { name: 'test_worker', file_path: 'tests/test_worker.py', qualified_name: 'test_worker' },
++      { name: 'AppTests', file_path: 'src/__tests__/app.test.js', qualified_name: 'App.Tests.AppTests' }
++    ],
++    callees: [
++      { name: 'RepoSave', file_path: 'src/repo.ts', qualified_name: 'App.Repo.Save' },
++      { name: 'MockSave', file_path: 'test/mocks.spec.ts', qualified_name: 'App.Test.MockSave' }
++    ]
++  };
++  const pruned = pruneTracePayload(rawTrace);
++  assert.deepEqual(pruned.callers.map(c => c.name), ['WorkerService']);
++  assert.deepEqual(pruned.callees.map(c => c.name), ['RepoSave']);
++});
++
++test('poda de get_architecture resume a árvore de arquivos e remove clusters vazios', () => {
++  const rawArch = {
++    project: 'api-pedidos',
++    total_nodes: 50,
++    clusters: [
++      { id: 1, label: 'Core', members: 10, top_nodes: ['Processar'] },
++      { id: 2, label: 'Empty', members: 0, top_nodes: [] }
++    ],
++    file_tree: [
++      { path: 'src', type: 'dir', children: 2 },
++      { path: 'src/index.ts', type: 'file', children: 0 },
++      { path: 'src/deep/nested/file.ts', type: 'file', children: 0 }
++    ]
++  };
++  const pruned = pruneArchitecturePayload(rawArch);
++  assert.equal(pruned.file_tree, undefined);
++  assert.ok(pruned.file_summary);
++  assert.equal(pruned.file_summary.total_files, 2);
++  assert.equal(pruned.file_summary.total_directories, 1);
++  assert.equal(pruned.clusters.length, 1);
++  assert.equal(pruned.clusters[0].label, 'Core');
++
++  const emptyClustersArch = pruneArchitecturePayload({ project: 'test', clusters: [] });
++  assert.equal(emptyClustersArch.clusters, undefined);
++});
++
++test('poda de get_code_snippet / get_symbol_snippet remove propriedades de AST redundantes', () => {
++  const rawSnippet = {
++    name: 'CreateOrder',
++    qualified_name: 'App.Orders.CreateOrder',
++    label: 'Method',
++    file_path: 'src/orders.ts',
++    start_line: 10,
++    end_line: 25,
++    source: 'function CreateOrder() {}',
++    signature: '() => void',
++    complexity: 3,
++    cognitive: 2,
++    loop_count: 0,
++    loop_depth: 0,
++    self_recursive: false,
++    param_count: 2,
++    max_access_depth: 1,
++    linear_scan_in_loop: 0,
++    alloc_in_loop: 0,
++    recursion_in_loop: false,
++    unguarded_recursion: false,
++    lines: 15,
++    is_exported: true,
++    is_test: false,
++    is_entry_point: false,
++    transitive_loop_depth: 0,
++    recursive: false
++  };
++  const pruned = pruneSnippetPayload(rawSnippet);
++  assert.equal(pruned.name, 'CreateOrder');
++  assert.equal(pruned.source, 'function CreateOrder() {}');
++  assert.equal(pruned.complexity, undefined);
++  assert.equal(pruned.loop_count, undefined);
++  assert.equal(pruned.transitive_loop_depth, undefined);
++  assert.equal(pruned.recursion_in_loop, undefined);
++});
++
++test('servidor gRPC executa mapeamento facade em CheckRequest e poda em CheckResponse', async t => {
++  const server = await startMcpGuardrailServer(userId => userId === 'user-1' ? scopedAccess : null, '127.0.0.1:0');
++  t.after(() => new Promise(resolve => server.tryShutdown(resolve)));
++  const protoRoot = path.resolve(import.meta.dirname, '..', 'proto');
++  const definition = protoLoader.loadSync(path.join(protoRoot, 'ext_mcp.proto'), {
++    includeDirs: [protoRoot],
++    keepCase: false,
++    longs: String,
++    enums: String,
++    defaults: false,
++    oneofs: true
++  });
++  const descriptor = grpc.loadPackageDefinition(definition);
++  const Client = descriptor.agentgateway.dev.ext_mcp.ExtMcp;
++  const client = new Client(`127.0.0.1:${server.boundPort}`, grpc.credentials.createInsecure());
++  t.after(() => client.close());
++
++  // Facade CheckRequest mapping: trace_symbol -> trace_path
++  const reqResult = await new Promise((resolve, reject) => client.CheckRequest({
++    method: 'tools/call',
++    metadataContext: { fields: { userId: { stringValue: 'user-1' } } },
++    mcpRequest: Buffer.from(JSON.stringify({ name: 'trace_symbol', arguments: { project: 'api-pedidos', symbol: 'HandleOrder' } }))
++  }, (error, response) => error ? reject(error) : resolve(response)));
++
++  assert.ok(reqResult.mutated);
++  const mutatedRequest = JSON.parse(reqResult.mutated);
++  assert.equal(mutatedRequest.name, 'trace_path');
++  assert.equal(mutatedRequest.arguments.function_name, 'HandleOrder');
++  assert.equal(reqResult.metadata.fields.facadeTool.stringValue, 'trace_symbol');
++  assert.equal(reqResult.metadata.fields.toolName.stringValue, 'trace_path');
++
++  // CheckResponse pruning: trace_symbol response
++  const rawResponse = {
++    content: [{
++      type: 'text',
++      text: JSON.stringify({
++        function: 'HandleOrder',
++        callers: [
++          { name: 'ApiGateway', file_path: 'src/api.ts' },
++          { name: 'TestOrder', file_path: 'tests/order.spec.ts' }
++        ]
++      })
++    }]
++  };
++  const respResult = await new Promise((resolve, reject) => client.CheckResponse({
++    method: 'tools/call',
++    metadataContext: {
++      fields: {
++        userId: { stringValue: 'user-1' },
++        toolName: { stringValue: 'trace_path' },
++        facadeTool: { stringValue: 'trace_symbol' }
++      }
++    },
++    mcpResponse: Buffer.from(JSON.stringify(rawResponse))
++  }, (error, response) => error ? reject(error) : resolve(response)));
++
++  assert.ok(respResult.mutated);
++  const mutatedResponse = JSON.parse(respResult.mutated);
++  const parsedContent = JSON.parse(mutatedResponse.content[0].text);
++  assert.deepEqual(parsedContent.callers.map(c => c.name), ['ApiGateway']);
++});
++
+diff --git a/scripts/optimize-sqlite-databases.mjs b/scripts/optimize-sqlite-databases.mjs
+new file mode 100755
+index 0000000..9bd2e6f
+--- /dev/null
++++ b/scripts/optimize-sqlite-databases.mjs
+@@ -0,0 +1,80 @@
++#!/usr/bin/env node
++import { DatabaseSync } from 'node:sqlite';
++import fs from 'node:fs';
++import path from 'node:path';
++import { fileURLToPath } from 'node:url';
++
++const __filename = fileURLToPath(import.meta.url);
++const __dirname = path.dirname(__filename);
++const ROOT = path.resolve(__dirname, '..');
++const DEFAULT_CACHE_DIR = process.env.CBM_CACHE_DIR || path.join(ROOT, 'cache');
++
++export async function optimizeDatabases(cacheDir = DEFAULT_CACHE_DIR) {
++  if (!fs.existsSync(cacheDir)) {
++    throw new Error(`Diretório de cache não encontrado: ${cacheDir}`);
++  }
++
++  const entries = fs.readdirSync(cacheDir)
++    .filter(file => file.endsWith('.db') && !file.startsWith('.'))
++    .sort();
++
++  console.log(`Iniciando otimização SQLite em: ${cacheDir}`);
++  console.log(`Total de arquivos .db encontrados: ${entries.length}`);
++
++  let updatedCount = 0;
++  let walCount = 0;
++  const results = [];
++
++  for (const file of entries) {
++    const dbPath = path.join(cacheDir, file);
++    let db;
++    try {
++      db = new DatabaseSync(dbPath);
++      db.exec('PRAGMA busy_timeout = 5000;');
++      const journalModeRow = db.prepare('PRAGMA journal_mode = WAL;').get();
++      db.exec('PRAGMA synchronous = NORMAL;');
++      db.exec('PRAGMA optimize;');
++
++      const journalMode = journalModeRow?.journal_mode || String(journalModeRow);
++      const isWal = String(journalMode).toLowerCase() === 'wal';
++      if (isWal) walCount++;
++      updatedCount++;
++
++      console.log(`✔ [WAL] ${file} -> journal_mode=${journalMode}, synchronous=NORMAL, busy_timeout=5000, optimize=OK`);
++      results.push({ file, success: true, journalMode });
++    } catch (err) {
++      console.error(`✖ Erro ao otimizar ${file}:`, err.message);
++      results.push({ file, success: false, error: err.message });
++    } finally {
++      if (db) {
++        try { db.close(); } catch {}
++      }
++    }
++  }
++
++  console.log('\n--- Resumo da Otimização SQLite ---');
++  console.log(`Bancos processados com sucesso: ${updatedCount}/${entries.length}`);
++  console.log(`Bancos confirmados em WAL mode: ${walCount}/${entries.length}`);
++
++  const repoDbs = entries.filter(f => f.startsWith('data-repositories-'));
++  console.log(`Bancos de repositório indexados (data-repositories-*.db): ${repoDbs.length}`);
++
++  if (walCount < entries.length) {
++    throw new Error(`Apenas ${walCount} de ${entries.length} bancos estão em modo WAL.`);
++  }
++
++  return { total: entries.length, repoDbsCount: repoDbs.length, walCount, results };
++}
++
++if (process.argv[1] === __filename) {
++  const targetDir = process.argv[2] || DEFAULT_CACHE_DIR;
++  optimizeDatabases(targetDir)
++    .then(summary => {
++      console.log(`\nTodos os bancos de cache SQLite foram otimizados com sucesso para WAL mode.`);
++      process.exit(0);
++    })
++    .catch(err => {
++      console.error('\nFalha na otimização:', err.message);
++      process.exit(1);
++    });
++}
+-- 
+2.53.0
+

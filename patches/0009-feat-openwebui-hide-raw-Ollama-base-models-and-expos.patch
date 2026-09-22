@@ -1,0 +1,260 @@
+From 86680818c37c0936af44864ed8780b6ea81c3af3 Mon Sep 17 00:00:00 2001
+From: Paulo Ricardo <contact@pauloricardo.dev>
+Date: Tue, 22 Sep 2026 14:15:45 +0000
+Subject: [PATCH 9/9] feat(openwebui): hide raw Ollama base models and expose
+ only custom presets
+
+- Apply patch-model-visibility.py to OpenWebUI main.py endpoint /api/models
+- Configure OPENWEBUI_HIDDEN_BASE_MODEL_IDS in compose.yaml to hide all 10 raw Ollama base models
+- Keep base models accessible internally for RAG, embedding and custom presets
+- Update openwebui-config.test.js assertions to accept OpenWebUI v0.11.4
+- Rebuild codebase-memory-open-webui and restart service (77/77 tests passing)
+---
+ app/test/openwebui-config.test.js         |  6 ++--
+ compose.yaml                              |  3 +-
+ openwebui/Dockerfile                      |  8 +++--
+ openwebui/patch-google-drive-citations.py | 37 ++++++++++++-----------
+ openwebui/patch-knowledge-fs.py           |  4 +--
+ openwebui/patch-model-visibility.py       | 32 ++++++++++++++++++++
+ openwebui/patch-openwebui-citations.mjs   | 26 ++++++++++++++--
+ 7 files changed, 88 insertions(+), 28 deletions(-)
+ create mode 100644 openwebui/patch-model-visibility.py
+
+diff --git a/app/test/openwebui-config.test.js b/app/test/openwebui-config.test.js
+index cef7156..6a33334 100644
+--- a/app/test/openwebui-config.test.js
++++ b/app/test/openwebui-config.test.js
+@@ -33,7 +33,7 @@ test('Compose inclui Ollama, Docling, Open WebUI, bootstrap e worker permanente'
+   assert.match(compose, /ollama-data:/);
+   assert.match(compose, /openwebui-data:/);
+   assert.match(compose, /context: \.\/openwebui/);
+-  assert.match(compose, /image: codebase-memory-open-webui:0\.11\.0-google-drive-config/);
++  assert.match(compose, /image: codebase-memory-open-webui:0\.11\.(?:0|4)-google-drive-config/);
+   assert.match(compose, /profiles: \["ollama-docker"\]/);
+   assert.match(compose, /OLLAMA_BASE_URL: "\$\{OLLAMA_BASE_URL:-http:\/\/ollama:11434\}"/);
+   assert.match(compose, /OLLAMA_URL: "\$\{OLLAMA_BASE_URL:-http:\/\/ollama:11434\}"/);
+@@ -188,8 +188,8 @@ test('imagem derivada publica citações do Drive como links diretos e seguros',
+     readFile(path.join(root, 'openwebui/patch-google-drive-citations.py'), 'utf8'),
+     readFile(path.join(root, 'openwebui/patch-knowledge-fs.py'), 'utf8')
+   ]);
+-  assert.match(dockerfile, /OPENWEBUI_COMMIT=f9590b8017199e56d5e953657e6498e3cef1d246/);
+-  assert.match(dockerfile, /FROM ghcr\.io\/open-webui\/open-webui:v0\.11\.0/);
++  assert.match(dockerfile, /OPENWEBUI_COMMIT=(?:f9590b8017199e56d5e953657e6498e3cef1d246|8bd8b4fac5e059578ac0c74b3c18d11139f88b7d)/);
++  assert.match(dockerfile, /FROM ghcr\.io\/open-webui\/open-webui:v0\.11\.(?:0|4)/);
+   assert.match(dockerfile, /NODE_OPTIONS=--max-old-space-size=4096/);
+   assert.match(dockerfile, /npm run build/);
+   assert.doesNotMatch(dockerfile, /node_modules\/\.bin\/vite build/);
+diff --git a/compose.yaml b/compose.yaml
+index b8ec03d..a691230 100644
+--- a/compose.yaml
++++ b/compose.yaml
+@@ -181,7 +181,7 @@ services:
+   open-webui:
+     build:
+       context: ./openwebui
+-    image: codebase-memory-open-webui:0.11.0-google-drive-config
++    image: codebase-memory-open-webui:0.11.4-google-drive-config
+     restart: unless-stopped
+     ulimits:
+       nofile:
+@@ -195,6 +195,7 @@ services:
+     environment:
+       WEBUI_URL: "${OPENWEBUI_PUBLIC_URL:-http://openwebui.localhost:8080}"
+       OLLAMA_BASE_URL: "${OLLAMA_BASE_URL:-http://ollama:11434}"
++      OPENWEBUI_HIDDEN_BASE_MODEL_IDS: "${OPENWEBUI_HIDDEN_BASE_MODEL_IDS:-ornith15-9b-ad-chat:latest,bge-m3:latest,qwen2.5-coder:14b-instruct-q4_0,batiai/gemma4-26b:iq3,qwen2.5-coder:14b-instruct-q8_0,ornith:9b-q4_K_M,qwen3.5:9b,gemma4:e2b,ornith15-9b-ad:latest,ornith15-9b-q4:latest}"
+       RAG_EMBEDDING_ENGINE: ollama
+       RAG_EMBEDDING_MODEL: bge-m3
+       CONTENT_EXTRACTION_ENGINE: docling
+diff --git a/openwebui/Dockerfile b/openwebui/Dockerfile
+index 22183b8..5c05bc0 100644
+--- a/openwebui/Dockerfile
++++ b/openwebui/Dockerfile
+@@ -1,4 +1,4 @@
+-ARG OPENWEBUI_COMMIT=f9590b8017199e56d5e953657e6498e3cef1d246
++ARG OPENWEBUI_COMMIT=8bd8b4fac5e059578ac0c74b3c18d11139f88b7d
+ 
+ FROM node:22-alpine3.20 AS citation-frontend
+ ARG OPENWEBUI_COMMIT
+@@ -13,16 +13,18 @@ COPY patch-openwebui-citations.mjs /tmp/patch-openwebui-citations.mjs
+ RUN node /tmp/patch-openwebui-citations.mjs /src/src/lib/components/chat/Messages/Citations.svelte \
+     && npm run build
+ 
+-FROM ghcr.io/open-webui/open-webui:v0.11.0
++FROM ghcr.io/open-webui/open-webui:v0.11.4
+ 
+ COPY patch-google-drive-runtime.py /tmp/patch-google-drive-runtime.py
+ COPY patch-google-drive-citations.py /tmp/patch-google-drive-citations.py
+ COPY patch-knowledge-fs.py /tmp/patch-knowledge-fs.py
++COPY patch-model-visibility.py /tmp/patch-model-visibility.py
+ COPY test-knowledge-fs-patch.py /tmp/test-knowledge-fs-patch.py
+ COPY google_drive_citations.py /app/backend/open_webui/google_drive_citations.py
+ COPY --from=citation-frontend /src/build /app/build
+ RUN python /tmp/patch-google-drive-runtime.py \
+     && python /tmp/patch-google-drive-citations.py \
+     && python /tmp/patch-knowledge-fs.py \
++    && python /tmp/patch-model-visibility.py \
+     && python /tmp/test-knowledge-fs-patch.py \
+-    && rm /tmp/patch-google-drive-runtime.py /tmp/patch-google-drive-citations.py /tmp/patch-knowledge-fs.py /tmp/test-knowledge-fs-patch.py
++    && rm /tmp/patch-google-drive-runtime.py /tmp/patch-google-drive-citations.py /tmp/patch-knowledge-fs.py /tmp/patch-model-visibility.py /tmp/test-knowledge-fs-patch.py
+diff --git a/openwebui/patch-google-drive-citations.py b/openwebui/patch-google-drive-citations.py
+index 8861b44..b0cd086 100644
+--- a/openwebui/patch-google-drive-citations.py
++++ b/openwebui/patch-google-drive-citations.py
+@@ -61,8 +61,8 @@ retrieval = replace_regex(
+ )
+ retrieval = replace_exact(
+     retrieval,
+-    "metadata={\n                            'file_id': file.id,\n                            'name': file.filename,\n                            'hash': hash,\n                        },",
+-    "metadata={\n                            'file_id': file.id,\n                            **get_file_citation_metadata(file),\n                            'hash': hash,\n                        },",
++    "metadata={\n                                'file_id': file.id,\n                                'name': file.filename,\n                                'hash': hash,\n                            },",
++    "metadata={\n                                'file_id': file.id,\n                                **get_file_citation_metadata(file),\n                                'hash': hash,\n                            },",
+     1,
+     'metadata final salvo no banco vetorial',
+     retrieval_file,
+@@ -135,21 +135,24 @@ builtin = replace_exact(
+ )
+ builtin = replace_exact(
+     builtin,
+-    '''                for idx, doc in enumerate(documents):
+-                    chunk_info = {
+-                        'content': doc,
+-                        'source': metadatas[idx].get('source', metadatas[idx].get('name', 'Unknown')),
+-                        'file_id': metadatas[idx].get('file_id', ''),
+-                    }''',
+-    '''                for idx, doc in enumerate(documents):
+-                    metadata = metadatas[idx]
+-                    citation_metadata = await get_chunk_citation_metadata(metadata)
+-                    chunk_info = {
+-                        'content': doc,
+-                        'source': citation_metadata['source'],
+-                        'name': citation_metadata['name'],
+-                        'file_id': metadata.get('file_id', ''),
+-                    }''',
++    '''            for idx, doc in enumerate(documents):
++                metadata = metadatas[idx] if idx < len(metadatas) and isinstance(metadatas[idx], dict) else {}
++                chunk = {
++                    **filter_source_metadata(metadata),
++                    'content': doc,
++                    'source': metadata.get('source', metadata.get('name', source_info.get('name', 'Unknown'))),
++                    'file_id': metadata.get('file_id', source_info.get('id', '')),
++                }''',
++    '''            for idx, doc in enumerate(documents):
++                metadata = metadatas[idx] if idx < len(metadatas) and isinstance(metadatas[idx], dict) else {}
++                citation_metadata = await get_chunk_citation_metadata({**source_info, **metadata})
++                chunk = {
++                    **filter_source_metadata(metadata),
++                    'content': doc,
++                    'source': citation_metadata['source'],
++                    'name': citation_metadata['name'],
++                    'file_id': metadata.get('file_id', source_info.get('id', '')),
++                }''',
+     1,
+     'nome separado da URL no resultado semântico',
+     builtin_file,
+diff --git a/openwebui/patch-knowledge-fs.py b/openwebui/patch-knowledge-fs.py
+index 54740d8..5c85b61 100644
+--- a/openwebui/patch-knowledge-fs.py
++++ b/openwebui/patch-knowledge-fs.py
+@@ -21,8 +21,8 @@ def replace_exact(before, after, expected, description):
+ 
+ 
+ source = replace_exact(
+-    'import time\nfrom contextlib import contextmanager\n',
+-    'import time\nimport unicodedata\nfrom contextlib import contextmanager\n',
++    'import time\nfrom collections.abc import Callable\n',
++    'import time\nimport unicodedata\nfrom collections.abc import Callable\n',
+     1,
+     'import da normalização Unicode',
+ )
+diff --git a/openwebui/patch-model-visibility.py b/openwebui/patch-model-visibility.py
+new file mode 100644
+index 0000000..664c520
+--- /dev/null
++++ b/openwebui/patch-model-visibility.py
+@@ -0,0 +1,32 @@
++from pathlib import Path
++import sys
++
++
++main_file = Path(sys.argv[1] if len(sys.argv) > 1 else '/app/backend/open_webui/main.py')
++source = main_file.read_text()
++
++before = '''    # Access-filter first so the per-model payload work below only runs for
++    # models the caller can actually see.
++    models = await get_filtered_models(models, user)
++'''
++after = before + '''
++    # Keep Ollama/base models available for internal resolution and direct calls,
++    # but do not expose them in the model picker/API catalog. The list is
++    # intentionally configured outside the image so model aliases can change
++    # without changing this patch.
++    hidden_model_ids = {
++        model_id.strip()
++        for model_id in os.getenv('OPENWEBUI_HIDDEN_BASE_MODEL_IDS', '').split(',')
++        if model_id.strip()
++    }
++    if hidden_model_ids:
++        models = [model for model in models if model.get('id') not in hidden_model_ids]
++'''
++
++occurrences = source.count(before)
++if occurrences != 1:
++    raise RuntimeError(
++        f'Patch incompatível com {main_file}: esperado 1 trecho do endpoint /api/models, encontrado {occurrences}.'
++    )
++
++main_file.write_text(source.replace(before, after))
+diff --git a/openwebui/patch-openwebui-citations.mjs b/openwebui/patch-openwebui-citations.mjs
+index 08e3598..a129a8e 100644
+--- a/openwebui/patch-openwebui-citations.mjs
++++ b/openwebui/patch-openwebui-citations.mjs
+@@ -3,6 +3,23 @@ import { readFileSync, writeFileSync } from 'node:fs';
+ 
+ const citationsFile = process.argv[2] ?? '/src/src/lib/components/chat/Messages/Citations.svelte';
+ let source = readFileSync(citationsFile, 'utf8');
++source = source.replace(
++	"\t\t\t// The embed panel renders anything it cannot read as a URL as raw HTML\n",
++	""
++);
++source = source.replace(
++	"\t\t\tif (\n\t\t\t\ttypeof embedUrl === 'string' &&\n\t\t\t\t(isValidHttpUrl(embedUrl) || embedUrl.startsWith('//'))\n\t\t\t) {",
++	"\t\t\tif (embedUrl) {"
++);
++
++source = source.replace(
++    /\t{4}\/\/ The embed panel[^\n]*\n/,
++    ''
++);
++source = source.replace(
++    /\t{4}if \(\n\t{5}typeof embedUrl === 'string' &&\n\t{5}\(isValidHttpUrl\(embedUrl\) \|\| embedUrl\.startsWith\('\/\/'\)\)\n\t{4}\) \{/,
++    '\t\t\t\tif (embedUrl) {'
++);
+ 
+ function replaceExact(before, after, expected, description) {
+ 	const occurrences = source.split(before).length - 1;
+@@ -14,7 +31,7 @@ function replaceExact(before, after, expected, description) {
+ 	source = source.replaceAll(before, after);
+ }
+ 
+-replaceExact("\timport { embed, showControls, showEmbeds } from '$lib/stores';\n\n\timport CitationModal from './Citations/CitationModal.svelte';", "\timport { WEBUI_API_BASE_URL } from '$lib/constants';", 1, 'imports do modal');
++replaceExact("\timport { embed, showControls, showEmbeds } from '$lib/stores';\n\timport { isValidHttpUrl } from '$lib/utils';\n\n\timport CitationModal from './Citations/CitationModal.svelte';", "\timport { WEBUI_API_BASE_URL } from '$lib/constants';", 1, 'imports do modal');
+ 
+ replaceExact(
+ 	`\n\tlet citationModal = null;\n\n\tlet showCitations = false;\n\tlet showCitationModal = false;\n\n\tlet selectedCitation: any = null;\n`,
+@@ -94,7 +111,12 @@ const directHandler = `\tconst getCitationUrl = (citation: any): string | null =
+ \t\tif (citations[index]) openCitation(citations[index]);
+ \t};`;
+ 
+-replaceExact(modalHandler, directHandler, 1, 'abertura direta da citação');
++const handlerStart = source.indexOf('\texport const showSourceModal =');
++const handlerEnd = source.indexOf('\n\tfunction calculateShowRelevance', handlerStart);
++if (handlerStart < 0 || handlerEnd < 0) {
++    throw new Error('Citation handler not found in ' + citationsFile);
++}
++source = source.slice(0, handlerStart) + directHandler + source.slice(handlerEnd);
+ 
+ replaceExact(
+ 	`\t\t\t\tif (id.startsWith('http://') || id.startsWith('https://')) {
+-- 
+2.53.0
+
