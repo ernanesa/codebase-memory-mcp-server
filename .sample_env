@@ -22,3 +22,5 @@ GRAFANA_PUBLIC_URL=http://grafana.localhost:8080
 GRAFANA_PUBLIC_HOST=grafana.localhost
 MCP_PUBLIC_URL=http://mcp.localhost:8080
 MCP_PUBLIC_HOST=mcp.localhost
+# Porta direta do MCP (ignora Nginx). Clientes locais podem usar localhost:8081.
+# MCP_DIRECT_PORT=8081

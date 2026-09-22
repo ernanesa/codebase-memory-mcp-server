@@ -3,6 +3,17 @@ import protoLoader from '@grpc/proto-loader';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { increment as incrementMetric, observe as observeMetric } from './observability.js';
+
+const listProjectsCache = new Map();
+const LIST_PROJECTS_CACHE_TTL_MS = 30_000;
+
+function listProjectsCacheKey(access) {
+  if (!access) return null;
+  if (access.system) return '__system__';
+  return [...access.allowedProjects].sort().join('\0');
+}
+
 const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const PROTO_FILE = path.join(ROOT, 'proto', 'ext_mcp.proto');
 
@@ -39,7 +50,7 @@ export const FACADE_TOOL_DEFINITIONS = [
         query: { type: 'string', description: 'Termo de busca cirúrgica ou símbolo a localizar via FTS5/BM25.' },
         label: { type: 'string', description: 'Filtro opcional por tipo de nó (Function, Method, Class, Route, etc).' },
         file_pattern: { type: 'string', description: 'Filtro opcional por padrão de caminho de arquivo.' },
-        limit: { type: 'number', description: 'Limite máximo de resultados (padrão 200).' }
+        limit: { type: 'number', description: 'Limite máximo de resultados (padrão 30, máximo 200).' }
       },
       required: ['project', 'query']
     }
@@ -148,7 +159,7 @@ function filterProjectPayload(payload, allowedProjects) {
 }
 
 export function filterListProjectsResult(result, allowedProjects) {
-  const filtered = structuredClone(result);
+  const filtered = result;
   if (filtered.structuredContent) {
     filtered.structuredContent = projectEntries(filtered.structuredContent)
       ? filterProjectPayload(filtered.structuredContent, allowedProjects)
@@ -390,7 +401,7 @@ export function pruneSnippetPayload(payload) {
 
 export function applyPayloadPruning(result, pruner) {
   if (!result || typeof result !== 'object') return result;
-  const pruned = structuredClone(result);
+  const pruned = result;
 
   if (pruned.structuredContent) {
     pruned.structuredContent = pruner(pruned.structuredContent);
@@ -428,7 +439,7 @@ export function mapFacadeRequest(params) {
       query: args.query || args.pattern || args.term || args.symbol || '',
       ...(args.label ? { label: args.label } : {}),
       ...(args.file_pattern ? { file_pattern: args.file_pattern } : {}),
-      ...(args.limit != null ? { limit: args.limit } : {}),
+      limit: args.limit != null ? args.limit : 30,
       ...(args.offset != null ? { offset: args.offset } : {})
     };
     return {
@@ -510,6 +521,7 @@ export function authorizeToolCall(params, access) {
 export function createMcpGuardrailHandlers(resolveAccess) {
   return {
     checkRequest(call, callback) {
+      const started = performance.now();
       try {
         const metadata = structFromProto(call.request.metadataContext || call.request.metadata_context);
         const userId = String(metadata.userId || '');
@@ -549,10 +561,14 @@ export function createMcpGuardrailHandlers(resolveAccess) {
         });
       } catch (error) {
         callback(null, invalidRequest(error.message));
+      } finally {
+        incrementMetric('mcp_guardrail_calls_total', { phase: 'request' });
+        observeMetric('mcp_guardrail_duration_seconds', (performance.now() - started) / 1000, { phase: 'request' });
       }
     },
 
     checkResponse(call, callback) {
+      const started = performance.now();
       try {
         const metadata = structFromProto(call.request.metadataContext || call.request.metadata_context);
         const access = resolveAccess(String(metadata.userId || ''));
@@ -566,6 +582,15 @@ export function createMcpGuardrailHandlers(resolveAccess) {
         const toolName = String(metadata.toolName || '');
         const facadeTool = String(metadata.facadeTool || '');
         const effectiveTool = facadeTool || toolName;
+
+        const cacheKey = effectiveTool === 'list_projects' ? listProjectsCacheKey(access) : null;
+        if (cacheKey) {
+          const rawHash = Buffer.from(call.request.mcpResponse || call.request.mcp_response || []).length;
+          const cached = listProjectsCache.get(cacheKey);
+          if (cached && cached.rawSize === rawHash && cached.expiresAt > Date.now()) {
+            return callback(null, { mutated: cached.buffer });
+          }
+        }
 
         let modified = false;
         let payload = result;
@@ -593,12 +618,23 @@ export function createMcpGuardrailHandlers(resolveAccess) {
         }
 
         if (modified) {
-          return callback(null, { mutated: Buffer.from(JSON.stringify(payload)) });
+          const mutatedBuffer = Buffer.from(JSON.stringify(payload));
+          if (cacheKey) {
+            listProjectsCache.set(cacheKey, {
+              buffer: mutatedBuffer,
+              rawSize: Buffer.from(call.request.mcpResponse || call.request.mcp_response || []).length,
+              expiresAt: Date.now() + LIST_PROJECTS_CACHE_TTL_MS
+            });
+          }
+          return callback(null, { mutated: mutatedBuffer });
         }
 
         callback(null, { pass: {} });
       } catch (error) {
         callback(null, invalidRequest(error.message));
+      } finally {
+        incrementMetric('mcp_guardrail_calls_total', { phase: 'response' });
+        observeMetric('mcp_guardrail_duration_seconds', (performance.now() - started) / 1000, { phase: 'response' });
       }
     }
   };

@@ -38,6 +38,8 @@ services:
       - ./repositories:/data/repositories:ro
       - ./cache:/data/cache
       - ${CBM_HOST_BIN}:/usr/local/bin/codebase-memory-mcp:ro
+    ports:
+      - "127.0.0.1:${MCP_DIRECT_PORT:-8081}:${UI_PORT:-8080}"
     expose:
       - "${UI_PORT:-8080}"
       - "15000"
