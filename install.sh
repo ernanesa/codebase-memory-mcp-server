@@ -396,7 +396,7 @@ configure_host_ollama_command() {
     printf '    <string>%s</string>\n' "$OLLAMA_CONTEXT_LENGTH"
     if [[ "$OLLAMA_KEEP_ALIVE" == '-1' ]]; then
       printf '%s\n' '    <key>OLLAMA_MAX_LOADED_MODELS</key>'
-      printf '%s\n' '    <string>2</string>'
+      printf '%s\n' '    <string>3</string>'
     fi
     if [[ "$OLLAMA_KV_CACHE_QUANTIZATION" == q8_0 ]]; then
       printf '%s\n' '    <key>OLLAMA_FLASH_ATTENTION</key>'
@@ -1078,7 +1078,7 @@ write_ollama_quantization_compose_override() {
     printf '      OLLAMA_KEEP_ALIVE: "%s"\n' "$OLLAMA_KEEP_ALIVE"
     printf '      OLLAMA_CONTEXT_LENGTH: "%s"\n' "$OLLAMA_CONTEXT_LENGTH"
     if [[ "$OLLAMA_KEEP_ALIVE" == '-1' ]]; then
-      printf '      OLLAMA_MAX_LOADED_MODELS: "2"\n'
+      printf '      OLLAMA_MAX_LOADED_MODELS: "3"\n'
     fi
     if [[ "$OLLAMA_KV_CACHE_QUANTIZATION" == q8_0 ]]; then
       printf '      OLLAMA_FLASH_ATTENTION: "1"\n'
