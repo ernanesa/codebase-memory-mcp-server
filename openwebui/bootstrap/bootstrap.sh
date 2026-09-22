@@ -157,4 +157,31 @@ curl -fsS "$OPENWEBUI_URL/api/v1/models/import" \
   -H 'content-type: application/json' \
   -d "$models_payload" >/dev/null
 
-echo "Presets de exemplo importados; bootstrap concluído"
+models_response="$(curl -fsS "$OPENWEBUI_URL/api/v1/models" -H "$authorization" 2>/dev/null || true)"
+if [ -n "$models_response" ]; then
+  echo "$models_response" | jq -c '.data[]? | select(.info != null)' | while read -r item; do
+    model_id="$(echo "$item" | jq -r '.id')"
+    base_id="$(echo "$item" | jq -r '.info.base_model_id // ""' | tr '[:upper:]' '[:lower:]')"
+    m_id="$(echo "$model_id" | tr '[:upper:]' '[:lower:]')"
+
+    if echo "$base_id $m_id" | grep -qE "coder|code"; then
+      updated_payload="$(echo "$item" | jq --argjson ctx "$OLLAMA_CODE_CONTEXT_LENGTH" --argjson gpu "$OLLAMA_CODE_NUM_GPU" '
+        .info | .params.num_ctx = $ctx | .params.num_gpu = $gpu
+      ')"
+      curl -fsS "$OPENWEBUI_URL/api/v1/models/model/update" \
+        -H "$authorization" \
+        -H 'content-type: application/json' \
+        -d "$updated_payload" >/dev/null 2>&1 || true
+    elif echo "$base_id $m_id" | grep -qE "ornith|business"; then
+      updated_payload="$(echo "$item" | jq --argjson ctx "$OLLAMA_BUSINESS_CONTEXT_LENGTH" '
+        .info | .params.num_ctx = $ctx
+      ')"
+      curl -fsS "$OPENWEBUI_URL/api/v1/models/model/update" \
+        -H "$authorization" \
+        -H 'content-type: application/json' \
+        -d "$updated_payload" >/dev/null 2>&1 || true
+    fi
+  done
+fi
+
+echo "Presets de exemplo importados e modelos calibrados; bootstrap concluído"
