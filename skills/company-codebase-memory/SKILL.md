@@ -74,13 +74,15 @@ Ler [references/security-and-troubleshooting.md](references/security-and-trouble
 
 ## Usar fallback local
 
-Usar `rg`, leitura de arquivos, testes e histórico Git como complemento ou fallback quando:
+Usar `rg` (ripgrep) e `fd` como ferramentas de alta performance em Rust, leitura de arquivos, testes e histórico Git como complemento ou fallback quando:
 
 - o MCP estiver indisponível;
 - o repositório não estiver indexado;
 - o índice estiver incompleto ou desatualizado;
 - for necessário confirmar detalhes exatos da implementação;
 - a ferramenta necessária não estiver liberada para o token individual.
+
+Evitar comandos lentos legados como `grep -rn` ou `find .` em árvores inteiras de código quando `rg` e `fd` estiverem disponíveis no ambiente.
 
 Não apresentar o fallback como resultado do Codebase Memory. Informar qual fonte sustentou cada conclusão importante.
 
