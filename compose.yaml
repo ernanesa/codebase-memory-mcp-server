@@ -181,7 +181,7 @@ services:
   open-webui:
     build:
       context: ./openwebui
-    image: codebase-memory-open-webui:0.11.0-google-drive-config
+    image: codebase-memory-open-webui:0.11.4-google-drive-config
     restart: unless-stopped
     ulimits:
       nofile:
@@ -195,6 +195,7 @@ services:
     environment:
       WEBUI_URL: "${OPENWEBUI_PUBLIC_URL:-http://openwebui.localhost:8080}"
       OLLAMA_BASE_URL: "${OLLAMA_BASE_URL:-http://ollama:11434}"
+      OPENWEBUI_HIDDEN_BASE_MODEL_IDS: "${OPENWEBUI_HIDDEN_BASE_MODEL_IDS:-ornith15-9b-ad-chat:latest,bge-m3:latest,qwen2.5-coder:14b-instruct-q4_0,batiai/gemma4-26b:iq3,qwen2.5-coder:14b-instruct-q8_0,ornith:9b-q4_K_M,qwen3.5:9b,gemma4:e2b,ornith15-9b-ad:latest,ornith15-9b-q4:latest}"
       RAG_EMBEDDING_ENGINE: ollama
       RAG_EMBEDDING_MODEL: bge-m3
       CONTENT_EXTRACTION_ENGINE: docling

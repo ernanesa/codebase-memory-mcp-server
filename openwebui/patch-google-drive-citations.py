@@ -61,8 +61,8 @@ retrieval = replace_regex(
 )
 retrieval = replace_exact(
     retrieval,
-    "metadata={\n                            'file_id': file.id,\n                            'name': file.filename,\n                            'hash': hash,\n                        },",
-    "metadata={\n                            'file_id': file.id,\n                            **get_file_citation_metadata(file),\n                            'hash': hash,\n                        },",
+    "metadata={\n                                'file_id': file.id,\n                                'name': file.filename,\n                                'hash': hash,\n                            },",
+    "metadata={\n                                'file_id': file.id,\n                                **get_file_citation_metadata(file),\n                                'hash': hash,\n                            },",
     1,
     'metadata final salvo no banco vetorial',
     retrieval_file,
@@ -135,21 +135,24 @@ builtin = replace_exact(
 )
 builtin = replace_exact(
     builtin,
-    '''                for idx, doc in enumerate(documents):
-                    chunk_info = {
-                        'content': doc,
-                        'source': metadatas[idx].get('source', metadatas[idx].get('name', 'Unknown')),
-                        'file_id': metadatas[idx].get('file_id', ''),
-                    }''',
-    '''                for idx, doc in enumerate(documents):
-                    metadata = metadatas[idx]
-                    citation_metadata = await get_chunk_citation_metadata(metadata)
-                    chunk_info = {
-                        'content': doc,
-                        'source': citation_metadata['source'],
-                        'name': citation_metadata['name'],
-                        'file_id': metadata.get('file_id', ''),
-                    }''',
+    '''            for idx, doc in enumerate(documents):
+                metadata = metadatas[idx] if idx < len(metadatas) and isinstance(metadatas[idx], dict) else {}
+                chunk = {
+                    **filter_source_metadata(metadata),
+                    'content': doc,
+                    'source': metadata.get('source', metadata.get('name', source_info.get('name', 'Unknown'))),
+                    'file_id': metadata.get('file_id', source_info.get('id', '')),
+                }''',
+    '''            for idx, doc in enumerate(documents):
+                metadata = metadatas[idx] if idx < len(metadatas) and isinstance(metadatas[idx], dict) else {}
+                citation_metadata = await get_chunk_citation_metadata({**source_info, **metadata})
+                chunk = {
+                    **filter_source_metadata(metadata),
+                    'content': doc,
+                    'source': citation_metadata['source'],
+                    'name': citation_metadata['name'],
+                    'file_id': metadata.get('file_id', source_info.get('id', '')),
+                }''',
     1,
     'nome separado da URL no resultado semântico',
     builtin_file,
