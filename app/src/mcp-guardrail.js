@@ -8,6 +8,66 @@ import { increment as incrementMetric, observe as observeMetric } from './observ
 const listProjectsCache = new Map();
 const LIST_PROJECTS_CACHE_TTL_MS = 30_000;
 
+// LRU Semantic Response Cache para tools determinísticas (snippets, architecture, traces)
+const MAX_SEMANTIC_CACHE_ENTRIES = 200;
+const SEMANTIC_CACHE_TTL_MS = 60_000; // 1 minuto
+const semanticResponseCache = new Map();
+
+export function clearSemanticCache() {
+  semanticResponseCache.clear();
+  listProjectsCache.clear();
+}
+
+function getCachedSemanticResponse(key) {
+  if (!key) return null;
+  const entry = semanticResponseCache.get(key);
+  if (!entry) return null;
+  if (entry.expiresAt <= Date.now()) {
+    semanticResponseCache.delete(key);
+    return null;
+  }
+  // Refresh LRU order
+  semanticResponseCache.delete(key);
+  semanticResponseCache.set(key, entry);
+  return entry.buffer;
+}
+
+function setCachedSemanticResponse(key, buffer) {
+  if (!key || !buffer) return;
+  if (semanticResponseCache.size >= MAX_SEMANTIC_CACHE_ENTRIES) {
+    // Delete oldest entry (first item in Map iterator)
+    const oldestKey = semanticResponseCache.keys().next().value;
+    if (oldestKey) semanticResponseCache.delete(oldestKey);
+  }
+  semanticResponseCache.set(key, {
+    buffer,
+    expiresAt: Date.now() + SEMANTIC_CACHE_TTL_MS
+  });
+}
+
+function semanticCacheKey(toolName, args) {
+  if (!toolName || !args || typeof args !== 'object') return null;
+  const project = String(args.project || '').trim();
+  if (!project) return null;
+
+  if (toolName === 'get_architecture') {
+    return `arch:${project}`;
+  }
+  if (toolName === 'get_symbol_snippet' || toolName === 'get_code_snippet') {
+    const symbol = String(args.symbol || args.qualified_name || args.name || '').trim();
+    if (!symbol) return null;
+    return `snip:${project}:${symbol}:${args.include_neighbors ? '1' : '0'}`;
+  }
+  if (toolName === 'trace_symbol' || toolName === 'trace_path') {
+    const sym = String(args.symbol || args.function_name || args.name || '').trim();
+    if (!sym) return null;
+    const depth = args.depth != null ? args.depth : 2;
+    const direction = String(args.direction || 'both');
+    return `trace:${project}:${sym}:${direction}:${depth}`;
+  }
+  return null;
+}
+
 function listProjectsCacheKey(access) {
   if (!access) return null;
   if (access.system) return '__system__';
@@ -374,11 +434,30 @@ export function pruneArchitecturePayload(payload) {
   return pruned;
 }
 
+export function sliceCodeSnippet(source) {
+  if (typeof source !== 'string' || !source) return source;
+
+  // 1. Remove license/boilerplate headers at the top of snippet (e.g. /* ... License ... */ or lines of //)
+  let cleaned = source.replace(/^\s*(?:\/\*[\s\S]*?(?:license|copyright|all rights reserved|apache|mit)[\s\S]*?\*\/\s*|\/\/[^\n]*(?:license|copyright)[\s\S]*?\n\s*)+/i, '');
+
+  // 2. Colapsa múltiplas linhas vazias consecutivas (máximo 1 linha em branco)
+  cleaned = cleaned.replace(/\n{3,}/g, '\n\n');
+
+  // 3. Remove trailing whitespace por linha
+  cleaned = cleaned.replace(/[ \t]+$/gm, '');
+
+  return cleaned.trim();
+}
+
 export function pruneSnippetObject(obj) {
   if (!obj || typeof obj !== 'object') return obj;
   const cleaned = {};
   for (const [k, v] of Object.entries(obj)) {
     if (UNUSED_AST_FIELDS.has(k)) continue;
+    if (k === 'source' && typeof v === 'string') {
+      cleaned[k] = sliceCodeSnippet(v);
+      continue;
+    }
     cleaned[k] = v;
   }
   return cleaned;
@@ -397,6 +476,19 @@ export function pruneSnippetPayload(payload) {
     result.suggestions = result.suggestions.map(pruneSnippetObject);
   }
   return result;
+}
+export function formatSearchResultMarkdown(items) {
+  if (!Array.isArray(items) || !items.length) return '';
+  const rows = ['| Símbolo | Tipo | Arquivo | Linha |', '| :--- | :--- | :--- | :--- |'];
+  for (const item of items) {
+    if (!item || typeof item !== 'object') continue;
+    const name = item.name || item.symbol || item.qualified_name || '-';
+    const label = item.label || item.type || '-';
+    const file = item.file_path || item.file || item.location || '-';
+    const line = item.start_line != null ? item.start_line : '-';
+    rows.push(`| \`${name}\` | ${label} | \`${file}\` | ${line} |`);
+  }
+  return rows.join('\n');
 }
 
 export function applyPayloadPruning(result, pruner) {
@@ -434,12 +526,32 @@ export function mapFacadeRequest(params) {
   const args = params.arguments && typeof params.arguments === 'object' ? { ...params.arguments } : {};
 
   if (toolName === 'code_search_surgical') {
+    const rawQuery = String(args.query || args.pattern || args.term || args.symbol || '').trim();
+    let label = args.label;
+
+    // Roteamento inteligente de queries: se não houver label explícito e o termo parecer um identificador de símbolo
+    // (ex: camelCase, PascalCase, snake_case), foca a busca em nós estruturais de definição
+    if (!label && /^[A-Z][a-zA-Z0-9_]+$/.test(rawQuery)) {
+      // PascalCase -> Class / Type / Interface / Struct
+      label = 'Class';
+    } else if (!label && /^[a-z][a-zA-Z0-9_]+$/.test(rawQuery) && (rawQuery.includes('_') || /[A-Z]/.test(rawQuery))) {
+      // camelCase / snake_case -> Function / Method
+      label = 'Function';
+    }
+
+    // Limites adaptativos:
+    // Se a query for muito curta / ampla (<= 3 chars, ou sem filtros), limita para 10 para proteger a janela de contexto
+    let limit = args.limit != null ? args.limit : 30;
+    if (args.limit == null && (rawQuery.length <= 3 || !label && !args.file_pattern)) {
+      limit = 15;
+    }
+
     const mappedArgs = {
       project: args.project,
-      query: args.query || args.pattern || args.term || args.symbol || '',
-      ...(args.label ? { label: args.label } : {}),
+      query: rawQuery,
+      ...(label ? { label } : {}),
       ...(args.file_pattern ? { file_pattern: args.file_pattern } : {}),
-      limit: args.limit != null ? args.limit : 30,
+      limit,
       ...(args.offset != null ? { offset: args.offset } : {})
     };
     return {
@@ -546,7 +658,8 @@ export function createMcpGuardrailHandlers(resolveAccess) {
               toolName: mapResult.backendTool,
               facadeTool: mapResult.facadeTool || '',
               originalTool: params.name || '',
-              resolvedProject: decision.resolvedProject || ''
+              resolvedProject: decision.resolvedProject || '',
+              callArgs: JSON.stringify(finalParams.arguments || {})
             })
           });
         }
@@ -556,7 +669,8 @@ export function createMcpGuardrailHandlers(resolveAccess) {
           metadata: structToProto({
             toolName: decision.toolName || '',
             originalTool: params.name || '',
-            resolvedProject: decision.resolvedProject || ''
+            resolvedProject: decision.resolvedProject || '',
+            callArgs: JSON.stringify(requestParams.arguments || {})
           })
         });
       } catch (error) {
@@ -592,6 +706,18 @@ export function createMcpGuardrailHandlers(resolveAccess) {
           }
         }
 
+        // Semantic LRU cache check for deterministic read operations
+        if (metadata.callArgs) {
+          try {
+            const callArgs = JSON.parse(metadata.callArgs);
+            const semKey = semanticCacheKey(effectiveTool, callArgs);
+            const cachedBuffer = getCachedSemanticResponse(semKey);
+            if (cachedBuffer) {
+              return callback(null, { mutated: cachedBuffer });
+            }
+          } catch { /* ignore parse error */ }
+        }
+
         let modified = false;
         let payload = result;
 
@@ -625,6 +751,15 @@ export function createMcpGuardrailHandlers(resolveAccess) {
               rawSize: Buffer.from(call.request.mcpResponse || call.request.mcp_response || []).length,
               expiresAt: Date.now() + LIST_PROJECTS_CACHE_TTL_MS
             });
+          }
+          if (metadata.callArgs) {
+            try {
+              const callArgs = JSON.parse(metadata.callArgs);
+              const semKey = semanticCacheKey(effectiveTool, callArgs);
+              if (semKey) {
+                setCachedSemanticResponse(semKey, mutatedBuffer);
+              }
+            } catch { /* ignore */ }
           }
           return callback(null, { mutated: mutatedBuffer });
         }

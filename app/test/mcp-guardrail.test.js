@@ -15,7 +15,10 @@ import {
   applyPayloadPruning,
   FACADE_TOOLS,
   resolveProjectAlias,
-  DUPLICATE_RAW_TOOLS
+  DUPLICATE_RAW_TOOLS,
+  sliceCodeSnippet,
+  formatSearchResultMarkdown,
+  clearSemanticCache
 } from '../src/mcp-guardrail.js';
 
 const scopedAccess = {
@@ -432,6 +435,69 @@ test('servidor gRPC resolve apelido em CheckRequest e muta project para canônic
   assert.equal(mutated.arguments.project, 'data-repositories-claps-clapsapi-gestor');
   assert.equal(mutated.arguments.query, 'ProcessarContrato');
   assert.equal(reqResult.metadata.fields.resolvedProject.stringValue, 'data-repositories-claps-clapsapi-gestor');
+});
+
+test('poda semântica de snippet remove headers de licença e linhas em branco repetidas', () => {
+  const codeWithLicense = `/*
+ * Copyright (c) 2024 Acme Corp. All rights reserved.
+ * Licensed under the Apache License 2.0.
+ */
+
+function calcularTotal(items) {
+
+
+  const total = items.reduce((a, b) => a + b, 0);   
+
+  return total;
+}`;
+  const sliced = sliceCodeSnippet(codeWithLicense);
+  assert.ok(!sliced.includes('Copyright'));
+  assert.ok(!sliced.includes('Apache'));
+  assert.ok(!sliced.includes('\n\n\n'));
+  assert.ok(sliced.startsWith('function calcularTotal(items)'));
+});
+
+test('roteamento inteligente infere label Class para PascalCase e Function para camelCase', () => {
+  const classReq = mapFacadeRequest({
+    name: 'code_search_surgical',
+    arguments: { project: 'api-pedidos', query: 'OrderManager' }
+  });
+  assert.equal(classReq.params.arguments.label, 'Class');
+
+  const funcReq = mapFacadeRequest({
+    name: 'code_search_surgical',
+    arguments: { project: 'api-pedidos', query: 'processPayment' }
+  });
+  assert.equal(funcReq.params.arguments.label, 'Function');
+
+  const snakeReq = mapFacadeRequest({
+    name: 'code_search_surgical',
+    arguments: { project: 'api-pedidos', query: 'handle_webhook' }
+  });
+  assert.equal(snakeReq.params.arguments.label, 'Function');
+
+  // Query curta ou genérica aplica limite adaptativo mais restritivo (15 nós)
+  const shortReq = mapFacadeRequest({
+    name: 'code_search_surgical',
+    arguments: { project: 'api-pedidos', query: 'app' }
+  });
+  assert.equal(shortReq.params.arguments.limit, 15);
+});
+
+test('formatSearchResultMarkdown formata lista de itens em tabela Markdown', () => {
+  const items = [
+    { name: 'processarPedido', label: 'Function', file_path: 'src/order.ts', start_line: 45 },
+    { name: 'Pedido', label: 'Class', file_path: 'src/types.ts', start_line: 12 }
+  ];
+  const md = formatSearchResultMarkdown(items);
+  assert.ok(md.includes('| Símbolo | Tipo | Arquivo | Linha |'));
+  assert.ok(md.includes('`processarPedido`'));
+  assert.ok(md.includes('`Pedido`'));
+  assert.ok(md.includes('src/order.ts'));
+});
+
+test('clearSemanticCache esvazia o cache sem lançar exceções', () => {
+  assert.doesNotThrow(() => clearSemanticCache());
 });
 
 
