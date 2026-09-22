@@ -5,7 +5,7 @@ import { createReadStream } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { assertSafeSegment, DEFAULT_TIMEZONE, DEFAULT_WORKSPACE_CRON, cronMatches, decryptWorkspaceToken, describeCron, encryptWorkspaceToken, generateMcpToken, gitAuthEnvironment, indexRepositoryArguments, loadCredentials, loadMcpUserStore, loadSecret, loadState, mcpTokenFingerprint, nextCronOccurrence, parseCronExpression, parseLastJsonLine, publicMcpUser, publicWorkspace, reconcileRepositoryProjects, removeMcpGatewayUserKey, run, safeChild, saveCredentials, saveMcpUserStore, saveSecret, saveState, setMcpGatewayUserKey, slugify, validateTimezone } from './lib.js';
-import { startMcpGuardrailServer } from './mcp-guardrail.js';
+import { clearSemanticCache, startMcpGuardrailServer } from './mcp-guardrail.js';
 import { gauge, increment, log as structuredLog, metricsText, observe } from './observability.js';
 import { createAdminAuth } from './auth.js';
 import { JOB_HISTORY_RETENTION_DAYS, JOB_LOG_MAX_CHARACTERS, loadJobHistory, paginateJobs, pruneJobHistory, recoverInterruptedJobs, saveJobHistory } from './job-history.js';
@@ -823,6 +823,7 @@ async function indexRepository(item, log) {
   if (indexed?.project) item.project = indexed.project;
   item.status = 'indexed';
   item.lastIndexedAt = new Date().toISOString();
+  clearSemanticCache();
 }
 
 function runWorkspaceIndex(selectedWorkspace) {
