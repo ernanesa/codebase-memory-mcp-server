@@ -21,8 +21,8 @@ def replace_exact(before, after, expected, description):
 
 
 source = replace_exact(
-    'import time\nfrom contextlib import contextmanager\n',
-    'import time\nimport unicodedata\nfrom contextlib import contextmanager\n',
+    'import time\nfrom collections.abc import Callable\n',
+    'import time\nimport unicodedata\nfrom collections.abc import Callable\n',
     1,
     'import da normalização Unicode',
 )

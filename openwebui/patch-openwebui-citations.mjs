@@ -3,6 +3,23 @@ import { readFileSync, writeFileSync } from 'node:fs';
 
 const citationsFile = process.argv[2] ?? '/src/src/lib/components/chat/Messages/Citations.svelte';
 let source = readFileSync(citationsFile, 'utf8');
+source = source.replace(
+	"\t\t\t// The embed panel renders anything it cannot read as a URL as raw HTML\n",
+	""
+);
+source = source.replace(
+	"\t\t\tif (\n\t\t\t\ttypeof embedUrl === 'string' &&\n\t\t\t\t(isValidHttpUrl(embedUrl) || embedUrl.startsWith('//'))\n\t\t\t) {",
+	"\t\t\tif (embedUrl) {"
+);
+
+source = source.replace(
+    /\t{4}\/\/ The embed panel[^\n]*\n/,
+    ''
+);
+source = source.replace(
+    /\t{4}if \(\n\t{5}typeof embedUrl === 'string' &&\n\t{5}\(isValidHttpUrl\(embedUrl\) \|\| embedUrl\.startsWith\('\/\/'\)\)\n\t{4}\) \{/,
+    '\t\t\t\tif (embedUrl) {'
+);
 
 function replaceExact(before, after, expected, description) {
 	const occurrences = source.split(before).length - 1;
@@ -14,7 +31,7 @@ function replaceExact(before, after, expected, description) {
 	source = source.replaceAll(before, after);
 }
 
-replaceExact("\timport { embed, showControls, showEmbeds } from '$lib/stores';\n\n\timport CitationModal from './Citations/CitationModal.svelte';", "\timport { WEBUI_API_BASE_URL } from '$lib/constants';", 1, 'imports do modal');
+replaceExact("\timport { embed, showControls, showEmbeds } from '$lib/stores';\n\timport { isValidHttpUrl } from '$lib/utils';\n\n\timport CitationModal from './Citations/CitationModal.svelte';", "\timport { WEBUI_API_BASE_URL } from '$lib/constants';", 1, 'imports do modal');
 
 replaceExact(
 	`\n\tlet citationModal = null;\n\n\tlet showCitations = false;\n\tlet showCitationModal = false;\n\n\tlet selectedCitation: any = null;\n`,
@@ -94,7 +111,12 @@ const directHandler = `\tconst getCitationUrl = (citation: any): string | null =
 \t\tif (citations[index]) openCitation(citations[index]);
 \t};`;
 
-replaceExact(modalHandler, directHandler, 1, 'abertura direta da citação');
+const handlerStart = source.indexOf('\texport const showSourceModal =');
+const handlerEnd = source.indexOf('\n\tfunction calculateShowRelevance', handlerStart);
+if (handlerStart < 0 || handlerEnd < 0) {
+    throw new Error('Citation handler not found in ' + citationsFile);
+}
+source = source.slice(0, handlerStart) + directHandler + source.slice(handlerEnd);
 
 replaceExact(
 	`\t\t\t\tif (id.startsWith('http://') || id.startsWith('https://')) {
