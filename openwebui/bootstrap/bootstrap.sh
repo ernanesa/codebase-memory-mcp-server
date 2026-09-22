@@ -10,7 +10,7 @@ set -eu
 : "${OLLAMA_BUSINESS_MODEL:=ornith15-9b-ad:latest}"
 : "${OLLAMA_CONTEXT_LENGTH:=64000}"
 : "${OLLAMA_CODE_CONTEXT_LENGTH:=16384}"
-: "${OLLAMA_BUSINESS_CONTEXT_LENGTH:=32768}"
+: "${OLLAMA_BUSINESS_CONTEXT_LENGTH:=16384}"
 : "${OLLAMA_CODE_NUM_GPU:=48}"
 : "${OLLAMA_EMBEDDING_MODEL:=bge-m3}"
 : "${RAG_RERANKING_MODEL:=}"
@@ -55,7 +55,12 @@ wait_for "Ollama" "$OLLAMA_URL/api/tags"
 wait_for "Open WebUI" "$OPENWEBUI_URL/health"
 pull_model "$OLLAMA_CHAT_MODEL"
 [ "$OLLAMA_BUSINESS_MODEL" = "$OLLAMA_CHAT_MODEL" ] || pull_model "$OLLAMA_BUSINESS_MODEL"
-pull_model "$OLLAMA_EMBEDDING_MODEL"
+if [ -n "$OLLAMA_EMBEDDING_MODEL" ]; then
+  pull_model "$OLLAMA_EMBEDDING_MODEL"
+  curl -fsS "$OLLAMA_URL/api/create" \
+    -H 'content-type: application/json' \
+    -d "$(jq -cn --arg m "$OLLAMA_EMBEDDING_MODEL" '{name:$m,from:$m,parameters:{num_gpu:0},stream:false}')" >/dev/null 2>&1 || true
+fi
 
 auth_payload="$(jq -cn --arg email "$WEBUI_ADMIN_EMAIL" --arg password "$WEBUI_ADMIN_PASSWORD" '{email:$email,password:$password}')"
 auth_response="$(curl -fsS "$OPENWEBUI_URL/api/v1/auths/signin" -H 'content-type: application/json' -d "$auth_payload")"

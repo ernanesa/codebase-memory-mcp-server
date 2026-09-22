@@ -250,7 +250,7 @@ test('presets de exemplo selecionam o padrão e carregam parâmetros e integraç
   assert.deepEqual(manifest.models.map(model => model.id), ['business-model-sample', 'code-model-sample']);
   assert.equal(manifest.models[0].base_model_id, 'ornith15-9b-ad:latest');
   assert.equal(manifest.models[1].base_model_id, 'qwen2.5-coder:14b-instruct-q4_0');
-  assert.equal(manifest.models[0].params.num_ctx, 32768);
+  assert.equal(manifest.models[0].params.num_ctx, 16384);
   assert.equal(manifest.models[1].params.num_ctx, 16384);
   assert.equal(manifest.models[1].params.num_gpu, 48);
   for (const model of manifest.models) {
@@ -507,7 +507,7 @@ test('override persiste residência dos modelos e adiciona quantização somente
     assert.match(override, /OLLAMA_KV_CACHE_TYPE: q8_0/);
     assert.match(override, /OLLAMA_KEEP_ALIVE: "-1"/);
     assert.match(override, /OLLAMA_CONTEXT_LENGTH: "64000"/);
-    assert.match(override, /OLLAMA_MAX_LOADED_MODELS: "2"/);
+    assert.match(override, /OLLAMA_MAX_LOADED_MODELS: "3"/);
 
     await execFileAsync('bash', ['-c', `
       source "$1"
@@ -704,7 +704,7 @@ test('ambiente persiste os overrides do Compose usados para GPU e quantização 
     assert.match(environment, /^OLLAMA_KEEP_ALIVE=-1$/m);
     const ollamaOverride = await readFile(path.join(temporaryRoot, 'compose.ollama.yaml'), 'utf8');
     assert.match(ollamaOverride, /OLLAMA_KEEP_ALIVE: "-1"/);
-    assert.match(ollamaOverride, /OLLAMA_MAX_LOADED_MODELS: "2"/);
+    assert.match(ollamaOverride, /OLLAMA_MAX_LOADED_MODELS: "3"/);
   } finally {
     await rm(temporaryRoot, { recursive: true, force: true });
   }
@@ -792,7 +792,7 @@ test('modo host registra um LaunchAgent persistente para o Ollama', async () => 
     assert.match(launchAgent, /<key>OLLAMA_KV_CACHE_TYPE<\/key>\s*<string>q8_0<\/string>/);
     assert.match(launchAgent, /<key>OLLAMA_KEEP_ALIVE<\/key>\s*<string>-1<\/string>/);
     assert.match(launchAgent, /<key>OLLAMA_CONTEXT_LENGTH<\/key>\s*<string>64000<\/string>/);
-    assert.match(launchAgent, /<key>OLLAMA_MAX_LOADED_MODELS<\/key>\s*<string>2<\/string>/);
+    assert.match(launchAgent, /<key>OLLAMA_MAX_LOADED_MODELS<\/key>\s*<string>3<\/string>/);
     assert.match(launchAgent, /<key>RunAtLoad<\/key>\s*<true\/>/);
     assert.match(launchAgent, /<key>KeepAlive<\/key>\s*<true\/>/);
   } finally {
