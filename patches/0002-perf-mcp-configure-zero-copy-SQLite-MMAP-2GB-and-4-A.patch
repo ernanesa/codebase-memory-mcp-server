@@ -1,0 +1,26 @@
+From 9e942a238cd0204770d7a16d5fb302653d5bc6b9 Mon Sep 17 00:00:00 2001
+From: Paulo Ricardo <contact@pauloricardo.dev>
+Date: Mon, 21 Sep 2026 19:02:08 +0000
+Subject: [PATCH 2/9] perf(mcp): configure zero-copy SQLite MMAP (2GB) and 4
+ AST worker threads
+
+---
+ compose.yaml | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/compose.yaml b/compose.yaml
+index 63cf1d9..16261aa 100644
+--- a/compose.yaml
++++ b/compose.yaml
+@@ -31,6 +31,8 @@ services:
+       CBM_ALLOWED_ROOT: /data/repositories
+       CBM_CACHE_DIR: /data/cache
+       CBM_MEM_BUDGET_MB: "${CBM_MEM_BUDGET_MB}"
++      CBM_SQLITE_MMAP_SIZE: "${CBM_SQLITE_MMAP_SIZE:-2147483648}"
++      CBM_WORKERS: "${CBM_WORKERS:-4}"
+     volumes:
+       - ./data/agentgateway:/config
+       - ./repositories:/data/repositories:ro
+-- 
+2.53.0
+

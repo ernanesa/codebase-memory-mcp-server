@@ -1,0 +1,484 @@
+From 47381531f0f06e50f8a77fd4244b403064db5b1c Mon Sep 17 00:00:00 2001
+From: Paulo Ricardo <contact@pauloricardo.dev>
+Date: Mon, 21 Sep 2026 19:33:00 +0000
+Subject: [PATCH 3/9] feat(mcp): implement fuzzy project resolution, schema
+ pruning, ulimits, and dual-model presets
+
+---
+ app/src/mcp-guardrail.js          | 145 +++++++++++++++++++++++++-----
+ app/test/mcp-guardrail.test.js    | 135 +++++++++++++++++++++++++++-
+ app/test/openwebui-config.test.js |   3 +-
+ compose.yaml                      |   9 ++
+ openwebui/bootstrap/bootstrap.sh  |   8 +-
+ openwebui/bootstrap/models.json   |   6 +-
+ 6 files changed, 277 insertions(+), 29 deletions(-)
+
+diff --git a/app/src/mcp-guardrail.js b/app/src/mcp-guardrail.js
+index 0d1b655..9fc2bd2 100644
+--- a/app/src/mcp-guardrail.js
++++ b/app/src/mcp-guardrail.js
+@@ -167,9 +167,22 @@ export function filterListProjectsResult(result, allowedProjects) {
+   return filterProjectPayload(filtered, allowedProjects);
+ }
+ 
+-export function filterToolsListResult(result, { includeFacade = false } = {}) {
++export const DUPLICATE_RAW_TOOLS = new Set([
++  'search_graph',
++  'search_code',
++  'trace_path',
++  'get_code_snippet',
++  'get_graph_schema',
++  'detect_changes',
++  'query_graph'
++]);
++
++export function filterToolsListResult(result, { includeFacade = false, pruneDuplicates = false } = {}) {
+   if (!Array.isArray(result?.tools)) return result;
+-  const filtered = result.tools.filter(tool => MCP_ANALYSIS_TOOLS.has(tool?.name));
++  let filtered = result.tools.filter(tool => MCP_ANALYSIS_TOOLS.has(tool?.name));
++  if (pruneDuplicates) {
++    filtered = filtered.filter(tool => !DUPLICATE_RAW_TOOLS.has(tool?.name));
++  }
+   if (!includeFacade) return { ...result, tools: filtered };
+ 
+   const existingNames = new Set(filtered.map(t => t?.name));
+@@ -177,6 +190,77 @@ export function filterToolsListResult(result, { includeFacade = false } = {}) {
+   return { ...result, tools: [...filtered, ...toAdd] };
+ }
+ 
++export function resolveProjectAlias(requestedProject, knownProjects) {
++  if (!requestedProject || typeof requestedProject !== 'string') return null;
++  if (!knownProjects) return null;
++
++  const trimmed = requestedProject.trim();
++  if (!trimmed) return null;
++
++  const knownList = knownProjects instanceof Set
++    ? Array.from(knownProjects)
++    : (Array.isArray(knownProjects) ? knownProjects : []);
++
++  if (knownList.length === 0) return null;
++
++  if (knownProjects instanceof Set && knownProjects.has(trimmed)) return trimmed;
++  if (Array.isArray(knownProjects) && knownProjects.includes(trimmed)) return trimmed;
++
++  const lowerTrimmed = trimmed.toLowerCase();
++  for (const kp of knownList) {
++    if (typeof kp === 'string' && kp.toLowerCase() === lowerTrimmed) {
++      return kp;
++    }
++  }
++
++  const clean = str => String(str).toLowerCase().replace(/[/\\_.:\s]+/g, '-').replace(/^-+|-+$/g, '');
++  const target = clean(lowerTrimmed);
++  if (!target) return null;
++
++  const candidates = [];
++  for (const kp of knownList) {
++    if (typeof kp !== 'string') continue;
++    const normKp = clean(kp);
++    const strippedKp = normKp.replace(/^data-repositories-/, '');
++
++    if (normKp === target || strippedKp === target) {
++      return kp;
++    }
++
++    if (strippedKp.endsWith(`-${target}`) || normKp.endsWith(`-${target}`)) {
++      candidates.push(kp);
++    }
++  }
++
++  if (candidates.length === 1) {
++    return candidates[0];
++  }
++  if (candidates.length > 1) {
++    candidates.sort((a, b) => a.length - b.length);
++    return candidates[0];
++  }
++
++  const loose = [];
++  for (const kp of knownList) {
++    if (typeof kp !== 'string') continue;
++    const normKp = clean(kp);
++    const strippedKp = normKp.replace(/^data-repositories-/, '');
++    if (strippedKp.includes(target) || normKp.includes(target)) {
++      loose.push(kp);
++    }
++  }
++
++  if (loose.length === 1) {
++    return loose[0];
++  }
++  if (loose.length > 1) {
++    loose.sort((a, b) => a.length - b.length);
++    return loose[0];
++  }
++
++  return null;
++}
++
+ export function isTestFileOrSymbol(item) {
+   if (!item || typeof item !== 'object') return false;
+   if (item.is_test === true) return true;
+@@ -390,28 +474,37 @@ export function mapFacadeRequest(params) {
+ }
+ 
+ export function authorizeToolCall(params, access) {
+-  if (access?.system === true) return { allowed: true, toolName: params?.name };
+-  if (!access) return { allowed: false, reason: 'Credencial sem cadastro de acesso MCP.' };
+-
+   const toolName = String(params?.name || '');
+   const args = params?.arguments && typeof params.arguments === 'object' ? params.arguments : {};
++  const rawProject = typeof args.project === 'string' ? args.project : '';
++  const knownProjects = access?.knownProjects || access?.allowedProjects;
++
++  let resolvedProject = rawProject;
++  if (rawProject && knownProjects) {
++    const alias = resolveProjectAlias(rawProject, knownProjects);
++    if (alias) {
++      resolvedProject = alias;
++    }
++  }
++
++  if (access?.system === true) return { allowed: true, toolName: params?.name, resolvedProject };
++  if (!access) return { allowed: false, reason: 'Credencial sem cadastro de acesso MCP.' };
++
+   if (!MCP_ANALYSIS_TOOLS.has(toolName)) {
+     return { allowed: false, reason: `A ferramenta ${toolName || 'informada'} não está disponível para tokens individuais.` };
+   }
+-  if (toolName === 'list_projects') return { allowed: true, toolName };
++  if (toolName === 'list_projects') return { allowed: true, toolName, resolvedProject };
+   if ((toolName === 'trace_path' || toolName === 'trace_symbol') && args.mode === 'cross_service') {
+     return { allowed: false, reason: `${toolName} em modo cross_service pode atravessar repositórios e exige a credencial de sistema.` };
+   }
+-  const project = typeof args.project === 'string' ? args.project : '';
+-  if (!project) return { allowed: false, reason: `A ferramenta ${toolName} exige o projeto do repositório.` };
+-  const knownProjects = access.knownProjects || access.allowedProjects;
+-  if (!knownProjects.has(project)) {
+-    return { allowed: false, reason: `O repositório do projeto ${project} não existe ou ainda não foi indexado.` };
++  if (!rawProject) return { allowed: false, reason: `A ferramenta ${toolName} exige o projeto do repositório.` };
++  if (!knownProjects || !knownProjects.has(resolvedProject)) {
++    return { allowed: false, reason: `O repositório do projeto ${rawProject} não existe ou ainda não foi indexado.` };
+   }
+-  if (!access.allowedProjects.has(project)) {
+-    return { allowed: false, reason: `O usuário não possui acesso ao repositório do projeto ${project}.` };
++  if (!access.allowedProjects.has(resolvedProject)) {
++    return { allowed: false, reason: `O usuário não possui acesso ao repositório do projeto ${rawProject}.` };
+   }
+-  return { allowed: true, toolName };
++  return { allowed: true, toolName, resolvedProject };
+ }
+ 
+ export function createMcpGuardrailHandlers(resolveAccess) {
+@@ -425,14 +518,23 @@ export function createMcpGuardrailHandlers(resolveAccess) {
+         const decision = authorizeToolCall(params, resolveAccess(userId));
+         if (!decision.allowed) return callback(null, permissionDenied(decision.reason));
+ 
+-        const mapResult = mapFacadeRequest(params);
+-        if (mapResult.mapped) {
++        const requestParams = structuredClone(params);
++        if (decision.resolvedProject && requestParams.arguments && typeof requestParams.arguments === 'object') {
++          requestParams.arguments.project = decision.resolvedProject;
++        }
++
++        const mapResult = mapFacadeRequest(requestParams);
++        const shouldMutate = mapResult.mapped || (decision.resolvedProject && decision.resolvedProject !== params?.arguments?.project);
++
++        if (shouldMutate) {
++          const finalParams = mapResult.mapped ? mapResult.params : requestParams;
+           return callback(null, {
+-            mutated: Buffer.from(JSON.stringify(mapResult.params)),
++            mutated: Buffer.from(JSON.stringify(finalParams)),
+             metadata: structToProto({
+               toolName: mapResult.backendTool,
+-              facadeTool: mapResult.facadeTool,
+-              originalTool: params.name || ''
++              facadeTool: mapResult.facadeTool || '',
++              originalTool: params.name || '',
++              resolvedProject: decision.resolvedProject || ''
+             })
+           });
+         }
+@@ -441,7 +543,8 @@ export function createMcpGuardrailHandlers(resolveAccess) {
+           pass: {},
+           metadata: structToProto({
+             toolName: decision.toolName || '',
+-            originalTool: params.name || ''
++            originalTool: params.name || '',
++            resolvedProject: decision.resolvedProject || ''
+           })
+         });
+       } catch (error) {
+@@ -457,7 +560,7 @@ export function createMcpGuardrailHandlers(resolveAccess) {
+ 
+         const result = parseJsonBuffer(call.request.mcpResponse || call.request.mcp_response, 'A resposta MCP');
+         if (call.request.method === 'tools/list') {
+-          return callback(null, { mutated: Buffer.from(JSON.stringify(filterToolsListResult(result, { includeFacade: true }))) });
++          return callback(null, { mutated: Buffer.from(JSON.stringify(filterToolsListResult(result, { includeFacade: true, pruneDuplicates: true }))) });
+         }
+ 
+         const toolName = String(metadata.toolName || '');
+diff --git a/app/test/mcp-guardrail.test.js b/app/test/mcp-guardrail.test.js
+index 561f113..8b5fd02 100644
+--- a/app/test/mcp-guardrail.test.js
++++ b/app/test/mcp-guardrail.test.js
+@@ -13,7 +13,9 @@ import {
+   pruneArchitecturePayload,
+   pruneSnippetPayload,
+   applyPayloadPruning,
+-  FACADE_TOOLS
++  FACADE_TOOLS,
++  resolveProjectAlias,
++  DUPLICATE_RAW_TOOLS
+ } from '../src/mcp-guardrail.js';
+ 
+ const scopedAccess = {
+@@ -302,3 +304,134 @@ test('servidor gRPC executa mapeamento facade em CheckRequest e poda em CheckRes
+   assert.deepEqual(parsedContent.callers.map(c => c.name), ['ApiGateway']);
+ });
+ 
++test('resolveProjectAlias resolve apelidos e nomes curtos para o ID canônico', () => {
++  const known = new Set([
++    'data-repositories-claps-clapsapi-gestor',
++    'data-repositories-claps-clapsapi-autorizador',
++    'data-repositories-pagueon-pagueonapi-recorrente',
++    'data-repositories-pagueon-front-pagueon-front'
++  ]);
++
++  // Correspondência exata
++  assert.equal(resolveProjectAlias('data-repositories-claps-clapsapi-gestor', known), 'data-repositories-claps-clapsapi-gestor');
++
++  // Case-insensitive
++  assert.equal(resolveProjectAlias('DATA-REPOSITORIES-CLAPS-CLAPSAPI-GESTOR', known), 'data-repositories-claps-clapsapi-gestor');
++
++  // Nome curto com sufixo
++  assert.equal(resolveProjectAlias('clapsapi-gestor', known), 'data-repositories-claps-clapsapi-gestor');
++  assert.equal(resolveProjectAlias('pagueonapi-recorrente', known), 'data-repositories-pagueon-pagueonapi-recorrente');
++
++  // Notação com barra
++  assert.equal(resolveProjectAlias('claps/clapsapi-gestor', known), 'data-repositories-claps-clapsapi-gestor');
++  assert.equal(resolveProjectAlias('pagueon/front', known), 'data-repositories-pagueon-front-pagueon-front');
++
++  // Inexistente
++  assert.equal(resolveProjectAlias('projeto-desconhecido', known), null);
++  assert.equal(resolveProjectAlias('', known), null);
++  assert.equal(resolveProjectAlias(null, known), null);
++});
++
++test('filterToolsListResult com pruneDuplicates expõe apenas facade e ferramentas essenciais', () => {
++  const allTools = {
++    tools: [
++      { name: 'search_graph' },
++      { name: 'search_code' },
++      { name: 'trace_path' },
++      { name: 'get_code_snippet' },
++      { name: 'get_graph_schema' },
++      { name: 'detect_changes' },
++      { name: 'query_graph' },
++      { name: 'get_architecture' },
++      { name: 'list_projects' },
++      { name: 'index_status' }
++    ]
++  };
++
++  const pruned = filterToolsListResult(allTools, { includeFacade: true, pruneDuplicates: true });
++  const names = pruned.tools.map(t => t.name);
++
++  // Deve conter as ferramentas facade
++  assert.ok(names.includes('code_search_surgical'));
++  assert.ok(names.includes('trace_symbol'));
++  assert.ok(names.includes('get_symbol_snippet'));
++
++  // Deve conter as essenciais
++  assert.ok(names.includes('get_architecture'));
++  assert.ok(names.includes('list_projects'));
++  assert.ok(names.includes('index_status'));
++
++  // NÃO deve conter as duplicadas brutas
++  for (const raw of DUPLICATE_RAW_TOOLS) {
++    assert.equal(names.includes(raw), false, `Ferramenta bruta duplicada ${raw} deveria ter sido podada`);
++  }
++});
++
++test('authorizeToolCall resolve apelido de projeto e autoriza com sucesso', () => {
++  const accessWithAliases = {
++    system: false,
++    allowedProjects: new Set(['data-repositories-claps-clapsapi-gestor']),
++    knownProjects: new Set([
++      'data-repositories-claps-clapsapi-gestor',
++      'data-repositories-pagueon-pagueonapi-recorrente'
++    ])
++  };
++
++  const res = authorizeToolCall({
++    name: 'code_search_surgical',
++    arguments: { project: 'clapsapi-gestor', query: 'Processar' }
++  }, accessWithAliases);
++
++  assert.equal(res.allowed, true);
++  assert.equal(res.resolvedProject, 'data-repositories-claps-clapsapi-gestor');
++
++  // Projeto não autorizado
++  const deniedRes = authorizeToolCall({
++    name: 'code_search_surgical',
++    arguments: { project: 'pagueonapi-recorrente', query: 'Processar' }
++  }, accessWithAliases);
++  assert.equal(deniedRes.allowed, false);
++  assert.match(deniedRes.reason, /não possui acesso/);
++});
++
++test('servidor gRPC resolve apelido em CheckRequest e muta project para canônico', async t => {
++  const aliasAccess = {
++    system: false,
++    allowedProjects: new Set(['data-repositories-claps-clapsapi-gestor']),
++    knownProjects: new Set(['data-repositories-claps-clapsapi-gestor'])
++  };
++
++  const server = await startMcpGuardrailServer(userId => userId === 'user-alias' ? aliasAccess : null, '127.0.0.1:0');
++  t.after(() => new Promise(resolve => server.tryShutdown(resolve)));
++  const protoRoot = path.resolve(import.meta.dirname, '..', 'proto');
++  const definition = protoLoader.loadSync(path.join(protoRoot, 'ext_mcp.proto'), {
++    includeDirs: [protoRoot],
++    keepCase: false,
++    longs: String,
++    enums: String,
++    defaults: false,
++    oneofs: true
++  });
++  const descriptor = grpc.loadPackageDefinition(definition);
++  const Client = descriptor.agentgateway.dev.ext_mcp.ExtMcp;
++  const client = new Client(`127.0.0.1:${server.boundPort}`, grpc.credentials.createInsecure());
++  t.after(() => client.close());
++
++  const reqResult = await new Promise((resolve, reject) => client.CheckRequest({
++    method: 'tools/call',
++    metadataContext: { fields: { userId: { stringValue: 'user-alias' } } },
++    mcpRequest: Buffer.from(JSON.stringify({
++      name: 'code_search_surgical',
++      arguments: { project: 'claps/clapsapi-gestor', query: 'ProcessarContrato' }
++    }))
++  }, (error, response) => error ? reject(error) : resolve(response)));
++
++  assert.ok(reqResult.mutated);
++  const mutated = JSON.parse(reqResult.mutated);
++  assert.equal(mutated.name, 'search_graph');
++  assert.equal(mutated.arguments.project, 'data-repositories-claps-clapsapi-gestor');
++  assert.equal(mutated.arguments.query, 'ProcessarContrato');
++  assert.equal(reqResult.metadata.fields.resolvedProject.stringValue, 'data-repositories-claps-clapsapi-gestor');
++});
++
++
+diff --git a/app/test/openwebui-config.test.js b/app/test/openwebui-config.test.js
+index e36f059..5ec0c03 100644
+--- a/app/test/openwebui-config.test.js
++++ b/app/test/openwebui-config.test.js
+@@ -248,8 +248,9 @@ print(json.dumps([module.get_file_citation_metadata(item) for item in cases]))
+ test('presets de exemplo selecionam o padrão e carregam parâmetros e integrações esperados', async () => {
+   const manifest = JSON.parse(await readFile(path.join(root, 'openwebui/bootstrap/models.json'), 'utf8'));
+   assert.deepEqual(manifest.models.map(model => model.id), ['business-model-sample', 'code-model-sample']);
++  assert.equal(manifest.models[0].base_model_id, 'ornith15-9b-ad:latest');
++  assert.equal(manifest.models[1].base_model_id, 'qwen2.5-coder:14b-instruct-q4_0');
+   for (const model of manifest.models) {
+-    assert.equal(model.base_model_id, 'gemma4:e2b');
+     assert.equal(model.params.num_ctx, 64000);
+     assert.equal(model.params.function_calling, 'native');
+   }
+diff --git a/compose.yaml b/compose.yaml
+index 16261aa..e37ac71 100644
+--- a/compose.yaml
++++ b/compose.yaml
+@@ -137,6 +137,10 @@ services:
+     image: ollama/ollama:${OLLAMA_VERSION:-0.32.1}
+     profiles: ["ollama-docker"]
+     restart: unless-stopped
++    ulimits:
++      nofile:
++        soft: 65535
++        hard: 65535
+     volumes:
+       - ollama-data:/root/.ollama
+     ports:
+@@ -177,6 +181,10 @@ services:
+       context: ./openwebui
+     image: codebase-memory-open-webui:0.11.0-google-drive-config
+     restart: unless-stopped
++    ulimits:
++      nofile:
++        soft: 65535
++        hard: 65535
+     depends_on:
+       docling:
+         condition: service_healthy
+@@ -226,6 +234,7 @@ services:
+       OPENWEBUI_URL: http://open-webui:8080
+       OLLAMA_URL: "${OLLAMA_BASE_URL:-http://ollama:11434}"
+       OLLAMA_CHAT_MODEL: "${OLLAMA_CHAT_MODEL:-gemma4:e2b}"
++      OLLAMA_BUSINESS_MODEL: "${OLLAMA_BUSINESS_MODEL:-ornith15-9b-ad:latest}"
+       OLLAMA_CONTEXT_LENGTH: "${OLLAMA_CONTEXT_LENGTH:-64000}"
+       OLLAMA_EMBEDDING_MODEL: bge-m3
+       RAG_RERANKING_MODEL: "${RAG_RERANKING_MODEL-BAAI/bge-reranker-v2-m3}"
+diff --git a/openwebui/bootstrap/bootstrap.sh b/openwebui/bootstrap/bootstrap.sh
+index e2b015b..59b5597 100755
+--- a/openwebui/bootstrap/bootstrap.sh
++++ b/openwebui/bootstrap/bootstrap.sh
+@@ -6,7 +6,8 @@ set -eu
+ : "${OLLAMA_URL:?OLLAMA_URL não configurada}"
+ : "${WEBUI_ADMIN_EMAIL:?WEBUI_ADMIN_EMAIL não configurado}"
+ : "${WEBUI_ADMIN_PASSWORD:?WEBUI_ADMIN_PASSWORD não configurado}"
+-: "${OLLAMA_CHAT_MODEL:=gemma4:e2b}"
++: "${OLLAMA_CHAT_MODEL:=qwen2.5-coder:14b-instruct-q4_0}"
++: "${OLLAMA_BUSINESS_MODEL:=ornith15-9b-ad:latest}"
+ : "${OLLAMA_CONTEXT_LENGTH:=64000}"
+ : "${OLLAMA_EMBEDDING_MODEL:=bge-m3}"
+ : "${RAG_RERANKING_MODEL:=}"
+@@ -46,6 +47,7 @@ pull_model() {
+ wait_for "Ollama" "$OLLAMA_URL/api/tags"
+ wait_for "Open WebUI" "$OPENWEBUI_URL/health"
+ pull_model "$OLLAMA_CHAT_MODEL"
++[ "$OLLAMA_BUSINESS_MODEL" = "$OLLAMA_CHAT_MODEL" ] || pull_model "$OLLAMA_BUSINESS_MODEL"
+ pull_model "$OLLAMA_EMBEDDING_MODEL"
+ 
+ auth_payload="$(jq -cn --arg email "$WEBUI_ADMIN_EMAIL" --arg password "$WEBUI_ADMIN_PASSWORD" '{email:$email,password:$password}')"
+@@ -127,9 +129,9 @@ curl -fsS "$OPENWEBUI_URL/api/v1/configs/tool_servers" \
+ unset mcp_system_token mcp_admin_connection tool_servers_payload
+ echo "MCP Admin validado, ativo e configurado com acesso total"
+ 
+-models_payload="$(jq --arg knowledge_id "$knowledge_id" --arg chat_model "$OLLAMA_CHAT_MODEL" --argjson context_length "$OLLAMA_CONTEXT_LENGTH" '
++models_payload="$(jq --arg knowledge_id "$knowledge_id" --arg chat_model "$OLLAMA_CHAT_MODEL" --arg business_model "$OLLAMA_BUSINESS_MODEL" --argjson context_length "$OLLAMA_CONTEXT_LENGTH" '
+   .models |= map(
+-    .base_model_id = $chat_model
++    (if .id == "business-model-sample" then .base_model_id = $business_model else .base_model_id = $chat_model end)
+     | .params.num_ctx = $context_length
+     | if .id == "business-model-sample" then
+         .meta.knowledge = [{id:$knowledge_id,name:"Knowledge Base Sample",type:"collection"}]
+diff --git a/openwebui/bootstrap/models.json b/openwebui/bootstrap/models.json
+index cf6f134..3af1bda 100644
+--- a/openwebui/bootstrap/models.json
++++ b/openwebui/bootstrap/models.json
+@@ -2,7 +2,7 @@
+   "models": [
+     {
+       "id": "business-model-sample",
+-      "base_model_id": "gemma4:e2b",
++      "base_model_id": "ornith15-9b-ad:latest",
+       "name": "Business Model Sample",
+       "is_active": true,
+       "access_grants": [],
+@@ -26,12 +26,12 @@
+     },
+     {
+       "id": "code-model-sample",
+-      "base_model_id": "gemma4:e2b",
++      "base_model_id": "qwen2.5-coder:14b-instruct-q4_0",
+       "name": "Code Model Sample",
+       "is_active": true,
+       "access_grants": [],
+       "params": {
+-        "system": "Você é o Assistente de Desenvolvimento da organização. Responda em português técnico, preciso e objetivo. Você possui a ferramenta MCP Admin, conectada com a credencial Sistema/Playground e acesso administrativo total a todos os projetos e ferramentas do Codebase Memory. Use esse poder somente para análise de código; nunca indexe, exclua ou modifique repositórios, ADRs, traces ou configurações, salvo pedido administrativo explícito e confirmado.\n\nPara qualquer pergunta sobre implementação, bug, dependência, arquitetura ou impacto, investigue antes de concluir:\n1. chame list_projects e use exatamente o ID retornado;\n2. use get_architecture para orientação ampla;\n3. use search_graph para símbolos ou conceitos e trace_path para callers e callees;\n4. recupere a fonte exata com get_code_snippet ou search_code;\n5. verifique index_status e detect_changes quando atualidade, ausência ou completude importar.\n\nNão responda com suposição genérica quando o MCP puder confirmar. Diferencie fato do grafo, fato do código, inferência e lacuna de cobertura. Antes de dizer que algo não existe ou não é usado, pesquise variantes, relações, cobertura e estado do índice. Cite projeto, arquivo, símbolo e linhas. Para fluxos, descreva entrada → validação → regra → persistência ou integração → resposta ou evento. Para impacto, classifique como confirmado, provável ou não avaliado. Se houver evidência insuficiente, declare isso e indique a próxima consulta necessária.",
++        "system": "Você é o Assistente de Desenvolvimento da organização. Responda em português técnico, preciso e objetivo. Você possui a ferramenta MCP Admin, conectada com a credencial Sistema/Playground e acesso administrativo total a todos os projetos e ferramentas do Codebase Memory. Use esse poder somente para análise de código; nunca indexe, exclua ou modifique repositórios, ADRs, traces ou configurações, salvo pedido administrativo explícito e confirmado.\n\nPara qualquer pergunta sobre implementação, bug, dependência, arquitetura ou impacto, investigue antes de concluir:\n1. chame list_projects e use exatamente o ID retornado;\n2. use get_architecture para orientação ampla e visão dos módulos;\n3. use code_search_surgical para símbolos ou conceitos com BM25 e trace_symbol para callers e callees com supressão de arquivos de teste;\n4. recupere a fonte exata e higienizada com get_symbol_snippet;\n5. verifique index_status quando atualidade, ausência ou completude importar.\n\nNão responda com suposição genérica quando o MCP puder confirmar. Diferencie fato do grafo, fato do código, inferência e lacuna de cobertura. Antes de dizer que algo não existe ou não é usado, pesquise variantes, relações, cobertura e estado do índice. Cite projeto, arquivo, símbolo e linhas. Para fluxos, descreva entrada → validação → regra → persistência ou integração → resposta ou evento. Para impacto, classifique como confirmado, provável ou não avaliado. Se houver evidência insuficiente, declare isso e indique a próxima consulta necessária.",
+         "num_ctx": 64000,
+         "temperature": 0.15,
+         "top_p": 0.85,
+-- 
+2.53.0
+

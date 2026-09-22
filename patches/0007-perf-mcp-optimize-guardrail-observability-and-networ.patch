@@ -1,0 +1,298 @@
+From 6c350867ef6e1d8bd3b2b6a4afe9b3122cf966e0 Mon Sep 17 00:00:00 2001
+From: Paulo Ricardo <contact@pauloricardo.dev>
+Date: Tue, 22 Sep 2026 12:56:48 +0000
+Subject: [PATCH 7/9] perf(mcp): optimize guardrail, observability and network
+ path
+
+- Cache list_projects responses in guardrail (30s TTL) to skip
+  re-parsing and re-filtering on repeated calls
+- Replace structuredClone with in-place mutation in
+  applyPayloadPruning and filterListProjectsResult to cut memory
+  allocation on large AST payloads
+- Lower code_search_surgical default limit from 200 to 30 to reduce
+  LLM context waste; max remains 200 when explicitly requested
+- Add per-phase latency histograms and call counters to the gRPC
+  guardrail (mcp_guardrail_duration_seconds, mcp_guardrail_calls_total)
+- Add proper Prometheus histogram bucket support to both observability
+  modules (app and knowledge-sync) with configurable buckets and
+  standard _bucket{le=...}, _count, _sum exposition format
+- Expose AgentGateway MCP port directly on loopback
+  (MCP_DIRECT_PORT, default 8081) to bypass the Nginx hop for local
+  MCP clients, reducing latency by ~1-2ms per call
+
+All 87 existing tests pass (73 app + 14 knowledge-sync).
+---
+ .sample_env                         |  2 ++
+ app/src/mcp-guardrail.js            | 46 +++++++++++++++++++++++++----
+ app/src/observability.js            | 28 +++++++++++++++---
+ compose.yaml                        |  2 ++
+ knowledge-sync/src/observability.js | 25 ++++++++++++++--
+ nginx/nginx.conf                    |  2 ++
+ 6 files changed, 93 insertions(+), 12 deletions(-)
+
+diff --git a/.sample_env b/.sample_env
+index bb442aa..5010a08 100644
+--- a/.sample_env
++++ b/.sample_env
+@@ -22,3 +22,5 @@ GRAFANA_PUBLIC_URL=http://grafana.localhost:8080
+ GRAFANA_PUBLIC_HOST=grafana.localhost
+ MCP_PUBLIC_URL=http://mcp.localhost:8080
+ MCP_PUBLIC_HOST=mcp.localhost
++# Porta direta do MCP (ignora Nginx). Clientes locais podem usar localhost:8081.
++# MCP_DIRECT_PORT=8081
+diff --git a/app/src/mcp-guardrail.js b/app/src/mcp-guardrail.js
+index 9fc2bd2..a455317 100644
+--- a/app/src/mcp-guardrail.js
++++ b/app/src/mcp-guardrail.js
+@@ -3,6 +3,17 @@ import protoLoader from '@grpc/proto-loader';
+ import path from 'node:path';
+ import { fileURLToPath } from 'node:url';
+ 
++import { increment as incrementMetric, observe as observeMetric } from './observability.js';
++
++const listProjectsCache = new Map();
++const LIST_PROJECTS_CACHE_TTL_MS = 30_000;
++
++function listProjectsCacheKey(access) {
++  if (!access) return null;
++  if (access.system) return '__system__';
++  return [...access.allowedProjects].sort().join('\0');
++}
++
+ const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
+ const PROTO_FILE = path.join(ROOT, 'proto', 'ext_mcp.proto');
+ 
+@@ -39,7 +50,7 @@ export const FACADE_TOOL_DEFINITIONS = [
+         query: { type: 'string', description: 'Termo de busca cirúrgica ou símbolo a localizar via FTS5/BM25.' },
+         label: { type: 'string', description: 'Filtro opcional por tipo de nó (Function, Method, Class, Route, etc).' },
+         file_pattern: { type: 'string', description: 'Filtro opcional por padrão de caminho de arquivo.' },
+-        limit: { type: 'number', description: 'Limite máximo de resultados (padrão 200).' }
++        limit: { type: 'number', description: 'Limite máximo de resultados (padrão 30, máximo 200).' }
+       },
+       required: ['project', 'query']
+     }
+@@ -148,7 +159,7 @@ function filterProjectPayload(payload, allowedProjects) {
+ }
+ 
+ export function filterListProjectsResult(result, allowedProjects) {
+-  const filtered = structuredClone(result);
++  const filtered = result;
+   if (filtered.structuredContent) {
+     filtered.structuredContent = projectEntries(filtered.structuredContent)
+       ? filterProjectPayload(filtered.structuredContent, allowedProjects)
+@@ -390,7 +401,7 @@ export function pruneSnippetPayload(payload) {
+ 
+ export function applyPayloadPruning(result, pruner) {
+   if (!result || typeof result !== 'object') return result;
+-  const pruned = structuredClone(result);
++  const pruned = result;
+ 
+   if (pruned.structuredContent) {
+     pruned.structuredContent = pruner(pruned.structuredContent);
+@@ -428,7 +439,7 @@ export function mapFacadeRequest(params) {
+       query: args.query || args.pattern || args.term || args.symbol || '',
+       ...(args.label ? { label: args.label } : {}),
+       ...(args.file_pattern ? { file_pattern: args.file_pattern } : {}),
+-      ...(args.limit != null ? { limit: args.limit } : {}),
++      limit: args.limit != null ? args.limit : 30,
+       ...(args.offset != null ? { offset: args.offset } : {})
+     };
+     return {
+@@ -510,6 +521,7 @@ export function authorizeToolCall(params, access) {
+ export function createMcpGuardrailHandlers(resolveAccess) {
+   return {
+     checkRequest(call, callback) {
++      const started = performance.now();
+       try {
+         const metadata = structFromProto(call.request.metadataContext || call.request.metadata_context);
+         const userId = String(metadata.userId || '');
+@@ -549,10 +561,14 @@ export function createMcpGuardrailHandlers(resolveAccess) {
+         });
+       } catch (error) {
+         callback(null, invalidRequest(error.message));
++      } finally {
++        incrementMetric('mcp_guardrail_calls_total', { phase: 'request' });
++        observeMetric('mcp_guardrail_duration_seconds', (performance.now() - started) / 1000, { phase: 'request' });
+       }
+     },
+ 
+     checkResponse(call, callback) {
++      const started = performance.now();
+       try {
+         const metadata = structFromProto(call.request.metadataContext || call.request.metadata_context);
+         const access = resolveAccess(String(metadata.userId || ''));
+@@ -567,6 +583,15 @@ export function createMcpGuardrailHandlers(resolveAccess) {
+         const facadeTool = String(metadata.facadeTool || '');
+         const effectiveTool = facadeTool || toolName;
+ 
++        const cacheKey = effectiveTool === 'list_projects' ? listProjectsCacheKey(access) : null;
++        if (cacheKey) {
++          const rawHash = Buffer.from(call.request.mcpResponse || call.request.mcp_response || []).length;
++          const cached = listProjectsCache.get(cacheKey);
++          if (cached && cached.rawSize === rawHash && cached.expiresAt > Date.now()) {
++            return callback(null, { mutated: cached.buffer });
++          }
++        }
++
+         let modified = false;
+         let payload = result;
+ 
+@@ -593,12 +618,23 @@ export function createMcpGuardrailHandlers(resolveAccess) {
+         }
+ 
+         if (modified) {
+-          return callback(null, { mutated: Buffer.from(JSON.stringify(payload)) });
++          const mutatedBuffer = Buffer.from(JSON.stringify(payload));
++          if (cacheKey) {
++            listProjectsCache.set(cacheKey, {
++              buffer: mutatedBuffer,
++              rawSize: Buffer.from(call.request.mcpResponse || call.request.mcp_response || []).length,
++              expiresAt: Date.now() + LIST_PROJECTS_CACHE_TTL_MS
++            });
++          }
++          return callback(null, { mutated: mutatedBuffer });
+         }
+ 
+         callback(null, { pass: {} });
+       } catch (error) {
+         callback(null, invalidRequest(error.message));
++      } finally {
++        incrementMetric('mcp_guardrail_calls_total', { phase: 'response' });
++        observeMetric('mcp_guardrail_duration_seconds', (performance.now() - started) / 1000, { phase: 'response' });
+       }
+     }
+   };
+diff --git a/app/src/observability.js b/app/src/observability.js
+index af0fed1..c385e32 100644
+--- a/app/src/observability.js
++++ b/app/src/observability.js
+@@ -1,6 +1,13 @@
+ const counters = new Map();
+ const gauges = new Map();
+ const histograms = new Map();
++const bucketConfigs = new Map();
++
++const DEFAULT_HISTOGRAM_BUCKETS = [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10];
++
++export function configureBuckets(name, buckets) {
++  bucketConfigs.set(name, buckets);
++}
+ 
+ function serializeLabels(labels) {
+   const entries = Object.entries(labels).filter(([, value]) => value !== undefined && value !== null).sort(([a], [b]) => a.localeCompare(b));
+@@ -18,10 +25,18 @@ export function gauge(name, value, labels = {}) { gauges.set(metricKey(name, lab
+ 
+ export function observe(name, value, labels = {}) {
+   const key = metricKey(name, labels);
+-  const current = histograms.get(key) || { count: 0, sum: 0 };
++  let current = histograms.get(key);
++  if (!current) {
++    const thresholds = bucketConfigs.get(name) || DEFAULT_HISTOGRAM_BUCKETS;
++    current = { count: 0, sum: 0, buckets: Object.fromEntries(thresholds.map(b => [b, 0])) };
++    histograms.set(key, current);
++  }
++  const val = Number(value) || 0;
+   current.count += 1;
+-  current.sum += Number(value) || 0;
+-  histograms.set(key, current);
++  current.sum += val;
++  for (const b in current.buckets) {
++    if (val <= Number(b)) current.buckets[b] += 1;
++  }
+ }
+ 
+ export function metricsText() {
+@@ -33,7 +48,12 @@ export function metricsText() {
+   for (const [key, value] of gauges) { const [name, labels] = JSON.parse(key); lines.push(`${name}${serializeLabels(labels)} ${value}`); }
+   for (const [key, value] of histograms) {
+     const [name, labels] = JSON.parse(key);
+-    lines.push(`${name}_count${serializeLabels(labels)} ${value.count}`, `${name}_sum${serializeLabels(labels)} ${value.sum}`);
++    for (const b in value.buckets) {
++      lines.push(`${name}_bucket${serializeLabels({ ...labels, le: b })} ${value.buckets[b]}`);
++    }
++    lines.push(`${name}_bucket${serializeLabels({ ...labels, le: '+Inf' })} ${value.count}`);
++    lines.push(`${name}_count${serializeLabels(labels)} ${value.count}`);
++    lines.push(`${name}_sum${serializeLabels(labels)} ${value.sum}`);
+   }
+   return `${lines.join('\n')}\n`;
+ }
+diff --git a/compose.yaml b/compose.yaml
+index 8122676..b8ec03d 100644
+--- a/compose.yaml
++++ b/compose.yaml
+@@ -38,6 +38,8 @@ services:
+       - ./repositories:/data/repositories:ro
+       - ./cache:/data/cache
+       - ${CBM_HOST_BIN}:/usr/local/bin/codebase-memory-mcp:ro
++    ports:
++      - "127.0.0.1:${MCP_DIRECT_PORT:-8081}:${UI_PORT:-8080}"
+     expose:
+       - "${UI_PORT:-8080}"
+       - "15000"
+diff --git a/knowledge-sync/src/observability.js b/knowledge-sync/src/observability.js
+index 7819248..e88c993 100644
+--- a/knowledge-sync/src/observability.js
++++ b/knowledge-sync/src/observability.js
+@@ -1,6 +1,13 @@
+ const counters = new Map();
+ const gauges = new Map();
+ const histograms = new Map();
++const bucketConfigs = new Map();
++
++const DEFAULT_HISTOGRAM_BUCKETS = [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10];
++
++export function configureBuckets(name, buckets) {
++  bucketConfigs.set(name, buckets);
++}
+ 
+ function key(name, labels = {}) {
+   const entries = Object.entries(labels).filter(([, value]) => value !== undefined && value !== null).sort(([a], [b]) => a.localeCompare(b));
+@@ -30,10 +37,18 @@ export function gauge(name, value, labels = {}) {
+ 
+ export function observe(name, value, labels = {}) {
+   const metric = key(name, labels);
+-  const current = histograms.get(metric) || { count: 0, sum: 0 };
++  let current = histograms.get(metric);
++  if (!current) {
++    const thresholds = bucketConfigs.get(name) || DEFAULT_HISTOGRAM_BUCKETS;
++    current = { count: 0, sum: 0, buckets: Object.fromEntries(thresholds.map(b => [b, 0])) };
++    histograms.set(metric, current);
++  }
++  const val = Number(value) || 0;
+   current.count += 1;
+-  current.sum += Number(value) || 0;
+-  histograms.set(metric, current);
++  current.sum += val;
++  for (const b in current.buckets) {
++    if (val <= Number(b)) current.buckets[b] += 1;
++  }
+ }
+ 
+ export function metricsText() {
+@@ -51,6 +66,10 @@ export function metricsText() {
+   }
+   for (const [metric, value] of histograms) {
+     const { name, labels } = parseKey(metric);
++    for (const b in value.buckets) {
++      lines.push(`${name}_bucket${labelsText({ ...labels, le: b })} ${value.buckets[b]}`);
++    }
++    lines.push(`${name}_bucket${labelsText({ ...labels, le: '+Inf' })} ${value.count}`);
+     lines.push(`${name}_count${labelsText(labels)} ${value.count}`);
+     lines.push(`${name}_sum${labelsText(labels)} ${value.sum}`);
+   }
+diff --git a/nginx/nginx.conf b/nginx/nginx.conf
+index 1a1d5d0..63882e4 100644
+--- a/nginx/nginx.conf
++++ b/nginx/nginx.conf
+@@ -155,6 +155,8 @@ http {
+     server {
+         listen 8080;
+         server_name ${MCP_PUBLIC_HOST};
++        # Clients may also connect directly via MCP_DIRECT_PORT (default 8081)
++        # to bypass this proxy. See compose.yaml agentgateway.ports.
+         client_max_body_size 512m;
+ 
+         add_header X-Content-Type-Options nosniff always;
+-- 
+2.53.0
+

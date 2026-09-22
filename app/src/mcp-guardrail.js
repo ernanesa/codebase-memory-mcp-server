@@ -8,9 +8,9 @@ import { increment as incrementMetric, observe as observeMetric } from './observ
 const listProjectsCache = new Map();
 const LIST_PROJECTS_CACHE_TTL_MS = 30_000;
 
-// LRU Semantic Response Cache para tools determinísticas (snippets, architecture, traces)
-const MAX_SEMANTIC_CACHE_ENTRIES = 200;
-const SEMANTIC_CACHE_TTL_MS = 60_000; // 1 minuto
+// LRU Semantic Response Cache para tools determinísticas (snippets, architecture, traces, searches)
+const MAX_SEMANTIC_CACHE_ENTRIES = 5000;
+const SEMANTIC_CACHE_TTL_MS = 1_800_000; // 30 minutos (invalidado por clearSemanticCache na reindexação)
 const semanticResponseCache = new Map();
 
 export function clearSemanticCache() {
@@ -53,7 +53,7 @@ function semanticCacheKey(toolName, args) {
   if (toolName === 'get_architecture') {
     return `arch:${project}`;
   }
-  if (toolName === 'get_symbol_snippet' || toolName === 'get_code_snippet') {
+  if (toolName === 'get_symbol_snippet' || toolName === 'get_code_snippet' || toolName === 'inspect_symbol') {
     const symbol = String(args.symbol || args.qualified_name || args.name || '').trim();
     if (!symbol) return null;
     return `snip:${project}:${symbol}:${args.include_neighbors ? '1' : '0'}`;
@@ -64,6 +64,14 @@ function semanticCacheKey(toolName, args) {
     const depth = args.depth != null ? args.depth : 2;
     const direction = String(args.direction || 'both');
     return `trace:${project}:${sym}:${direction}:${depth}`;
+  }
+  if (toolName === 'code_search_surgical' || toolName === 'search_graph') {
+    const q = String(args.query || args.pattern || args.term || '').trim().toLowerCase();
+    if (!q) return null;
+    const label = String(args.label || '').trim().toLowerCase();
+    const fp = String(args.file_pattern || '').trim().toLowerCase();
+    const limit = args.limit != null ? args.limit : 30;
+    return `search:${project}:${q}:${label}:${fp}:${limit}`;
   }
   return null;
 }
@@ -90,13 +98,15 @@ export const MCP_ANALYSIS_TOOLS = new Set([
   'detect_changes',
   'code_search_surgical',
   'trace_symbol',
-  'get_symbol_snippet'
+  'get_symbol_snippet',
+  'inspect_symbol'
 ]);
 
 export const FACADE_TOOLS = new Set([
   'code_search_surgical',
   'trace_symbol',
-  'get_symbol_snippet'
+  'get_symbol_snippet',
+  'inspect_symbol'
 ]);
 
 export const FACADE_TOOL_DEFINITIONS = [
@@ -138,6 +148,19 @@ export const FACADE_TOOL_DEFINITIONS = [
         project: { type: 'string', description: 'Nome do projeto/repositório indexado.' },
         symbol: { type: 'string', description: 'Nome do símbolo ou qualified_name.' },
         include_neighbors: { type: 'boolean', description: 'Se deve incluir nós vizinhos no grafo.' }
+      },
+      required: ['project', 'symbol']
+    }
+  },
+  {
+    name: 'inspect_symbol',
+    description: 'Inspeção cirúrgica completa em 1 único passo: recupera o snippet de código-fonte, assinatura e callers/callees de produção.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        project: { type: 'string', description: 'Nome do projeto/repositório indexado.' },
+        symbol: { type: 'string', description: 'Nome do símbolo, método ou função a inspecionar.' },
+        include_neighbors: { type: 'boolean', description: 'Se deve incluir referências vizinhas no grafo (padrão: true).' }
       },
       required: ['project', 'symbol']
     }
@@ -491,6 +514,42 @@ export function formatSearchResultMarkdown(items) {
   return rows.join('\n');
 }
 
+export function pruneSearchResultPayload(payload) {
+  if (!payload || typeof payload !== 'object') return payload;
+  const pruned = { ...payload };
+  const items = Array.isArray(pruned.results) ? pruned.results : (Array.isArray(pruned) ? pruned : null);
+  if (items) {
+    const cleaned = items.map(item => {
+      if (!item || typeof item !== 'object') return item;
+      const copy = { ...item };
+      for (const f of UNUSED_AST_FIELDS) delete copy[f];
+      delete copy.rank;
+      return copy;
+    });
+    if (Array.isArray(pruned.results)) pruned.results = cleaned;
+    else return cleaned;
+  }
+  return pruned;
+}
+
+export function detectMcpPayloadKind(payload) {
+  if (!payload || typeof payload !== 'object') return null;
+  const target = payload.structuredContent || payload;
+  let parsed = null;
+  if (Array.isArray(payload.content) && payload.content[0]?.text) {
+    try { parsed = JSON.parse(payload.content[0].text); } catch {}
+  }
+  const obj = (parsed && typeof parsed === 'object') ? parsed : target;
+  if (!obj || typeof obj !== 'object') return null;
+
+  if (obj.search_mode != null && Array.isArray(obj.results)) return 'search';
+  if (Array.isArray(obj.callers) || Array.isArray(obj.callees) || Array.isArray(obj.paths)) return 'trace';
+  if (Array.isArray(obj.file_tree) || Array.isArray(obj.clusters)) return 'architecture';
+  if (obj.qualified_name && (obj.source != null || obj.signature != null || obj.parent_class != null || obj.start_line != null)) return 'snippet';
+  if (Array.isArray(obj.projects)) return 'projects';
+  return null;
+}
+
 export function applyPayloadPruning(result, pruner) {
   if (!result || typeof result !== 'object') return result;
   const pruned = result;
@@ -588,6 +647,20 @@ export function mapFacadeRequest(params) {
     return {
       mapped: true,
       facadeTool: 'get_symbol_snippet',
+      backendTool: 'get_code_snippet',
+      params: { ...params, name: 'get_code_snippet', arguments: mappedArgs }
+    };
+  }
+
+  if (toolName === 'inspect_symbol') {
+    const mappedArgs = {
+      project: args.project,
+      qualified_name: args.symbol || args.qualified_name || args.name || '',
+      include_neighbors: args.include_neighbors !== false
+    };
+    return {
+      mapped: true,
+      facadeTool: 'inspect_symbol',
       backendTool: 'get_code_snippet',
       params: { ...params, name: 'get_code_snippet', arguments: mappedArgs }
     };
@@ -721,15 +794,40 @@ export function createMcpGuardrailHandlers(resolveAccess) {
         let modified = false;
         let payload = result;
 
-        if (effectiveTool === 'trace_path' || effectiveTool === 'trace_symbol') {
+        const detectedKind = detectMcpPayloadKind(result);
+        const isTrace = effectiveTool === 'trace_path' || effectiveTool === 'trace_symbol' || detectedKind === 'trace';
+        const isArch = effectiveTool === 'get_architecture' || detectedKind === 'architecture';
+        const isSnippet = effectiveTool === 'get_code_snippet' || effectiveTool === 'get_symbol_snippet' || effectiveTool === 'inspect_symbol' || detectedKind === 'snippet';
+        const isSearch = effectiveTool === 'code_search_surgical' || effectiveTool === 'search_graph' || detectedKind === 'search';
+
+        if (isTrace) {
           payload = applyPayloadPruning(payload, pruneTracePayload);
           modified = true;
-        } else if (effectiveTool === 'get_architecture') {
+        } else if (isArch) {
           payload = applyPayloadPruning(payload, pruneArchitecturePayload);
           modified = true;
-        } else if (effectiveTool === 'get_code_snippet' || effectiveTool === 'get_symbol_snippet') {
+        } else if (isSnippet) {
           payload = applyPayloadPruning(payload, pruneSnippetPayload);
           modified = true;
+        } else if (isSearch) {
+          payload = applyPayloadPruning(payload, pruneSearchResultPayload);
+          modified = true;
+          if (Array.isArray(payload?.content)) {
+            let searchItems = null;
+            try {
+              const parsed = JSON.parse(payload.content[0]?.text || '{}');
+              if (Array.isArray(parsed.results)) searchItems = parsed.results;
+            } catch {}
+            if (!searchItems && Array.isArray(payload?.structuredContent?.results)) {
+              searchItems = payload.structuredContent.results;
+            }
+            if (Array.isArray(searchItems) && searchItems.length > 0) {
+              const tableMd = formatSearchResultMarkdown(searchItems);
+              if (tableMd) {
+                payload.content = [{ type: 'text', text: tableMd }];
+              }
+            }
+          }
         }
 
         const hasProjects = projectEntries(result?.structuredContent)

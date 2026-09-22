@@ -1,0 +1,28 @@
+From b2b6267e2513295fa6b97f3f707c0dcf42e8fe37 Mon Sep 17 00:00:00 2001
+From: Paulo Ricardo <contact@pauloricardo.dev>
+Date: Mon, 21 Sep 2026 19:40:52 +0000
+Subject: [PATCH 4/9] fix(bootstrap): check local model existence before
+ pulling to support local fine-tunes
+
+---
+ openwebui/bootstrap/bootstrap.sh | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/openwebui/bootstrap/bootstrap.sh b/openwebui/bootstrap/bootstrap.sh
+index 59b5597..03e3275 100755
+--- a/openwebui/bootstrap/bootstrap.sh
++++ b/openwebui/bootstrap/bootstrap.sh
+@@ -39,6 +39,10 @@ wait_for() {
+ pull_model() {
+   model="$1"
+   echo "Garantindo modelo Ollama: $model"
++  if curl -fsS "$OLLAMA_URL/api/tags" | jq -e --arg m "$model" '.models[]? | select(.name == $m or .model == $m)' >/dev/null 2>&1; then
++    echo "Modelo Ollama $model já disponível localmente"
++    return 0
++  fi
+   curl -fsS "$OLLAMA_URL/api/pull" \
+     -H 'content-type: application/json' \
+     -d "$(jq -cn --arg model "$model" '{model:$model,stream:false}')" >/dev/null
+-- 
+2.53.0
+

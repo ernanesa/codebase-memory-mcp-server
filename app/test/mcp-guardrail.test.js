@@ -18,6 +18,7 @@ import {
   DUPLICATE_RAW_TOOLS,
   sliceCodeSnippet,
   formatSearchResultMarkdown,
+  pruneSearchResultPayload,
   clearSemanticCache
 } from '../src/mcp-guardrail.js';
 
@@ -498,6 +499,46 @@ test('formatSearchResultMarkdown formata lista de itens em tabela Markdown', () 
 
 test('clearSemanticCache esvazia o cache sem lançar exceções', () => {
   assert.doesNotThrow(() => clearSemanticCache());
+});
+
+test('mapeamento de inspect_symbol para get_code_snippet com include_neighbors', () => {
+  const req = mapFacadeRequest({
+    name: 'inspect_symbol',
+    arguments: { project: 'api-pedidos', symbol: 'ProcessarPedido' }
+  });
+  assert.equal(req.mapped, true);
+  assert.equal(req.backendTool, 'get_code_snippet');
+  assert.equal(req.facadeTool, 'inspect_symbol');
+  assert.equal(req.params.arguments.qualified_name, 'ProcessarPedido');
+  assert.equal(req.params.arguments.include_neighbors, true);
+});
+
+test('pruneSearchResultPayload remove rank e campos inúteis de AST de buscas', () => {
+  const rawSearch = {
+    total: 1,
+    search_mode: 'bm25',
+    results: [
+      {
+        name: 'Contrato',
+        qualified_name: 'Claps.Contrato',
+        label: 'Class',
+        file_path: 'Contrato.cs',
+        start_line: 10,
+        end_line: 50,
+        rank: -10.5,
+        complexity: 12,
+        cognitive: 8,
+        lines: 40
+      }
+    ]
+  };
+  const pruned = pruneSearchResultPayload(rawSearch);
+  assert.equal(pruned.results[0].name, 'Contrato');
+  assert.equal(pruned.results[0].rank, undefined);
+  assert.equal(pruned.results[0].complexity, undefined);
+  assert.equal(pruned.results[0].cognitive, undefined);
+  assert.equal(pruned.results[0].lines, undefined);
+  assert.equal(pruned.results[0].start_line, 10);
 });
 
 
