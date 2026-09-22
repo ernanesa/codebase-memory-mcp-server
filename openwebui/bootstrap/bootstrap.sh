@@ -9,6 +9,9 @@ set -eu
 : "${OLLAMA_CHAT_MODEL:=qwen2.5-coder:14b-instruct-q4_0}"
 : "${OLLAMA_BUSINESS_MODEL:=ornith15-9b-ad:latest}"
 : "${OLLAMA_CONTEXT_LENGTH:=64000}"
+: "${OLLAMA_CODE_CONTEXT_LENGTH:=16384}"
+: "${OLLAMA_BUSINESS_CONTEXT_LENGTH:=32768}"
+: "${OLLAMA_CODE_NUM_GPU:=48}"
 : "${OLLAMA_EMBEDDING_MODEL:=bge-m3}"
 : "${RAG_RERANKING_MODEL:=}"
 : "${RAG_RERANKING_BATCH_SIZE:=4}"
@@ -133,10 +136,18 @@ curl -fsS "$OPENWEBUI_URL/api/v1/configs/tool_servers" \
 unset mcp_system_token mcp_admin_connection tool_servers_payload
 echo "MCP Admin validado, ativo e configurado com acesso total"
 
-models_payload="$(jq --arg knowledge_id "$knowledge_id" --arg chat_model "$OLLAMA_CHAT_MODEL" --arg business_model "$OLLAMA_BUSINESS_MODEL" --argjson context_length "$OLLAMA_CONTEXT_LENGTH" '
+models_payload="$(jq --arg knowledge_id "$knowledge_id" \
+  --arg chat_model "$OLLAMA_CHAT_MODEL" \
+  --arg business_model "$OLLAMA_BUSINESS_MODEL" \
+  --argjson code_ctx "$OLLAMA_CODE_CONTEXT_LENGTH" \
+  --argjson biz_ctx "$OLLAMA_BUSINESS_CONTEXT_LENGTH" \
+  --argjson code_gpu "$OLLAMA_CODE_NUM_GPU" '
   .models |= map(
-    (if .id == "business-model-sample" then .base_model_id = $business_model else .base_model_id = $chat_model end)
-    | .params.num_ctx = $context_length
+    (if .id == "business-model-sample" then
+      .base_model_id = $business_model | .params.num_ctx = $biz_ctx
+    else
+      .base_model_id = $chat_model | .params.num_ctx = $code_ctx | .params.num_gpu = $code_gpu
+    end)
     | if .id == "business-model-sample" then
         .meta.knowledge = [{id:$knowledge_id,name:"Knowledge Base Sample",type:"collection"}]
       else . end

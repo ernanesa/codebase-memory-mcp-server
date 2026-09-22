@@ -250,8 +250,10 @@ test('presets de exemplo selecionam o padrão e carregam parâmetros e integraç
   assert.deepEqual(manifest.models.map(model => model.id), ['business-model-sample', 'code-model-sample']);
   assert.equal(manifest.models[0].base_model_id, 'ornith15-9b-ad:latest');
   assert.equal(manifest.models[1].base_model_id, 'qwen2.5-coder:14b-instruct-q4_0');
+  assert.equal(manifest.models[0].params.num_ctx, 32768);
+  assert.equal(manifest.models[1].params.num_ctx, 16384);
+  assert.equal(manifest.models[1].params.num_gpu, 48);
   for (const model of manifest.models) {
-    assert.equal(model.params.num_ctx, 64000);
     assert.equal(model.params.function_calling, 'native');
   }
   assert.equal(manifest.models[0].params.temperature, 0.3);
