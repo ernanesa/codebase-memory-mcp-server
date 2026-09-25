@@ -2,12 +2,18 @@
 set -e
 
 # ==============================================================================
-# Setup Automático de MCP e Regras de IA para Desenvolvedores (MA9)
+# Setup Automático de MCP e Regras de IA para Desenvolvedores
 # Suporta: Cursor, VS Code, Windsurf, Claude Desktop, Antigravity
 # ==============================================================================
 
-MCP_DEFAULT_URL="https://mcp.ma9.tec.br"
-MCP_URL="${MCP_URL:-$MCP_DEFAULT_URL}"
+# Resolve MCP_PUBLIC_URL from .env if present, otherwise use localhost default
+MCP_DEFAULT_URL="http://mcp.localhost:8080"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+ENV_FILE="${SCRIPT_DIR}/../.env"
+if [ -z "${MCP_PUBLIC_URL:-}" ] && [ -f "$ENV_FILE" ]; then
+  MCP_PUBLIC_URL="$(grep -m1 '^MCP_PUBLIC_URL=' "$ENV_FILE" 2>/dev/null | sed 's/^[^=]*=//' | tr -d '"'"'" || true)"
+fi
+MCP_URL="${MCP_URL:-${MCP_PUBLIC_URL:-$MCP_DEFAULT_URL}}"
 TOKEN=""
 
 # Parse arguments

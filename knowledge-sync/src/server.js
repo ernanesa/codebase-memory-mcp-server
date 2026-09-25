@@ -1,4 +1,5 @@
 import http from 'node:http';
+import { randomUUID, timingSafeEqual } from 'node:crypto';
 import { readFile, mkdir, rename, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { changesAffectTarget, createServiceAccountAssertion, fileChecksum, folderRoot, fullReconciliationDue, GOOGLE_FOLDER_MIME, isTargetDue, MANAGED_ROOT, migrateTargetSchedule, migrateTargetSources, nextRunAt, normalizeTargetInput, publicTarget, sanitizeDriveName, scheduledSlot } from './lib.js';
@@ -92,7 +93,7 @@ function withMutation(operation) {
 
 function persist() {
   const operation = async () => {
-    const temporary = `${STATE_FILE}.tmp`;
+    const temporary = `${STATE_FILE}.${randomUUID()}.tmp`;
     await writeFile(temporary, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
     await rename(temporary, STATE_FILE);
   };
@@ -916,7 +917,12 @@ function runFileReprocess(knowledgeBaseId, sourceKey) {
 
 async function authorize(request) {
   const authorization = request.headers.authorization || '';
-  return authorization === `Bearer ${apiToken}`;
+  const prefix = 'Bearer ';
+  if (!authorization.startsWith(prefix)) return false;
+  const received = Buffer.from(authorization.slice(prefix.length));
+  const expected = Buffer.from(apiToken);
+  if (received.length !== expected.length) return false;
+  return timingSafeEqual(received, expected);
 }
 
 async function route(request, response, url) {

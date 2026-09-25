@@ -4,11 +4,20 @@ import { chmod, mkdir, readFile, readdir, rename, rm, rmdir, stat, unlink, write
 import { createReadStream } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { assertSafeSegment, DEFAULT_TIMEZONE, DEFAULT_WORKSPACE_CRON, cronMatches, decryptWorkspaceToken, describeCron, encryptWorkspaceToken, generateMcpToken, gitAuthEnvironment, indexRepositoryArguments, loadCredentials, loadMcpUserStore, loadSecret, loadState, mcpTokenFingerprint, nextCronOccurrence, parseCronExpression, parseLastJsonLine, publicMcpUser, publicWorkspace, reconcileRepositoryProjects, removeMcpGatewayUserKey, run, safeChild, saveCredentials, saveMcpUserStore, saveSecret, saveState, setMcpGatewayUserKey, slugify, validateTimezone } from './lib.js';
+import { assertSafeSegment, createMutex, DEFAULT_TIMEZONE, DEFAULT_WORKSPACE_CRON, cronMatches, decryptWorkspaceToken, describeCron, encryptWorkspaceToken, generateMcpToken, gitAuthEnvironment, indexRepositoryArguments, loadCredentials, loadMcpUserStore, loadSecret, loadState, mcpTokenFingerprint, nextCronOccurrence, parseCronExpression, parseLastJsonLine, publicMcpUser, publicWorkspace, reconcileRepositoryProjects, removeMcpGatewayUserKey, run, safeChild, saveCredentials, saveMcpUserStore, saveSecret, saveState, setMcpGatewayUserKey, slugify, validateTimezone } from './lib.js';
 import { clearSemanticCache, startMcpGuardrailServer } from './mcp-guardrail.js';
 import { gauge, increment, log as structuredLog, metricsText, observe } from './observability.js';
 import { createAdminAuth } from './auth.js';
 import { JOB_HISTORY_RETENTION_DAYS, JOB_LOG_MAX_CHARACTERS, loadJobHistory, paginateJobs, pruneJobHistory, recoverInterruptedJobs, saveJobHistory } from './job-history.js';
+import { createRouter } from './router.js';
+import { json, textResponse, redirect, requestOriginAllowed, clientAddress, secureRequest } from './http.js';
+import { register as registerAuth } from './routes/auth.js';
+import { register as registerHealth } from './routes/health.js';
+import { register as registerGithub } from './routes/github.js';
+import { register as registerJobs } from './routes/jobs.js';
+import { register as registerKnowledgeSync } from './routes/knowledge-sync.js';
+import { register as registerMcpUsers } from './routes/mcp-users.js';
+import { register as registerWorkspaces } from './routes/workspaces.js';
 
 const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const PUBLIC_DIR = path.join(ROOT, 'public');
@@ -103,6 +112,7 @@ const syncQueues = new Map();
 const syncWorkspaceOrder = [];
 const activeWorkspaceSyncs = new Set();
 let activeRepositorySyncs = 0;
+const stateMutex = createMutex();
 let mcpUserMutation = false;
 let projectReconciliation = null;
 let lastProjectReconciliationAt = 0;
@@ -112,105 +122,9 @@ const MCP_SYSTEM_USER = {
   identity: 'system@local'
 };
 
-function json(response, status, payload) {
-  response.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
-  response.end(JSON.stringify(payload));
-}
-
 function errorResponse(response, error, status = error.status || 400) {
   structuredLog('error', 'request_failed', { status, error: error.message });
   json(response, status, { error: error.message || 'Erro inesperado.' });
-}
-
-function textResponse(response, status, payload, contentType = 'text/plain; charset=utf-8') {
-  response.writeHead(status, { 'content-type': contentType, 'cache-control': 'no-store' });
-  response.end(payload);
-}
-
-function redirect(response, location) {
-  response.writeHead(302, { location, 'cache-control': 'no-store' });
-  response.end();
-}
-
-function secureRequest(request) {
-  return ADMIN_COOKIE_SECURE || String(request.headers['x-forwarded-proto'] || '').split(',')[0].trim() === 'https';
-}
-
-function requestOriginAllowed(request) {
-  const origin = request.headers.origin;
-  if (!origin) return true;
-  try {
-    const host = String(request.headers['x-forwarded-host'] || request.headers.host || '').split(',')[0].trim();
-    return new URL(origin).host === host;
-  } catch { return false; }
-}
-
-function clientAddress(request) {
-  return String(request.headers['x-real-ip'] || request.socket.remoteAddress || 'unknown');
-}
-
-function loginAllowed(request) {
-  const key = clientAddress(request);
-  const now = Date.now();
-  const current = loginAttempts.get(key);
-  if (!current || current.resetAt <= now) return true;
-  return current.failures < 5;
-}
-
-function registerLoginFailure(request) {
-  const key = clientAddress(request);
-  const now = Date.now();
-  const current = loginAttempts.get(key);
-  loginAttempts.set(key, !current || current.resetAt <= now
-    ? { failures: 1, resetAt: now + 5 * 60_000 }
-    : { ...current, failures: current.failures + 1 });
-}
-
-async function routeAuth(request, response, url) {
-  if (url.pathname === '/api/auth/login' && request.method === 'POST') {
-    if (!requestOriginAllowed(request)) return json(response, 403, { error: 'Origem não permitida.' });
-    if (!loginAllowed(request)) return json(response, 429, { error: 'Muitas tentativas. Aguarde alguns minutos.' });
-    const payload = await body(request);
-    if (!await adminAuth.verifyCredentials(payload.username, payload.password)) {
-      registerLoginFailure(request);
-      return json(response, 401, { error: 'Usuário ou senha inválidos.' });
-    }
-    loginAttempts.delete(clientAddress(request));
-    const token = adminAuth.issueToken();
-    response.setHeader('set-cookie', adminAuth.sessionCookie(token, secureRequest(request)));
-    return json(response, 200, { user: { username: adminAuth.username, role: 'admin' } });
-  }
-  if (url.pathname === '/api/auth/session' && request.method === 'GET') {
-    const session = adminAuth.session(request);
-    return session
-      ? json(response, 200, { user: { username: session.sub, role: session.role } })
-      : json(response, 401, { error: 'Autenticação necessária.' });
-  }
-  if (url.pathname === '/api/auth/logout' && request.method === 'POST') {
-    if (!requestOriginAllowed(request)) return json(response, 403, { error: 'Origem não permitida.' });
-    adminAuth.revoke(adminAuth.tokenFromRequest(request));
-    response.setHeader('set-cookie', adminAuth.clearCookie(secureRequest(request)));
-    return json(response, 200, { ok: true });
-  }
-  return json(response, 404, { error: 'Rota não encontrada.' });
-}
-
-async function probe(name, url, options = {}) {
-  const started = performance.now();
-  try {
-    const result = await fetch(url, { ...options, signal: AbortSignal.timeout(3_000) });
-    return { name, ok: result.status < 500, status: result.status, durationMs: Math.round(performance.now() - started) };
-  } catch (error) {
-    return { name, ok: false, error: error.message, durationMs: Math.round(performance.now() - started) };
-  }
-}
-
-async function dependencyHealth() {
-  const checks = await Promise.all([
-    probe('agentgateway', `${AGENTGATEWAY_ADMIN_URL}/`),
-    ...(KNOWLEDGE_SYNC_ENABLED ? [probe('knowledge-sync', `${KNOWLEDGE_SYNC_URL}/health/ready`)] : [])
-  ]);
-  return { status: checks.every(check => check.ok) ? 'ready' : 'not_ready', checks };
 }
 
 async function knowledgeSyncRequest(pathname, { method = 'GET', payload } = {}) {
@@ -279,7 +193,7 @@ function validateGoogleServiceAccount(value) {
 }
 
 async function saveGoogleServiceAccount(credentials) {
-  const temporary = `${GOOGLE_DRIVE_SERVICE_ACCOUNT_FILE}.tmp`;
+  const temporary = `${GOOGLE_DRIVE_SERVICE_ACCOUNT_FILE}.${randomUUID()}.tmp`;
   await mkdir(path.dirname(GOOGLE_DRIVE_SERVICE_ACCOUNT_FILE), { recursive: true });
   await writeFile(temporary, `${JSON.stringify(credentials, null, 2)}\n`, { mode: 0o600 });
   await chmod(temporary, 0o600);
@@ -345,7 +259,9 @@ function scheduleJobHistoryPersistence() {
 async function persist() {
   if (jobHistoryTimer) clearTimeout(jobHistoryTimer);
   jobHistoryTimer = null;
-  await Promise.all([saveState(STATE_FILE, state), enqueueJobPersistence()]);
+  return stateMutex(async () => {
+    await Promise.all([saveState(STATE_FILE, state), enqueueJobPersistence()]);
+  });
 }
 
 async function refreshRepositoryProjects({ force = false } = {}) {
@@ -887,339 +803,111 @@ async function runWorkspaceSync(selectedWorkspace, source = 'schedule') {
   }
   pumpSyncQueue();
   void (async () => {
-    const results = await Promise.all(completions);
-    const failed = results.filter(job => job.status === 'failed').length;
-    const changed = results.filter(job => job.changed).length;
-    const indexed = results.filter(job => job.indexed).length;
-    const unchanged = results.filter(job => job.status === 'completed' && !job.changed).length;
-    parent.status = failed ? 'failed' : 'completed';
-    parent.progress = 100;
-    parent.finishedAt = new Date().toISOString();
-    parent.log += `${changed} atualizado(s), ${indexed} reindexado(s), ${unchanged} sem alterações, ${failed} falha(s), ${skipped} ignorado(s).`;
-    const schedule = selectedWorkspace.updateSchedule;
-    schedule.lastRunAt = parent.finishedAt;
-    schedule.lastRunStatus = parent.status;
-    activeWorkspaceSyncs.delete(selectedWorkspace.id);
-    await persist().catch(console.error);
+    try {
+      const results = await Promise.all(completions);
+      const failed = results.filter(job => job.status === 'failed').length;
+      const changed = results.filter(job => job.changed).length;
+      const indexed = results.filter(job => job.indexed).length;
+      const unchanged = results.filter(job => job.status === 'completed' && !job.changed).length;
+      parent.status = failed ? 'failed' : 'completed';
+      parent.progress = 100;
+      parent.finishedAt = new Date().toISOString();
+      parent.log += `${changed} atualizado(s), ${indexed} reindexado(s), ${unchanged} sem alterações, ${failed} falha(s), ${skipped} ignorado(s).`;
+      const schedule = selectedWorkspace.updateSchedule;
+      schedule.lastRunAt = parent.finishedAt;
+      schedule.lastRunStatus = parent.status;
+    } catch (error) {
+      parent.status = 'failed';
+      parent.error = error.message;
+      parent.progress = 100;
+      parent.finishedAt = new Date().toISOString();
+      parent.log += `\nErro inesperado na conclusão da sincronização: ${error.message}\n`;
+      structuredLog('error', 'workspace_sync_completion_failed', { workspaceId: selectedWorkspace.id, error: error.message });
+    } finally {
+      activeWorkspaceSyncs.delete(selectedWorkspace.id);
+      await persist().catch(console.error);
+    }
   })();
   return parent;
 }
 
-async function routeApi(request, response, url) {
-  const parts = url.pathname.split('/').filter(Boolean).slice(1);
+const router = createRouter();
 
-  if (request.method === 'GET' && url.pathname === '/api/health') {
-    return json(response, 200, { status: 'ok' });
-  }
-  if (request.method === 'GET' && url.pathname === '/api/health/live') return json(response, 200, { status: 'ok' });
-  if (request.method === 'GET' && ['/api/health/ready', '/api/health/detail'].includes(url.pathname)) {
-    const health = await dependencyHealth();
-    return json(response, health.status === 'ready' ? 200 : 503, health);
-  }
-  if (request.method === 'GET' && url.pathname === '/api/metrics') {
-    let combined = metricsText();
-    if (KNOWLEDGE_SYNC_ENABLED) {
-      try {
-        const worker = await fetch(`${KNOWLEDGE_SYNC_URL}/metrics`, { signal: AbortSignal.timeout(3_000) });
-        if (worker.ok) combined += await worker.text();
-      } catch (error) {
-        structuredLog('warn', 'worker_metrics_unavailable', { error: error.message });
-      }
-    }
-    return textResponse(response, 200, combined, 'text/plain; version=0.0.4; charset=utf-8');
-  }
-  if (request.method === 'GET' && url.pathname === '/api/config') {
-    return json(response, 200, {
-      uiPort: UI_PORT,
-      knowledgeSyncEnabled: KNOWLEDGE_SYNC_ENABLED,
-      grafanaUrl: GRAFANA_PUBLIC_URL,
-      mcpUrl: MCP_PUBLIC_URL
-    });
-  }
-  if (url.pathname === '/api/knowledge-sync/credentials') {
-    if (request.method === 'GET') {
-      const result = await knowledgeSyncRequest('/api/status');
-      return json(response, result.status, result.result);
-    }
-    if (request.method === 'PUT') {
-      const payload = await body(request);
-      const credentials = validateGoogleServiceAccount(payload.credentials ?? payload);
-      await saveGoogleServiceAccount(credentials);
-      const result = await knowledgeSyncRequest('/api/status');
-      return json(response, 200, result.result);
-    }
-    if (request.method === 'DELETE') {
-      await knowledgeSyncRequest('/api/targets/drive-credentials-removed', { method: 'POST', payload: {} });
-      await removeGoogleServiceAccount();
-      const status = await knowledgeSyncRequest('/api/status');
-      return json(response, 200, status.result);
-    }
-    return json(response, 405, { error: 'Método não permitido.' });
-  }
-  if (url.pathname.startsWith('/api/knowledge-sync')) {
-    const workerPath = `/api${url.pathname.slice('/api/knowledge-sync'.length)}${url.search}`;
-    const payload = ['POST', 'PUT', 'PATCH'].includes(request.method) ? await body(request) : undefined;
-    const result = await knowledgeSyncRequest(workerPath, { method: request.method, payload });
-    return json(response, result.status, result.result);
-  }
-  if (url.pathname === '/api/mcp-system-token/reveal' && request.method === 'POST') {
-    return json(response, 200, { token: mcpSystemToken, name: MCP_SYSTEM_USER.name });
-  }
-  if (url.pathname === '/api/mcp-system-token/rotate' && request.method === 'POST') {
-    const token = await rotateMcpSystemToken();
-    return json(response, 200, { token, name: MCP_SYSTEM_USER.name });
-  }
-  if (url.pathname === '/api/mcp-users') {
-    if (request.method === 'GET') {
-      return json(response, 200, {
-        users: mcpUserStore.users.map(publicMcpUser),
-        accessMode: 'strict',
-        systemAccess: true
-      });
-    }
-    if (request.method === 'POST') {
-      const payload = await body(request);
-      const input = mcpUserInput(payload);
-      const repositoryIds = mcpRepositoryIds(payload.repositoryIds);
-      if (mcpUserStore.users.some(item => item.identity.toLowerCase() === input.identity.toLowerCase())) {
-        throw new Error('Já existe um usuário MCP com esse e-mail ou login.');
-      }
-      const now = new Date().toISOString();
-      const issued = issueMcpToken({ id: randomUUID(), ...input, repositoryIds, createdAt: now });
-      const nextStore = { managed: true, users: [...mcpUserStore.users, issued.user] };
-      await commitMcpUserChange(nextStore, config => setMcpGatewayUserKey(config, issued.user, issued.token));
-      return json(response, 201, { user: publicMcpUser(issued.user), token: issued.token });
-    }
-  }
-  if (url.pathname === '/api/mcp-access-options' && request.method === 'GET') {
-    await refreshRepositoryProjects().catch(error => console.warn('Não foi possível atualizar os IDs MCP dos repositórios:', error.message));
-    return json(response, 200, {
-      workspaces: state.workspaces.map(item => ({
-        id: item.id,
-        name: item.name,
-        repositories: state.repositories
-          .filter(repository => repository.workspaceId === item.id)
-          .map(repository => ({
-            id: repository.accessId,
-            name: repository.name,
-            fullName: repository.fullName,
-            indexed: Boolean(repository.project),
-            project: repository.project || null
-          }))
-          .sort((a, b) => a.fullName.localeCompare(b.fullName))
-      }))
-    });
-  }
-  if (parts[0] === 'mcp-users' && parts[1]) {
-    const selected = mcpUser(parts[1]);
-    if (parts.length === 3 && parts[2] === 'repositories' && request.method === 'PUT') {
-      const payload = await body(request);
-      const repositoryIds = mcpRepositoryIds(payload.repositoryIds);
-      const updated = { ...selected, repositoryIds, updatedAt: new Date().toISOString() };
-      const nextStore = { managed: true, users: mcpUserStore.users.map(item => item.id === selected.id ? updated : item) };
-      await commitMcpUserStoreOnly(nextStore);
-      return json(response, 200, { user: publicMcpUser(updated) });
-    }
-    if (parts.length === 2 && request.method === 'DELETE') {
-      const nextStore = { managed: true, users: mcpUserStore.users.filter(item => item.id !== selected.id) };
-      await commitMcpUserChange(nextStore, config => removeMcpGatewayUserKey(config, selected.id));
-      return json(response, 200, { deleted: true });
-    }
-    if (parts.length === 3 && parts[2] === 'revoke' && request.method === 'POST') {
-      if (selected.status === 'revoked') throw new Error('O token deste usuário já está revogado.');
-      const now = new Date().toISOString();
-      const updated = { ...selected, status: 'revoked', updatedAt: now, revokedAt: now };
-      const nextStore = { managed: true, users: mcpUserStore.users.map(item => item.id === selected.id ? updated : item) };
-      await commitMcpUserChange(nextStore, config => removeMcpGatewayUserKey(config, selected.id));
-      return json(response, 200, { user: publicMcpUser(updated) });
-    }
-    if (parts.length === 3 && (parts[2] === 'rotate' || parts[2] === 'reactivate') && request.method === 'POST') {
-      if (parts[2] === 'rotate' && selected.status !== 'active') throw new Error('Reative o usuário antes de rotacionar seu token.');
-      if (parts[2] === 'reactivate' && selected.status !== 'revoked') throw new Error('Este usuário já está ativo.');
-      const issued = issueMcpToken(selected);
-      const nextStore = { managed: true, users: mcpUserStore.users.map(item => item.id === selected.id ? issued.user : item) };
-      await commitMcpUserChange(nextStore, config => setMcpGatewayUserKey(config, issued.user, issued.token));
-      return json(response, 200, { user: publicMcpUser(issued.user), token: issued.token });
-    }
-  }
-  if (url.pathname === '/api/github/connection') {
-    if (request.method === 'GET') return json(response, 200, { connected: Boolean(githubToken), user: githubUser });
-    if (request.method === 'POST') {
-      const input = await body(request);
-      const token = String(input.token ?? '').trim();
-      const user = await github('/user', token);
-      const persistedUser = { login: user.login, name: user.name, avatarUrl: user.avatar_url };
-      await saveCredentials(GITHUB_CREDENTIALS_FILE, { token, user: persistedUser });
-      githubToken = token;
-      githubUser = persistedUser;
-      githubCache = { at: 0, repositories: [] };
-      return json(response, 200, { connected: true, user: githubUser });
-    }
-    if (request.method === 'DELETE') {
-      await rm(GITHUB_CREDENTIALS_FILE, { force: true });
-      githubToken = ''; githubUser = null; githubCache = { at: 0, repositories: [] };
-      return json(response, 200, { connected: false });
-    }
-  }
-  if (request.method === 'GET' && url.pathname === '/api/github/repositories') {
-    const search = (url.searchParams.get('search') || '').toLowerCase();
-    const repositories = (await listGithubRepositories()).filter(item => !search || `${item.fullName} ${item.description || ''}`.toLowerCase().includes(search));
-    return json(response, 200, { repositories });
-  }
-  if (url.pathname === '/api/workspaces' && request.method === 'GET') {
-    return json(response, 200, { workspaces: state.workspaces.map(item => ({ ...publicWorkspace(item), updateSchedule: publicUpdateSchedule(item), repositoryCount: state.repositories.filter(repo => repo.workspaceId === item.id).length })) });
-  }
-  if (url.pathname === '/api/workspaces' && request.method === 'POST') {
-    const input = await body(request);
-    const name = String(input.name ?? '').trim();
-    const id = slugify(name);
-    if (!name || !id) throw new Error('Informe um nome válido para o workspace.');
-    if (state.workspaces.some(item => item.id === id)) throw new Error('Já existe um workspace com esse nome.');
-    const item = { id, name: name.slice(0, 80), description: String(input.description ?? '').trim().slice(0, 240), updateSchedule: defaultUpdateSchedule(), createdAt: new Date().toISOString() };
-    const issued = issueWorkspaceMcpCredential(item);
-    item.mcpCredential = issued.credential;
-    await mkdir(safeChild(REPOSITORIES_DIR, id), { recursive: true });
-    const nextState = { ...state, workspaces: [...state.workspaces, item] };
-    try {
-      await commitWorkspaceChange(nextState, config => setMcpGatewayUserKey(config, workspacePrincipal(item), issued.token));
-    } catch (error) {
-      await rmdir(safeChild(REPOSITORIES_DIR, id)).catch(() => {});
-      throw error;
-    }
-    return json(response, 201, { workspace: publicWorkspace(item), token: issued.token });
-  }
+const ctx = {
+  get state() { return state; },
+  set state(v) { state = v; },
+  config: {
+    REPOSITORIES_DIR,
+    REPOSITORY_SYNC_CONCURRENCY,
+    WORKSPACE_TIMEZONE,
+    DEFAULT_WORKSPACE_CRON,
+    GITHUB_CREDENTIALS_FILE,
+    KNOWLEDGE_SYNC_ENABLED,
+    KNOWLEDGE_SYNC_URL,
+    AGENTGATEWAY_ADMIN_URL,
+    UI_PORT,
+    GRAFANA_PUBLIC_URL,
+    MCP_PUBLIC_URL,
+    MCP_SYSTEM_USER,
+    ADMIN_COOKIE_SECURE
+  },
+  adminAuth,
+  loginAttempts,
+  github: {
+    get token() { return githubToken; },
+    set token(v) { githubToken = v; },
+    get user() { return githubUser; },
+    set user(v) { githubUser = v; },
+    get cache() { return githubCache; },
+    set cache(v) { githubCache = v; }
+  },
+  get githubToken() { return githubToken; },
+  saveCredentials,
+  removeFile: file => rm(file, { force: true }),
+  jobs,
+  retainRecentJobs,
+  scheduleJobHistoryPersistence,
+  knowledgeSyncRequest,
+  validateGoogleServiceAccount,
+  saveGoogleServiceAccount,
+  removeGoogleServiceAccount,
+  mcp: {
+    get userStore() { return mcpUserStore; },
+    set userStore(v) { mcpUserStore = v; },
+    get systemToken() { return mcpSystemToken; },
+    get workspaceEncryptionKey() { return mcpWorkspaceEncryptionKey; }
+  },
+  commitMcpUserChange,
+  commitMcpUserStoreOnly,
+  issueMcpToken,
+  rotateMcpSystemToken,
+  refreshRepositoryProjects,
+  workspace,
+  repository,
+  persist,
+  createJob,
+  enqueueRepositorySync,
+  runWorkspaceSync,
+  runWorkspaceIndex,
+  commitWorkspaceChange,
+  issueWorkspaceMcpCredential,
+  workspacePrincipal,
+  listGithubRepositories,
+  indexRepository,
+  locks,
+  activeWorkspaceSyncs,
+  setMcpGatewayUserKey,
+  removeMcpGatewayUserKey,
+  defaultUpdateSchedule
+};
 
-  if (parts[0] === 'workspaces' && parts[1]) {
-    const workspaceId = parts[1];
-    const selectedWorkspace = workspace(workspaceId);
-    if (parts.length === 2 && request.method === 'GET') {
-      return json(response, 200, { workspace: { ...publicWorkspace(selectedWorkspace), updateSchedule: publicUpdateSchedule(selectedWorkspace) }, repositories: state.repositories.filter(item => item.workspaceId === workspaceId).map(publicRepository) });
-    }
-    if (parts.length === 2 && request.method === 'DELETE') {
-      if (state.repositories.some(item => item.workspaceId === workspaceId)) throw new Error('Remova os repositórios antes de excluir o workspace.');
-      const directory = safeChild(REPOSITORIES_DIR, workspaceId);
-      const remainingFiles = await readdir(directory).catch(error => error.code === 'ENOENT' ? [] : Promise.reject(error));
-      if (remainingFiles.length) throw new Error('A pasta do workspace contém arquivos não gerenciados e não pode ser excluída.');
-      const nextState = { ...state, workspaces: state.workspaces.filter(item => item.id !== workspaceId) };
-      await rmdir(directory).catch(error => { if (error.code !== 'ENOENT') throw error; });
-      try {
-        await commitWorkspaceChange(nextState, config => removeMcpGatewayUserKey(config, workspacePrincipal(selectedWorkspace).id));
-      } catch (error) {
-        await mkdir(directory, { recursive: true }).catch(() => {});
-        throw error;
-      }
-      return json(response, 200, { deleted: true });
-    }
-    if (parts[2] === 'mcp-token' && parts.length === 4) {
-      if (parts[3] === 'reveal' && request.method === 'POST') {
-        if (!selectedWorkspace.mcpCredential) throw new Error('O workspace ainda não possui credencial MCP.');
-        const token = decryptWorkspaceToken(selectedWorkspace.mcpCredential.encryptedToken, mcpWorkspaceEncryptionKey);
-        return json(response, 200, { name: selectedWorkspace.name, token });
-      }
-      if ((parts[3] === 'rotate' || parts[3] === 'reactivate') && request.method === 'POST') {
-        if (parts[3] === 'rotate' && selectedWorkspace.mcpCredential?.status !== 'active') throw new Error('Reative o token antes de rotacioná-lo.');
-        if (parts[3] === 'reactivate' && selectedWorkspace.mcpCredential?.status === 'active') throw new Error('O token deste workspace já está ativo.');
-        const nextState = structuredClone(state);
-        const nextWorkspace = nextState.workspaces.find(item => item.id === workspaceId);
-        const issued = issueWorkspaceMcpCredential(nextWorkspace);
-        nextWorkspace.mcpCredential = issued.credential;
-        await commitWorkspaceChange(nextState, config => setMcpGatewayUserKey(config, workspacePrincipal(nextWorkspace), issued.token));
-        return json(response, 200, { workspace: publicWorkspace(nextWorkspace), token: issued.token });
-      }
-      if (parts[3] === 'revoke' && request.method === 'POST') {
-        if (selectedWorkspace.mcpCredential?.status !== 'active') throw new Error('O token deste workspace já está revogado.');
-        const nextState = structuredClone(state);
-        const nextWorkspace = nextState.workspaces.find(item => item.id === workspaceId);
-        const now = new Date().toISOString();
-        nextWorkspace.mcpCredential = { ...nextWorkspace.mcpCredential, status: 'revoked', revokedAt: now, updatedAt: now };
-        await commitWorkspaceChange(nextState, config => removeMcpGatewayUserKey(config, workspacePrincipal(nextWorkspace).id));
-        return json(response, 200, { workspace: publicWorkspace(nextWorkspace) });
-      }
-    }
-    if (parts[2] === 'schedule' && parts.length === 3) {
-      if (request.method === 'GET') return json(response, 200, { schedule: publicUpdateSchedule(selectedWorkspace), concurrency: REPOSITORY_SYNC_CONCURRENCY });
-      if (request.method === 'PUT') {
-        const input = await body(request);
-        const cron = parseCronExpression(input.cron).expression;
-        const timezone = validateTimezone(input.timezone);
-        const enabled = input.enabled === undefined ? selectedWorkspace.updateSchedule.enabled : input.enabled;
-        if (typeof enabled !== 'boolean') throw new Error('O estado da rotina deve ser verdadeiro ou falso.');
-        selectedWorkspace.updateSchedule = { ...selectedWorkspace.updateSchedule, cron, timezone, enabled, updatedAt: new Date().toISOString(), lastScheduledMinute: null };
-        await persist();
-        return json(response, 200, { schedule: publicUpdateSchedule(selectedWorkspace), concurrency: REPOSITORY_SYNC_CONCURRENCY });
-      }
-    }
-    if (parts[2] === 'schedule' && parts[3] === 'run' && request.method === 'POST') {
-      const job = await runWorkspaceSync(selectedWorkspace, 'manual');
-      await persist();
-      return json(response, 202, job);
-    }
-    if (parts[2] === 'index' && parts.length === 3 && request.method === 'POST') {
-      const job = runWorkspaceIndex(selectedWorkspace);
-      await persist();
-      return json(response, 202, job);
-    }
-    if (parts[2] === 'repositories' && parts.length === 3 && request.method === 'POST') {
-      const input = await body(request);
-      if (!Array.isArray(input.repositories) || !input.repositories.length) throw new Error('Selecione pelo menos um repositório.');
-      const available = await listGithubRepositories();
-      const selected = input.repositories.map(fullName => available.find(item => item.fullName === fullName));
-      if (selected.some(item => !item)) throw new Error('Um dos repositórios selecionados não está disponível.');
-      const requestedIds = new Map();
-      for (const remote of selected) {
-        const repositoryId = slugify(remote.name);
-        const collision = requestedIds.get(repositoryId) || state.repositories.find(item => item.workspaceId === workspaceId && item.id === repositoryId && item.fullName !== remote.fullName)?.fullName;
-        if (collision) throw new Error(`Os repositórios ${collision} e ${remote.fullName} usam o mesmo nome de pasta. Adicione-os em workspaces diferentes.`);
-        requestedIds.set(repositoryId, remote.fullName);
-      }
-      const created = [];
-      for (const remote of selected) {
-        const id = slugify(remote.name);
-        if (state.repositories.some(item => item.workspaceId === workspaceId && item.id === id)) continue;
-        const target = safeChild(REPOSITORIES_DIR, workspaceId, id);
-        const item = { id, accessId: randomUUID(), workspaceId, name: remote.name, fullName: remote.fullName, description: remote.description, private: remote.private, language: remote.language, defaultBranch: remote.defaultBranch, status: 'cloning', path: target, createdAt: new Date().toISOString() };
-        state.repositories.push(item);
-        const job = createJob('clone', `Clonando ${remote.fullName}`, `${workspaceId}/${id}`, async (currentJob, log) => {
-          await run('git', ['clone', remote.cloneUrl, target], { env: gitAuthEnvironment(githubToken), onOutput: log });
-          const commit = (await run('git', ['rev-parse', '--short', 'HEAD'], { cwd: target })).stdout.trim();
-          item.status = 'ready'; item.commit = commit; item.lastSyncAt = new Date().toISOString(); currentJob.progress = 100;
-        });
-        item.activeJobId = job.id;
-        created.push(publicRepository(item));
-      }
-      await persist();
-      return json(response, 202, { repositories: created });
-    }
-    if (parts[2] === 'repositories' && parts[3]) {
-      const item = repository(workspaceId, parts[3]);
-      if (parts.length === 4 && request.method === 'DELETE') {
-        if (locks.has(`${workspaceId}/${item.id}`)) throw new Error('Aguarde a operação atual terminar.');
-        await rm(item.path, { recursive: true, force: true });
-        state.repositories = state.repositories.filter(repo => repo !== item);
-        await persist();
-        return json(response, 200, { deleted: true });
-      }
-      if (parts[4] === 'sync' && request.method === 'POST') {
-        const { job } = enqueueRepositorySync(item);
-        await persist();
-        return json(response, 202, job);
-      }
-      if (parts[4] === 'index' && request.method === 'POST') {
-        const job = createJob('index', `Indexando ${item.fullName}`, `${workspaceId}/${item.id}`, async (_job, log) => {
-          await indexRepository(item, log);
-        });
-        item.activeJobId = job.id; await persist(); return json(response, 202, job);
-      }
-    }
-  }
-  if (request.method === 'GET' && url.pathname === '/api/jobs') {
-    if (retainRecentJobs()) scheduleJobHistoryPersistence();
-    const result = paginateJobs(jobs, { page: url.searchParams.get('page'), pageSize: url.searchParams.get('pageSize') });
-    const activeCount = jobs.filter(job => ['queued', 'running'].includes(job.status)).length;
-    return json(response, 200, { ...result, activeCount, retentionDays: JOB_HISTORY_RETENTION_DAYS });
-  }
-  return json(response, 404, { error: 'Rota não encontrada.' });
-}
+registerAuth(router, ctx);
+registerHealth(router, ctx);
+registerGithub(router, ctx);
+registerJobs(router, ctx);
+registerKnowledgeSync(router, ctx);
+registerMcpUsers(router, ctx);
+registerWorkspaces(router, ctx);
 
 function serveStatic(response, pathname) {
   const requested = pathname === '/' ? 'index.html' : pathname === '/login' ? 'login.html' : pathname.slice(1);
@@ -1279,19 +967,23 @@ await startMcpGuardrailServer(mcpAccess, MCP_GUARDRAIL_ADDR);
 await provisionMcpSystemToken();
 await provisionWorkspaceMcpTokens();
 
-http.createServer(async (request, response) => {
+const server = http.createServer(async (request, response) => {
   const url = new URL(request.url, `http://${request.headers.host || 'localhost'}`);
   try {
     if (url.pathname.startsWith('/api/')) {
-      if (url.pathname.startsWith('/api/auth/')) return await routeAuth(request, response, url);
-      if (['/api/health', '/api/health/live', '/api/health/ready', '/api/health/detail', '/api/metrics'].includes(url.pathname)) {
-        return await routeApi(request, response, url);
+      const isPublic = url.pathname.startsWith('/api/auth/') ||
+        ['/api/health', '/api/health/live', '/api/health/ready', '/api/health/detail', '/api/metrics'].includes(url.pathname);
+      if (!isPublic) {
+        if (!adminAuth.session(request)) return json(response, 401, { error: 'Autenticação necessária.' });
+        if (!['GET', 'HEAD', 'OPTIONS'].includes(request.method) && !requestOriginAllowed(request)) {
+          return json(response, 403, { error: 'Origem não permitida.' });
+        }
       }
-      if (!adminAuth.session(request)) return json(response, 401, { error: 'Autenticação necessária.' });
-      if (!['GET', 'HEAD', 'OPTIONS'].includes(request.method) && !requestOriginAllowed(request)) {
-        return json(response, 403, { error: 'Origem não permitida.' });
+      const match = router.match(request.method, url.pathname);
+      if (match) {
+        return await match.handler(request, response, url, match.params);
       }
-      return await routeApi(request, response, url);
+      return json(response, 404, { error: 'Rota não encontrada.' });
     }
     const publicAsset = ['/login', '/login.html', '/login.js', '/styles.css'].includes(url.pathname);
     const session = adminAuth.session(request);
@@ -1302,4 +994,30 @@ http.createServer(async (request, response) => {
     if (!session) return redirect(response, '/login');
     serveStatic(response, url.pathname);
   } catch (error) { errorResponse(response, error); }
-}).listen(PORT, '0.0.0.0', () => console.log(`Codebase Memory Admin em http://0.0.0.0:${PORT}`));
+});
+
+let isShuttingDown = false;
+async function gracefulShutdown(signal) {
+  if (isShuttingDown) return;
+  isShuttingDown = true;
+  structuredLog('info', 'shutdown_started', { signal });
+  server.close(() => structuredLog('info', 'http_server_closed'));
+  try {
+    await persist();
+  } catch (error) {
+    structuredLog('error', 'shutdown_persist_failed', { error: error.message });
+  }
+  process.exit(0);
+}
+
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, value] of loginAttempts.entries()) {
+    if (value.resetAt <= now) loginAttempts.delete(key);
+  }
+}, 10 * 60_000).unref();
+
+server.listen(PORT, '0.0.0.0', () => console.log(`Codebase Memory Admin em http://0.0.0.0:${PORT}`));

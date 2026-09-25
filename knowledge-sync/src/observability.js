@@ -9,39 +9,29 @@ export function configureBuckets(name, buckets) {
   bucketConfigs.set(name, buckets);
 }
 
-function key(name, labels = {}) {
+function serializeLabels(labels) {
   const entries = Object.entries(labels).filter(([, value]) => value !== undefined && value !== null).sort(([a], [b]) => a.localeCompare(b));
-  return `${name}|${entries.map(([label, value]) => `${label}=${String(value)}`).join(',')}`;
+  return entries.length ? `{${entries.map(([name, value]) => `${name}="${String(value).replaceAll('\\', '\\\\').replaceAll('"', '\\"')}"`).join(',')}}` : '';
 }
 
-function parseKey(value) {
-  const [name, raw = ''] = value.split('|');
-  const labels = raw ? Object.fromEntries(raw.split(',').map(item => item.split('='))) : {};
-  return { name, labels };
-}
-
-function labelsText(labels) {
-  const entries = Object.entries(labels);
-  if (!entries.length) return '';
-  return `{${entries.map(([name, value]) => `${name}="${String(value).replaceAll('\\', '\\\\').replaceAll('"', '\\"')}"`).join(',')}}`;
-}
+function metricKey(name, labels) { return JSON.stringify([name, labels]); }
 
 export function increment(name, labels = {}, value = 1) {
-  const metric = key(name, labels);
-  counters.set(metric, (counters.get(metric) || 0) + value);
+  const k = metricKey(name, labels);
+  counters.set(k, (counters.get(k) || 0) + value);
 }
 
 export function gauge(name, value, labels = {}) {
-  gauges.set(key(name, labels), Number(value) || 0);
+  gauges.set(metricKey(name, labels), Number(value) || 0);
 }
 
 export function observe(name, value, labels = {}) {
-  const metric = key(name, labels);
-  let current = histograms.get(metric);
+  const k = metricKey(name, labels);
+  let current = histograms.get(k);
   if (!current) {
     const thresholds = bucketConfigs.get(name) || DEFAULT_HISTOGRAM_BUCKETS;
     current = { count: 0, sum: 0, buckets: Object.fromEntries(thresholds.map(b => [b, 0])) };
-    histograms.set(metric, current);
+    histograms.set(k, current);
   }
   const val = Number(value) || 0;
   current.count += 1;
@@ -56,22 +46,22 @@ export function metricsText() {
   gauge('knowledge_sync_process_heap_used_bytes', process.memoryUsage().heapUsed);
   gauge('knowledge_sync_process_uptime_seconds', process.uptime());
   const lines = [];
-  for (const [metric, value] of counters) {
-    const { name, labels } = parseKey(metric);
-    lines.push(`${name}${labelsText(labels)} ${value}`);
+  for (const [k, value] of counters) {
+    const [name, labels] = JSON.parse(k);
+    lines.push(`${name}${serializeLabels(labels)} ${value}`);
   }
-  for (const [metric, value] of gauges) {
-    const { name, labels } = parseKey(metric);
-    lines.push(`${name}${labelsText(labels)} ${value}`);
+  for (const [k, value] of gauges) {
+    const [name, labels] = JSON.parse(k);
+    lines.push(`${name}${serializeLabels(labels)} ${value}`);
   }
-  for (const [metric, value] of histograms) {
-    const { name, labels } = parseKey(metric);
+  for (const [k, value] of histograms) {
+    const [name, labels] = JSON.parse(k);
     for (const b in value.buckets) {
-      lines.push(`${name}_bucket${labelsText({ ...labels, le: b })} ${value.buckets[b]}`);
+      lines.push(`${name}_bucket${serializeLabels({ ...labels, le: b })} ${value.buckets[b]}`);
     }
-    lines.push(`${name}_bucket${labelsText({ ...labels, le: '+Inf' })} ${value.count}`);
-    lines.push(`${name}_count${labelsText(labels)} ${value.count}`);
-    lines.push(`${name}_sum${labelsText(labels)} ${value.sum}`);
+    lines.push(`${name}_bucket${serializeLabels({ ...labels, le: '+Inf' })} ${value.count}`);
+    lines.push(`${name}_count${serializeLabels(labels)} ${value.count}`);
+    lines.push(`${name}_sum${serializeLabels(labels)} ${value.sum}`);
   }
   return `${lines.join('\n')}\n`;
 }

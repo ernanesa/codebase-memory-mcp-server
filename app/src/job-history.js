@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { chmod, mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 
@@ -61,7 +62,7 @@ export async function loadJobHistory(file) {
 
 export async function saveJobHistory(file, jobs) {
   await mkdir(path.dirname(file), { recursive: true });
-  const temporary = `${file}.tmp`;
+  const temporary = `${file}.${randomUUID()}.tmp`;
   await writeFile(temporary, `${JSON.stringify({ version: 1, jobs }, null, 2)}\n`, { mode: 0o600 });
   await chmod(temporary, 0o600);
   await rename(temporary, file);

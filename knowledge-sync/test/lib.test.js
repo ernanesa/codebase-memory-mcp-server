@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { changesAffectTarget, fileChecksum, folderRoot, fullReconciliationDue, isTargetDue, legacyIntervalToCron, migrateTargetSchedule, migrateTargetSources, nextRunAt, normalizeTargetInput, sanitizeDriveName } from '../src/lib.js';
+import { changesAffectTarget, fileChecksum, folderRoot, fullReconciliationDue, isTargetDue, legacyIntervalToCron, migrateTargetSchedule, migrateTargetSources, nextCronOccurrence, nextRunAt, normalizeTargetInput, previousCronOccurrence, sanitizeDriveName } from '../src/lib.js';
 
 test('normaliza um vínculo entre pasta, links e Knowledge Base', () => {
   assert.deepEqual(normalizeTargetInput({
@@ -52,6 +52,17 @@ test('agenda pelo cron, não duplica o mesmo slot e calcula a próxima execuçã
   assert.equal(isTargetDue({ ...target, lastScheduledAt: '2026-01-01T10:30:00Z' }, new Date('2026-01-01T10:30:45Z')), false);
   assert.equal(isTargetDue({ ...target, enabled: false }, new Date('2026-01-01T11:30:00Z')), false);
   assert.equal(nextRunAt(target, new Date('2026-01-01T10:31:00Z')), '2026-01-01T11:30:00.000Z');
+});
+
+test('nextCronOccurrence itera com performance e reutiliza formatadores de fuso horário', () => {
+  const start = Date.now();
+  const next = nextCronOccurrence('0 0 31 12 *', 'America/Maceio', new Date('2026-01-01T00:00:00Z'));
+  const duration = Date.now() - start;
+  assert.equal(next.toISOString(), '2026-12-31T03:00:00.000Z');
+  assert.ok(duration < 8000, `nextCronOccurrence demorou ${duration}ms, esperado menos de 8000ms`);
+
+  const prev = previousCronOccurrence('0 0 1 1 *', 'America/Maceio', new Date('2026-01-02T03:00:00.000Z'));
+  assert.equal(prev.toISOString(), '2026-01-01T03:00:00.000Z');
 });
 
 test('migra intervalo legado preservando os casos comuns', () => {

@@ -5,7 +5,9 @@
 /cache/
 /repositories/
 /data/
-/app/node_modules/
+
+# Dependências
+node_modules/
 
 # Arquivos temporários do instalador
 .env.tmp
@@ -13,3 +15,10 @@ compose.ollama.yaml
 compose.ollama.yaml.tmp
 compose.gpu.yaml
 compose.gpu.yaml.tmp
+
+# Artefatos
+*.bundle
+.DS_Store
+
+# Relatórios de avaliação RAG
+rag-eval/reports/
