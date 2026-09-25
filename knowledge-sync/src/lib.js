@@ -51,27 +51,47 @@ export function parseCronExpression(expression) {
   };
 }
 
+const formatterCache = new Map();
+const WEEKDAYS = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
+
+function getFormatter(timezone) {
+  let formatter = formatterCache.get(timezone);
+  if (!formatter) {
+    formatter = new Intl.DateTimeFormat('en-US', {
+      timeZone: timezone,
+      minute: 'numeric', hour: 'numeric', hourCycle: 'h23',
+      day: 'numeric', month: 'numeric', weekday: 'short'
+    });
+    formatterCache.set(timezone, formatter);
+  }
+  return formatter;
+}
+
 export function validateTimezone(timezone) {
   const value = String(timezone ?? '').trim();
-  try { new Intl.DateTimeFormat('en-US', { timeZone: value }).format(); }
+  try { getFormatter(value); }
   catch { throw new Error('Fuso horário inválido. Use um identificador como America/Maceio.'); }
   return value;
 }
 
 function zonedDateParts(date, timezone) {
-  const parts = new Intl.DateTimeFormat('en-US', {
-    timeZone: timezone,
-    minute: 'numeric', hour: 'numeric', hourCycle: 'h23',
-    day: 'numeric', month: 'numeric', weekday: 'short'
-  }).formatToParts(date);
-  const value = type => parts.find(item => item.type === type)?.value;
-  return {
-    minute: Number(value('minute')),
-    hour: Number(value('hour')),
-    day: Number(value('day')),
-    month: Number(value('month')),
-    weekday: ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].indexOf(value('weekday'))
-  };
+  const parts = getFormatter(timezone).formatToParts(date);
+  let minute;
+  let hour;
+  let day;
+  let month;
+  let weekday;
+  for (let index = 0; index < parts.length; index += 1) {
+    const item = parts[index];
+    switch (item.type) {
+      case 'minute': minute = Number(item.value); break;
+      case 'hour': hour = Number(item.value); break;
+      case 'day': day = Number(item.value); break;
+      case 'month': month = Number(item.value); break;
+      case 'weekday': weekday = WEEKDAYS[item.value] ?? -1; break;
+    }
+  }
+  return { minute, hour, day, month, weekday };
 }
 
 export function cronMatches(expression, date, timezone) {

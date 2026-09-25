@@ -1,11 +1,29 @@
 #!/usr/bin/env python3
+import os
 import sys
 import json
 import yaml
 from pathlib import Path
 
 CONFIG_PATH = Path('data/agentgateway/config.yaml')
-MCP_URL = "https://mcp.ma9.tec.br"
+
+def _read_env_file(env_path='.env'):
+    """Lê variáveis de um arquivo .env simples (KEY=VALUE por linha)."""
+    result = {}
+    try:
+        with open(env_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#') or '=' not in line:
+                    continue
+                key, _, value = line.partition('=')
+                result[key.strip()] = value.strip().strip('"').strip("'")
+    except FileNotFoundError:
+        pass
+    return result
+
+_env = _read_env_file()
+MCP_URL = os.environ.get('MCP_PUBLIC_URL') or _env.get('MCP_PUBLIC_URL') or 'http://mcp.localhost:8080'
 
 if not CONFIG_PATH.exists():
     print(f"Erro: Arquivo {CONFIG_PATH} não encontrado.", file=sys.stderr)
@@ -43,8 +61,8 @@ def generate_mcp_json(token):
     }
 
 print("=" * 70)
-print(" CONFIGURAÇÃO AUTOMÁTICA DE MCP PARA DESENVOLVEDORES (MA9 TEC)")
-print(f" Endpoint Oficial: {MCP_URL}")
+print(" CONFIGURAÇÃO AUTOMÁTICA DE MCP PARA DESENVOLVEDORES")
+print(f" Endpoint: {MCP_URL}")
 print("=" * 70)
 
 found = 0

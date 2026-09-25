@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtemp, rm, stat } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { assertSafeSegment, cronMatches, decryptWorkspaceToken, describeCron, encryptWorkspaceToken, ensureMcpGatewayGuardrail, generateMcpToken, gitAuthEnvironment, indexRepositoryArguments, loadCredentials, loadMcpUserStore, loadSecret, mcpTokenFingerprint, nextCronOccurrence, parseCronExpression, parseLastJsonLine, publicMcpUser, publicWorkspace, reconcileRepositoryProjects, removeMcpGatewayUserKey, safeChild, saveCredentials, saveMcpUserStore, saveSecret, setMcpGatewayUserKey, slugify, validateTimezone } from '../src/lib.js';
+import { assertSafeSegment, createMutex, cronMatches, decryptWorkspaceToken, describeCron, encryptWorkspaceToken, ensureMcpGatewayGuardrail, generateMcpToken, gitAuthEnvironment, indexRepositoryArguments, loadCredentials, loadMcpUserStore, loadSecret, mcpTokenFingerprint, nextCronOccurrence, parseCronExpression, parseLastJsonLine, publicMcpUser, publicWorkspace, reconcileRepositoryProjects, removeMcpGatewayUserKey, safeChild, saveCredentials, saveMcpUserStore, saveSecret, setMcpGatewayUserKey, slugify, validateTimezone } from '../src/lib.js';
 
 test('slugify normaliza nomes de workspaces', () => {
   assert.equal(slugify('Pagamentos & Cobrança'), 'pagamentos-cobranca');
@@ -24,6 +24,14 @@ test('cron padrão executa no minuto zero de cada hora', () => {
   assert.equal(cronMatches('0 * * * *', new Date('2026-07-15T14:00:00Z'), 'UTC'), true);
   assert.equal(cronMatches('0 * * * *', new Date('2026-07-15T14:01:00Z'), 'UTC'), false);
   assert.equal(nextCronOccurrence('0 * * * *', 'UTC', new Date('2026-07-15T14:20:00Z')).toISOString(), '2026-07-15T15:00:00.000Z');
+});
+
+test('nextCronOccurrence itera com performance e reutiliza formatadores de fuso horário', () => {
+  const start = Date.now();
+  const next = nextCronOccurrence('0 0 31 12 *', 'America/Maceio', new Date('2026-01-01T00:00:00Z'));
+  const duration = Date.now() - start;
+  assert.equal(next.toISOString(), '2026-12-31T03:00:00.000Z');
+  assert.ok(duration < 8000, `nextCronOccurrence demorou ${duration}ms, esperado menos de 8000ms`);
 });
 
 test('descreve semanticamente os crons mais comuns sem ocultar combinações', () => {
@@ -181,3 +189,35 @@ test('token técnico persiste em arquivo protegido', async t => {
   assert.equal(await loadSecret(file), token);
   if (process.platform !== 'win32') assert.equal((await stat(file)).mode & 0o777, 0o600);
 });
+
+test('createMutex serializa operações assíncronas concorrentes e trata erros', async () => {
+  const mutex = createMutex();
+  const executionOrder = [];
+
+  const task1 = mutex(async () => {
+    await new Promise(resolve => setTimeout(resolve, 30));
+    executionOrder.push('task1');
+    return 'result1';
+  });
+
+  const task2 = mutex(async () => {
+    executionOrder.push('task2-start');
+    throw new Error('falha na task2');
+  });
+
+  const task3 = mutex(async () => {
+    executionOrder.push('task3');
+    return 'result3';
+  });
+
+  const r1 = await task1;
+  assert.equal(r1, 'result1');
+
+  await assert.rejects(task2, /falha na task2/);
+
+  const r3 = await task3;
+  assert.equal(r3, 'result3');
+
+  assert.deepEqual(executionOrder, ['task1', 'task2-start', 'task3']);
+});
+

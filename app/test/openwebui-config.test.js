@@ -85,15 +85,16 @@ test('painel incorpora o dashboard do hostname público do Grafana', async () =>
 });
 
 test('painel persiste operações por sete dias e navega pelo histórico paginado', async () => {
-  const [browser, styles, server, history] = await Promise.all([
+  const [browser, styles, server, history, jobsRoutes] = await Promise.all([
     readFile(path.join(root, 'app/public/app.js'), 'utf8'),
     readFile(path.join(root, 'app/public/styles.css'), 'utf8'),
     readFile(path.join(root, 'app/src/server.js'), 'utf8'),
-    readFile(path.join(root, 'app/src/job-history.js'), 'utf8')
+    readFile(path.join(root, 'app/src/job-history.js'), 'utf8'),
+    readFile(path.join(root, 'app/src/routes/jobs.js'), 'utf8')
   ]);
   assert.match(server, /JOB_HISTORY_FILE = path\.join\(DATA_DIR, 'jobs\.json'\)/);
-  assert.match(server, /paginateJobs\(jobs/);
-  assert.match(server, /activeCount/);
+  assert.match(jobsRoutes, /paginateJobs\(/);
+  assert.match(jobsRoutes, /activeCount/);
   assert.match(history, /JOB_HISTORY_RETENTION_DAYS = 7/);
   assert.match(history, /Operação interrompida pela reinicialização do serviço/);
   assert.match(browser, /\/api\/jobs\?page=\$\{encodeURIComponent\(page\)\}&pageSize=/);
@@ -272,11 +273,12 @@ test('presets de exemplo selecionam o padrão e carregam parâmetros e integraç
 });
 
 test('painel administra vínculos entre fontes e Knowledge Bases pelo BFF interno', async () => {
-  const [html, browser, styles, server] = await Promise.all([
+  const [html, browser, styles, server, knowledgeSyncRoutes] = await Promise.all([
     readFile(path.join(root, 'app/public/index.html'), 'utf8'),
     readFile(path.join(root, 'app/public/app.js'), 'utf8'),
     readFile(path.join(root, 'app/public/styles.css'), 'utf8'),
-    readFile(path.join(root, 'app/src/server.js'), 'utf8')
+    readFile(path.join(root, 'app/src/server.js'), 'utf8'),
+    readFile(path.join(root, 'app/src/routes/knowledge-sync.js'), 'utf8')
   ]);
   assert.match(html, /data-view="knowledge-sync"/);
   assert.match(browser, /Vincular fontes/);
@@ -303,7 +305,7 @@ test('painel administra vínculos entre fontes e Knowledge Bases pelo BFF intern
   assert.match(styles, /knowledge-sync-identity > div \{[^}]*min-width:0/);
   assert.match(styles, /knowledge-sync-identity small \{[^}]*overflow-wrap:anywhere/);
   assert.match(styles, /knowledge-sync-actions \{[^}]*grid-column:1 \/ -1/);
-  assert.match(server, /url\.pathname\.startsWith\('\/api\/knowledge-sync'\)/);
+  assert.match(knowledgeSyncRoutes, /prefix\('\*', '\/api\/knowledge-sync'/);
   assert.match(server, /KNOWLEDGE_SYNC_TOKEN_FILE/);
   assert.match(server, /GOOGLE_DRIVE_SERVICE_ACCOUNT_FILE/);
   assert.match(server, /validateGoogleServiceAccount/);
@@ -325,7 +327,8 @@ test('painel confirma workspace com Enter e permite indexar o workspace aberto',
   assert.match(browser, /data-action="index-workspace"/);
   assert.match(browser, /\/api\/workspaces\/\$\{currentWorkspace\}\/index/);
   assert.match(server, /function runWorkspaceIndex/);
-  assert.match(server, /parts\[2\] === 'index'.*request\.method === 'POST'/);
+  const workspaceRoutes = await readFile(path.join(root, 'app/src/routes/workspaces.js'), 'utf8');
+  assert.match(workspaceRoutes, /\/api\/workspaces\/:workspaceId\/index/);
 });
 
 test('instalador sugere Gemma 4, fixa Ollama 0.32.1 e bootstrap usa o contrato atual', async () => {

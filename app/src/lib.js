@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'node:crypto';
+import { createCipheriv, createDecipheriv, createHash, randomBytes, randomUUID } from 'node:crypto';
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 
@@ -86,27 +86,47 @@ export function describeCron(expression) {
   return `Atualiza conforme o cron ${cron.expression}`;
 }
 
+const formatterCache = new Map();
+const WEEKDAYS = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
+
+function getFormatter(timezone) {
+  let formatter = formatterCache.get(timezone);
+  if (!formatter) {
+    formatter = new Intl.DateTimeFormat('en-US', {
+      timeZone: timezone,
+      minute: 'numeric', hour: 'numeric', hourCycle: 'h23',
+      day: 'numeric', month: 'numeric', weekday: 'short'
+    });
+    formatterCache.set(timezone, formatter);
+  }
+  return formatter;
+}
+
 export function validateTimezone(timezone) {
   const value = String(timezone ?? '').trim();
-  try { new Intl.DateTimeFormat('en-US', { timeZone: value }).format(); }
+  try { getFormatter(value); }
   catch { throw new Error('Fuso horário inválido. Use um identificador como America/Maceio.'); }
   return value;
 }
 
 function zonedDateParts(date, timezone) {
-  const parts = new Intl.DateTimeFormat('en-US', {
-    timeZone: timezone,
-    minute: 'numeric', hour: 'numeric', hourCycle: 'h23',
-    day: 'numeric', month: 'numeric', weekday: 'short'
-  }).formatToParts(date);
-  const value = type => parts.find(item => item.type === type)?.value;
-  return {
-    minute: Number(value('minute')),
-    hour: Number(value('hour')),
-    day: Number(value('day')),
-    month: Number(value('month')),
-    weekday: ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].indexOf(value('weekday'))
-  };
+  const parts = getFormatter(timezone).formatToParts(date);
+  let minute;
+  let hour;
+  let day;
+  let month;
+  let weekday;
+  for (let index = 0; index < parts.length; index += 1) {
+    const item = parts[index];
+    switch (item.type) {
+      case 'minute': minute = Number(item.value); break;
+      case 'hour': hour = Number(item.value); break;
+      case 'day': day = Number(item.value); break;
+      case 'month': month = Number(item.value); break;
+      case 'weekday': weekday = WEEKDAYS[item.value] ?? -1; break;
+    }
+  }
+  return { minute, hour, day, month, weekday };
 }
 
 export function cronMatches(expression, date, timezone) {
@@ -215,7 +235,7 @@ export async function loadState(file) {
 
 export async function saveState(file, state) {
   await mkdir(path.dirname(file), { recursive: true });
-  const temporary = `${file}.tmp`;
+  const temporary = `${file}.${randomUUID()}.tmp`;
   await writeFile(temporary, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
   await rename(temporary, file);
 }
@@ -233,7 +253,7 @@ export async function loadCredentials(file) {
 
 export async function saveCredentials(file, credentials) {
   await mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
-  const temporary = `${file}.tmp`;
+  const temporary = `${file}.${randomUUID()}.tmp`;
   await writeFile(temporary, `${JSON.stringify(credentials)}\n`, { mode: 0o600 });
   await rename(temporary, file);
 }
@@ -315,7 +335,7 @@ export async function loadMcpUserStore(file) {
 
 export async function saveMcpUserStore(file, store) {
   await mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
-  const temporary = `${file}.tmp`;
+  const temporary = `${file}.${randomUUID()}.tmp`;
   await writeFile(temporary, `${JSON.stringify(store, null, 2)}\n`, { mode: 0o600 });
   await rename(temporary, file);
 }
@@ -332,7 +352,7 @@ export async function loadSecret(file) {
 
 export async function saveSecret(file, value) {
   await mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
-  const temporary = `${file}.tmp`;
+  const temporary = `${file}.${randomUUID()}.tmp`;
   await writeFile(temporary, `${value}\n`, { mode: 0o600 });
   await rename(temporary, file);
 }
@@ -417,3 +437,19 @@ export function run(command, args, options = {}) {
     });
   });
 }
+
+/**
+ * Cria um mutex assíncrono para serializar operações concorrentes.
+ * Garante ordem FIFO e resiliência contra rejeições.
+ *
+ * @returns {<T>(fn: () => Promise<T> | T) => Promise<T>}
+ */
+export function createMutex() {
+  let current = Promise.resolve();
+  return function acquire(fn) {
+    const next = current.then(() => fn());
+    current = next.catch(() => {});
+    return next;
+  };
+}
+
