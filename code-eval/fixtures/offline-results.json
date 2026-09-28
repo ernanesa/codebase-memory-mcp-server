@@ -1,0 +1,24 @@
+{
+  "cases": [
+    {
+      "id": "symbol-create-order",
+      "query": "CreateOrder",
+      "project": "demo",
+      "expectedSymbols": ["createOrder"],
+      "relevantPaths": ["src/orders.js"],
+      "requiredEvidencePaths": ["src/orders.js"]
+    },
+    {
+      "id": "isolated-chunk-payment",
+      "query": "capture payment",
+      "project": "demo",
+      "expectedSymbols": ["capturePayment"],
+      "relevantPaths": ["src/payments.js"],
+      "requiredEvidencePaths": ["src/payments.js"]
+    }
+  ],
+  "results": {
+    "symbol-create-order": { "structuredContent": { "results": [{ "file_path": "src/orders.js", "qualified_name": "createOrder", "sha256": "86dc2e7bd86822c1321f5612149a72206e3b679a00969c3dd49d00af065406b8", "source": "export function createOrder(input) {}" }] } },
+    "isolated-chunk-payment": { "structuredContent": { "results": [{ "file_path": "src/payments.js", "qualified_name": "capturePayment", "sha256": "8e8f3705665bcf059bfb81c26ccdea06e6e7e4d86aa74d907edafb592e1dd51e", "source": "export function capturePayment(payment) {}" }] } }
+  }
+}

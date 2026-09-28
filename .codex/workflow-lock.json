@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "resources": [
+    {
+      "path": ".codex/workflows/verified-delivery.md",
+      "sha256": "eb742e8c4896ef0249ef3d8c7adeb6c28a7f2ad56bba69d423b95dea4b03bbaf"
+    },
+    {
+      "path": ".codex/workflows/task-envelope.schema.json",
+      "sha256": "b1a00a915202ae8c7ee1c7bca4c4a2e5c01fee7b4eb891eafbed2276e25eab82"
+    },
+    {
+      "path": "scripts/verify-workflow-lock.mjs",
+      "sha256": "e913de47e7604477602d6a0bb118f8feac994c544548d2d3deb71c6ae5be27dd"
+    },
+    {
+      "path": "scripts/validate-task-envelope.mjs",
+      "sha256": "646510901dfa5079b354e53ed8c7cf3eaab23f094c1a5a5ae92fb9e7e17c5983"
+    }
+  ]
+}

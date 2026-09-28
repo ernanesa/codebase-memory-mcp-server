@@ -23,6 +23,7 @@ Ambiente autogerenciado para disponibilizar repositórios a clientes MCP e mante
 - Debian, Ubuntu ou distribuição compatível com `apt-get`; ou macOS 14+;
 - usuário comum com acesso a `sudo`;
 - Docker e Docker Compose, instalados automaticamente quando necessário;
+- Node.js 26.x para executar testes e ferramentas locais do MCP;
 - acesso de leitura aos repositórios GitHub;
 - GPU NVIDIA opcional para o Ollama no Linux.
 
@@ -124,6 +125,7 @@ A sincronização de fontes usa cron por Knowledge Base. O padrão `30 * * * *` 
 - [Configuração e manutenção](CONFIGURATION.md)
 - [Configurar Google Drive](GOOGLE-DRIVE-CONFIG.md)
 - [Avaliar a qualidade do RAG](RAG-EVALUATION.md)
+- [Usar o MCP com Codex e preservar contexto](CODEX-MCP-CONTEXT.md)
 - [Skill Company Codebase Memory](skills/company-codebase-memory/)
 
 ## Segurança

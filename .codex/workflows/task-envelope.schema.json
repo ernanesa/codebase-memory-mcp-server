@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://codebase-memory.local/schemas/task-envelope.schema.json",
+  "title": "Verified delivery task envelope",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["taskId", "objective", "acceptanceCriteria", "explicitExclusions", "baseline", "requirements", "files", "checks", "review"],
+  "$defs": {
+    "nonEmpty": { "type": "string", "minLength": 1 },
+    "commit": { "type": "string", "pattern": "^[0-9a-f]{7,64}$" },
+    "evidenceRef": { "type": "string", "minLength": 1 },
+    "evidence": { "type": "object", "additionalProperties": false, "required": ["id", "source", "kind"], "properties": { "id": { "$ref": "#/$defs/evidenceRef" }, "source": { "$ref": "#/$defs/nonEmpty" }, "kind": { "enum": ["command", "diff", "metric", "review", "trace", "document", "other"] }, "baselineCommit": { "$ref": "#/$defs/commit" }, "recordedAt": { "type": "string", "format": "date-time" }, "detail": { "$ref": "#/$defs/nonEmpty" } } }
+  },
+  "properties": {
+    "taskId": { "$ref": "#/$defs/nonEmpty" }, "objective": { "$ref": "#/$defs/nonEmpty" },
+    "acceptanceCriteria": { "type": "array", "minItems": 1, "items": { "type": "object", "additionalProperties": false, "required": ["id", "text", "status"], "properties": { "id": { "$ref": "#/$defs/nonEmpty" }, "text": { "$ref": "#/$defs/nonEmpty" }, "status": { "enum": ["pending", "passed", "failed", "not-verified"] }, "evidence": { "type": "array", "items": { "$ref": "#/$defs/evidenceRef" }, "uniqueItems": true } } } },
+    "explicitExclusions": { "type": "array", "items": { "$ref": "#/$defs/nonEmpty" } },
+    "baseline": { "type": "object", "additionalProperties": false, "required": ["commit", "branch", "workingTree"], "properties": { "commit": { "$ref": "#/$defs/commit" }, "branch": { "$ref": "#/$defs/nonEmpty" }, "workingTree": { "enum": ["clean", "dirty"] }, "dirtyAuthorization": { "type": "object", "additionalProperties": false, "required": ["authorizedBy", "reason"], "properties": { "authorizedBy": { "$ref": "#/$defs/nonEmpty" }, "reason": { "$ref": "#/$defs/nonEmpty" }, "recordedAt": { "type": "string", "format": "date-time" } } } } },
+    "requirements": { "type": "array", "minItems": 1, "items": { "type": "object", "additionalProperties": false, "required": ["id", "text", "files", "checks"], "properties": { "id": { "$ref": "#/$defs/nonEmpty" }, "text": { "$ref": "#/$defs/nonEmpty" }, "files": { "type": "array", "items": { "$ref": "#/$defs/nonEmpty" } }, "checks": { "type": "array", "items": { "$ref": "#/$defs/nonEmpty" } }, "dependencies": { "type": "array", "items": { "$ref": "#/$defs/nonEmpty" }, "uniqueItems": true } } } },
+    "dependencies": { "type": "array", "items": { "type": "object", "additionalProperties": false, "required": ["id", "text", "status"], "properties": { "id": { "$ref": "#/$defs/nonEmpty" }, "text": { "$ref": "#/$defs/nonEmpty" }, "status": { "enum": ["pending", "satisfied", "blocked", "invalidated"] }, "owner": { "$ref": "#/$defs/nonEmpty" }, "invalidationCondition": { "$ref": "#/$defs/nonEmpty" } } } },
+    "unknowns": { "type": "array", "items": { "type": "object", "additionalProperties": false, "required": ["id", "text", "status"], "properties": { "id": { "$ref": "#/$defs/nonEmpty" }, "text": { "$ref": "#/$defs/nonEmpty" }, "status": { "enum": ["open", "resolved", "accepted"] }, "impact": { "enum": ["low", "medium", "high"] } } } },
+    "stopConditions": { "type": "array", "items": { "$ref": "#/$defs/nonEmpty" }, "uniqueItems": true },
+    "evidenceProvenance": { "type": "array", "items": { "$ref": "#/$defs/evidence" } },
+    "files": { "type": "array", "items": { "type": "object", "additionalProperties": false, "required": ["path", "owner", "role"], "properties": { "path": { "$ref": "#/$defs/nonEmpty" }, "owner": { "$ref": "#/$defs/nonEmpty" }, "role": { "enum": ["implementation", "test", "contract", "documentation", "configuration"] } } } },
+    "checks": { "type": "array", "items": { "type": "object", "additionalProperties": false, "required": ["id", "command", "status", "baselineCommit"], "properties": { "id": { "$ref": "#/$defs/nonEmpty" }, "command": { "$ref": "#/$defs/nonEmpty" }, "status": { "enum": ["pending", "passed", "failed", "not-verified", "not-applicable"] }, "baselineCommit": { "$ref": "#/$defs/commit" }, "evidence": { "$ref": "#/$defs/nonEmpty" }, "evidenceRefs": { "type": "array", "items": { "$ref": "#/$defs/evidenceRef" }, "uniqueItems": true } } } },
+    "review": { "type": "object", "additionalProperties": false, "required": ["status", "baselineCommit", "findings"], "properties": { "status": { "enum": ["pending", "passed", "failed", "not-verified"] }, "baselineCommit": { "$ref": "#/$defs/commit" }, "findings": { "type": "array", "items": { "type": "string" } }, "evidenceRefs": { "type": "array", "items": { "$ref": "#/$defs/evidenceRef" }, "uniqueItems": true } } },
+    "residualRisks": { "type": "array", "items": { "$ref": "#/$defs/nonEmpty" } }
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "name": "codebase-memory-code-eval",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "engines": { "node": "26.x" },
+  "scripts": {
+    "test": "node --test",
+    "evaluate:fixtures": "node runner.mjs --fixtures fixtures/offline-results.json --source-root fixtures/source"
+  }
+}

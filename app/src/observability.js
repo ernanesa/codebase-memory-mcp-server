@@ -9,12 +9,19 @@ export function configureBuckets(name, buckets) {
   bucketConfigs.set(name, buckets);
 }
 
-function serializeLabels(labels) {
-  const entries = Object.entries(labels).filter(([, value]) => value !== undefined && value !== null).sort(([a], [b]) => a.localeCompare(b));
-  return entries.length ? `{${entries.map(([name, value]) => `${name}="${String(value).replaceAll('\\', '\\\\').replaceAll('"', '\\"')}"`).join(',')}}` : '';
+function canonicalLabels(labels) {
+  return Object.fromEntries(Object.entries(labels)
+    .filter(([, value]) => value !== undefined && value !== null)
+    .map(([name, value]) => [name, String(value).replaceAll('\r', '\n')])
+    .sort(([a], [b]) => a.localeCompare(b)));
 }
 
-function metricKey(name, labels) { return JSON.stringify([name, labels]); }
+function serializeLabels(labels) {
+  const entries = Object.entries(canonicalLabels(labels));
+  return entries.length ? `{${entries.map(([name, value]) => `${name}="${String(value).replaceAll('\\', '\\\\').replaceAll('\n', '\\n').replaceAll('"', '\\"')}"`).join(',')}}` : '';
+}
+
+function metricKey(name, labels) { return JSON.stringify([name, canonicalLabels(labels)]); }
 
 export function increment(name, labels = {}, value = 1) {
   const key = metricKey(name, labels);

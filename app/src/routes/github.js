@@ -1,6 +1,6 @@
 /**
  * Rotas e integração com a API do GitHub.
- * Sem dependências externas — usa apenas APIs nativas do Node 22.
+ * Sem dependências externas — usa apenas APIs nativas do Node.
  */
 
 import { json, body } from '../http.js';

@@ -32,6 +32,12 @@ mcp:
           metadata:
             userId: apiKey.userId
             toolName: mcp.tool.name
+          # AgentGateway v1.3.1 has no verified setting for injecting a
+          # static credential into the outgoing ExtMCP gRPC metadata. `metadata`
+          # above is MCP request context, not transport authentication, and
+          # `requestHeaders` below only controls inbound headers. Do not pass a
+          # secret through either field. Add service authentication only after
+          # upgrading to a version with documented ExtMCP credential support.
           requestHeaders:
             allowed: []
   targets:

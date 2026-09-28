@@ -193,6 +193,9 @@ async function setupTestEnvironment(t, overrides = {}) {
     async persist() {
       ctx.persisted = true;
     },
+    async listGithubRepositories() {
+      return overrides.listGithubRepositories ? overrides.listGithubRepositories() : [];
+    },
     async runWorkspaceSync(selectedWorkspace, source) {
       return {
         id: 'job-sync-1',
@@ -634,6 +637,27 @@ test('Operações de token MCP do workspace (reveal, rotate, revoke, reactivate)
     () => dispatch(router, 'POST', `/api/workspaces/${wsId}/mcp-token/reactivate`),
     { message: 'O token deste workspace já está ativo.' }
   );
+});
+
+test('POST de repositórios rejeita workspace inexistente antes de consultar GitHub ou criar jobs', async t => {
+  let githubCalls = 0;
+  const { router, ctx } = await setupTestEnvironment(t, {
+    listGithubRepositories: async () => {
+      githubCalls += 1;
+      return [{ name: 'api', fullName: 'org/api', cloneUrl: 'https://example.test/org/api.git' }];
+    }
+  });
+
+  await assert.rejects(
+    () => dispatch(router, 'POST', '/api/workspaces/inexistente/repositories', {
+      body: { repositories: ['org/api'] }
+    }),
+    { message: 'Workspace não encontrado.' }
+  );
+
+  assert.equal(githubCalls, 0);
+  assert.deepEqual(ctx.state.repositories, []);
+  assert.equal(ctx.persisted, false);
 });
 
 // ---------------------------------------------------------------------------

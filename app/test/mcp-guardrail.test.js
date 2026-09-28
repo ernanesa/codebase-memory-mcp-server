@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import grpc from '@grpc/grpc-js';
 import protoLoader from '@grpc/proto-loader';
 import path from 'node:path';
+import { metricsText } from '../src/observability.js';
 import {
   authorizeToolCall,
   filterListProjectsResult,
@@ -19,7 +20,9 @@ import {
   sliceCodeSnippet,
   formatSearchResultMarkdown,
   pruneSearchResultPayload,
-  clearSemanticCache
+  clearSemanticCache,
+  createMcpGuardrailHandlers,
+  semanticCacheKey
 } from '../src/mcp-guardrail.js';
 
 const scopedAccess = {
@@ -33,6 +36,19 @@ test('guardrail permite análise somente nos projetos autorizados', () => {
   assert.match(authorizeToolCall({ name: 'search_graph', arguments: { project: 'api-financeiro' } }, scopedAccess).reason, /não possui acesso/);
   assert.match(authorizeToolCall({ name: 'search_graph', arguments: { project: 'projeto-inexistente' } }, scopedAccess).reason, /não existe ou ainda não foi indexado/);
   assert.match(authorizeToolCall({ name: 'search_graph', arguments: {} }, scopedAccess).reason, /exige o projeto/);
+});
+
+test('credencial de serviço opcional falha fechado quando habilitada e userId é validado', async () => {
+  const handlers = createMcpGuardrailHandlers(() => scopedAccess, { sharedSecret: 's'.repeat(40) });
+  const invoke = metadataContext => new Promise((resolve, reject) => handlers.checkRequest({
+    request: { method: 'tools/call', metadataContext, mcpRequest: Buffer.from(JSON.stringify({ name: 'search_graph', arguments: { project: 'api-pedidos' } })) }
+  }, (error, result) => error ? reject(error) : resolve(result)));
+  const missingCredential = await invoke({ userId: 'user-1' });
+  assert.equal(missingCredential.error.code, 'PERMISSION_DENIED');
+  const malformedIdentity = await invoke({ userId: 'user-1/../system-playground', guardrailCredential: 's'.repeat(40) });
+  assert.equal(malformedIdentity.error.code, 'PERMISSION_DENIED');
+  const allowed = await invoke({ userId: 'user-1', guardrailCredential: 's'.repeat(40) });
+  assert.ok(allowed.pass);
 });
 
 test('guardrail bloqueia mutações, ferramentas desconhecidas e travessia cross-service', () => {
@@ -67,6 +83,13 @@ test('tools/list não anuncia ferramentas administrativas para tokens individuai
     { name: 'manage_adr' }
   ] });
   assert.deepEqual(filtered.tools.map(tool => tool.name), ['search_graph']);
+});
+
+test('tools/list mantém ordem estável quando a resposta do backend muda de ordem', () => {
+  const first = filterToolsListResult({ tools: [{ name: 'trace_path' }, { name: 'search_graph' }] }, { includeFacade: true, pruneDuplicates: true });
+  const second = filterToolsListResult({ tools: [{ name: 'search_graph' }, { name: 'trace_path' }] }, { includeFacade: true, pruneDuplicates: true });
+  assert.deepEqual(first.tools.map(tool => tool.name), second.tools.map(tool => tool.name));
+  assert.deepEqual(first.tools.map(tool => tool.name), [...first.tools.map(tool => tool.name)].sort());
 });
 
 test('servidor gRPC implementa o protocolo ExtMcp esperado pelo AgentGateway', async t => {
@@ -111,7 +134,9 @@ test('servidor gRPC implementa o protocolo ExtMcp esperado pelo AgentGateway', a
     metadataContext: {
       fields: {
         userId: { stringValue: 'user-1' },
-        toolName: { stringValue: 'list_projects' }
+        toolName: { stringValue: 'list_projects' },
+        originalTool: { stringValue: 'list_projects' },
+        callArgs: { stringValue: '{}' }
       }
     },
     mcpResponse: Buffer.from(JSON.stringify(upstream))
@@ -149,6 +174,8 @@ test('mapeamento transparente de ferramentas facade em mapFacadeRequest', () => 
   assert.equal(trace.params.arguments.function_name, 'CriarPedido');
   assert.equal(trace.params.arguments.direction, 'callers');
   assert.equal(trace.params.arguments.include_tests, false);
+  const traceWithTests = mapFacadeRequest({ name: 'trace_symbol', arguments: { project: 'api-pedidos', symbol: 'CriarPedido', include_tests: true } });
+  assert.equal(traceWithTests.params.arguments.include_tests, true);
 
   const snippet = mapFacadeRequest({
     name: 'get_symbol_snippet',
@@ -296,7 +323,9 @@ test('servidor gRPC executa mapeamento facade em CheckRequest e poda em CheckRes
       fields: {
         userId: { stringValue: 'user-1' },
         toolName: { stringValue: 'trace_path' },
-        facadeTool: { stringValue: 'trace_symbol' }
+        facadeTool: { stringValue: 'trace_symbol' },
+        originalTool: { stringValue: 'trace_symbol' },
+        callArgs: { stringValue: JSON.stringify({ project: 'api-pedidos', symbol: 'HandleOrder' }) }
       }
     },
     mcpResponse: Buffer.from(JSON.stringify(rawResponse))
@@ -398,6 +427,28 @@ test('authorizeToolCall resolve apelido de projeto e autoriza com sucesso', () =
   assert.match(deniedRes.reason, /não possui acesso/);
 });
 
+test('guardrail rejeita aliases ambíguos sem escolher um projeto arbitrariamente', () => {
+  const access = {
+    system: false,
+    allowedProjects: new Set([
+      'data-repositories-claps-api-pedidos',
+      'data-repositories-pagueon-api-pedidos'
+    ]),
+    knownProjects: new Set([
+      'data-repositories-claps-api-pedidos',
+      'data-repositories-pagueon-api-pedidos'
+    ])
+  };
+
+  const result = authorizeToolCall({
+    name: 'search_graph',
+    arguments: { project: 'api-pedidos', query: 'CriarPedido' }
+  }, access);
+
+  assert.equal(result.allowed, false);
+  assert.match(result.reason, /ambíguo/);
+});
+
 test('servidor gRPC resolve apelido em CheckRequest e muta project para canônico', async t => {
   const aliasAccess = {
     system: false,
@@ -458,24 +509,24 @@ function calcularTotal(items) {
   assert.ok(sliced.startsWith('function calcularTotal(items)'));
 });
 
-test('roteamento inteligente infere label Class para PascalCase e Function para camelCase', () => {
+test('busca facade não infere label para identificadores que podem ser métodos', () => {
   const classReq = mapFacadeRequest({
     name: 'code_search_surgical',
     arguments: { project: 'api-pedidos', query: 'OrderManager' }
   });
-  assert.equal(classReq.params.arguments.label, 'Class');
+  assert.equal(classReq.params.arguments.label, undefined);
 
   const funcReq = mapFacadeRequest({
     name: 'code_search_surgical',
     arguments: { project: 'api-pedidos', query: 'processPayment' }
   });
-  assert.equal(funcReq.params.arguments.label, 'Function');
+  assert.equal(funcReq.params.arguments.label, undefined);
 
   const snakeReq = mapFacadeRequest({
     name: 'code_search_surgical',
     arguments: { project: 'api-pedidos', query: 'handle_webhook' }
   });
-  assert.equal(snakeReq.params.arguments.label, 'Function');
+  assert.equal(snakeReq.params.arguments.label, undefined);
 
   // Query curta ou genérica aplica limite adaptativo mais restritivo (15 nós)
   const shortReq = mapFacadeRequest({
@@ -483,6 +534,313 @@ test('roteamento inteligente infere label Class para PascalCase e Function para 
     arguments: { project: 'api-pedidos', query: 'app' }
   });
   assert.equal(shortReq.params.arguments.limit, 15);
+});
+
+test('chave de cache canônica inclui todos os argumentos, escopo e evidência', () => {
+  const accessA = { allowedProjects: new Set(['api-pedidos']) };
+  const accessB = { allowedProjects: new Set(['api-financeiro']) };
+  const args = { project: 'api-pedidos', query: 'CriarPedido', limit: 30, offset: 0, filters: { language: 'csharp' } };
+  const evidence = { project: 'api-pedidos', status: 'fresh', indexedCommit: 'abc' };
+
+  const original = semanticCacheKey('search_graph', args, accessA, evidence);
+  assert.equal(original, semanticCacheKey('search_graph', { filters: { language: 'csharp' }, offset: 0, limit: 30, query: 'CriarPedido', project: 'api-pedidos' }, accessA, evidence));
+  assert.notEqual(original, semanticCacheKey('search_graph', { ...args, offset: 1 }, accessA, evidence));
+  assert.notEqual(original, semanticCacheKey('search_graph', args, accessB, evidence));
+  assert.notEqual(original, semanticCacheKey('search_graph', args, accessA, { ...evidence, indexedCommit: 'def' }));
+});
+
+test('CheckResponse reautoriza a chamada e anexa evidência de índice sem alterar o conteúdo JSON', async () => {
+  const activeAccess = {
+    system: false,
+    allowedProjects: new Set(['api-pedidos']),
+    knownProjects: new Set(['api-pedidos']),
+    projectEvidence: new Map([['api-pedidos', { status: 'fresh', indexedCommit: 'abc123', indexedAt: '2026-09-28T12:00:00.000Z' }]])
+  };
+  const handlers = createMcpGuardrailHandlers(userId => userId === 'active' ? activeAccess : {
+    system: false,
+    allowedProjects: new Set(),
+    knownProjects: new Set(['api-pedidos'])
+  });
+  const response = {
+    content: [{ type: 'text', text: JSON.stringify({ search_mode: 'bm25', results: [{ name: 'CriarPedido', label: 'Method' }] }) }],
+    structuredContent: { search_mode: 'bm25', results: [{ name: 'CriarPedido', label: 'Method' }] }
+  };
+  const request = {
+    method: 'tools/call',
+    metadataContext: {
+      userId: 'active',
+      toolName: 'search_graph',
+      originalTool: 'code_search_surgical',
+      resolvedProject: 'api-pedidos',
+      callArgs: JSON.stringify({ project: 'api-pedidos', query: 'CriarPedido', offset: 0 })
+    },
+    mcpResponse: Buffer.from(JSON.stringify(response))
+  };
+  const result = await new Promise((resolve, reject) => handlers.checkResponse({ request }, (error, value) => error ? reject(error) : resolve(value)));
+  const payload = JSON.parse(result.mutated);
+
+  assert.deepEqual(JSON.parse(payload.content[0].text).results.map(item => item.name), ['CriarPedido']);
+  assert.deepEqual(payload._meta['codebase-memory/evidence'], {
+    project: 'api-pedidos', status: 'fresh', indexedCommit: 'abc123', indexedAt: '2026-09-28T12:00:00.000Z'
+  });
+
+  const revoked = await new Promise((resolve, reject) => handlers.checkResponse({
+    request: { ...request, metadataContext: { ...request.metadataContext, userId: 'revoked' } }
+  }, (error, value) => error ? reject(error) : resolve(value)));
+  assert.equal(revoked.error.code, 'PERMISSION_DENIED');
+});
+
+test('CheckResponse falha fechado sem metadados e alinha resposta textual com resultados seletivos', async () => {
+  const access = { system: false, allowedProjects: new Set(['api-pedidos']), knownProjects: new Set(['api-pedidos']) };
+  const handlers = createMcpGuardrailHandlers(() => access);
+  const denied = await new Promise((resolve, reject) => handlers.checkResponse({
+    request: { method: 'tools/call', metadataContext: { userId: 'user-1' }, mcpResponse: Buffer.from('{}') }
+  }, (error, value) => error ? reject(error) : resolve(value)));
+  assert.equal(denied.error.code, 'PERMISSION_DENIED');
+
+  const response = {
+    structuredContent: {
+      search_mode: 'bm25',
+      results: [
+        { name: 'ProductionResult', file_path: 'src/orders.js' },
+        { name: 'TestResult', file_path: 'tests/orders.test.js' }
+      ]
+    },
+    content: [{ type: 'text', text: 'unstructured backend output' }]
+  };
+  const result = await new Promise((resolve, reject) => handlers.checkResponse({
+    request: {
+      method: 'tools/call',
+      metadataContext: {
+        userId: 'user-1', toolName: 'search_graph', facadeTool: 'code_search_surgical',
+        originalTool: 'code_search_surgical', resolvedProject: 'api-pedidos',
+        callArgs: JSON.stringify({ project: 'api-pedidos', query: 'Order' }), includeTests: 'false'
+      },
+      mcpResponse: Buffer.from(JSON.stringify(response))
+    }
+  }, (error, value) => error ? reject(error) : resolve(value)));
+  const payload = JSON.parse(result.mutated);
+  assert.deepEqual(payload.structuredContent.results.map(item => item.name), ['ProductionResult']);
+  assert.equal(payload.content[0].text, JSON.stringify(payload.structuredContent));
+
+  const withTests = await new Promise((resolve, reject) => handlers.checkResponse({
+    request: {
+      method: 'tools/call',
+      metadataContext: {
+        userId: 'user-1', toolName: 'search_graph', facadeTool: 'code_search_surgical',
+        originalTool: 'code_search_surgical', resolvedProject: 'api-pedidos',
+        callArgs: JSON.stringify({ project: 'api-pedidos', query: 'Order' }), includeTests: 'true'
+      },
+      mcpResponse: Buffer.from(JSON.stringify(response))
+    }
+  }, (error, value) => error ? reject(error) : resolve(value)));
+  assert.deepEqual(JSON.parse(withTests.mutated).structuredContent.results.map(item => item.name), ['ProductionResult', 'TestResult']);
+});
+
+test('busca em texto não estruturado falha fechado quando não pode filtrar arquivos de teste', async () => {
+  const access = { system: false, allowedProjects: new Set(['api-pedidos']), knownProjects: new Set(['api-pedidos']) };
+  const handlers = createMcpGuardrailHandlers(() => access);
+  const metadataContext = {
+    userId: 'user-1', toolName: 'search_graph', facadeTool: 'code_search_surgical',
+    originalTool: 'code_search_surgical', resolvedProject: 'api-pedidos',
+    callArgs: JSON.stringify({ project: 'api-pedidos', query: 'Order' }), includeTests: 'false'
+  };
+  const run = includeTests => new Promise((resolve, reject) => handlers.checkResponse({
+    request: {
+      method: 'tools/call',
+      metadataContext: { ...metadataContext, includeTests },
+      mcpResponse: Buffer.from(JSON.stringify({ content: [{ type: 'text', text: 'src/orders.js\ntests/orders.test.js' }] }))
+    }
+  }, (error, value) => error ? reject(error) : resolve(value)));
+
+  const filtered = JSON.parse((await run('false')).mutated);
+  assert.equal(filtered.isError, true);
+  assert.match(filtered.content[0].text, /não retornou resultados estruturados/);
+
+  const explicitlyIncluded = JSON.parse((await run('true')).mutated);
+  assert.equal(explicitlyIncluded.isError, undefined);
+  assert.equal(explicitlyIncluded.content[0].text, 'src/orders.js\ntests/orders.test.js');
+});
+
+test('busca mista substitui texto original pela representação estruturada filtrada', async () => {
+  const access = { system: false, allowedProjects: new Set(['api-pedidos']), knownProjects: new Set(['api-pedidos']) };
+  const handlers = createMcpGuardrailHandlers(() => access);
+  const result = await new Promise((resolve, reject) => handlers.checkResponse({
+    request: {
+      method: 'tools/call',
+      metadataContext: {
+        userId: 'user-1', toolName: 'search_graph', facadeTool: 'code_search_surgical',
+        originalTool: 'code_search_surgical', resolvedProject: 'api-pedidos',
+        callArgs: JSON.stringify({ project: 'api-pedidos', query: 'Order' }), includeTests: 'false'
+      },
+      mcpResponse: Buffer.from(JSON.stringify({
+        results: [{ name: 'ProductionResult', file_path: 'src/orders.js' }, { name: 'TestResult', file_path: 'tests/orders.test.js' }],
+        content: [{ type: 'text', text: 'raw mixed output includes tests/orders.test.js' }]
+      }))
+    }
+  }, (error, value) => error ? reject(error) : resolve(value)));
+  const payload = JSON.parse(result.mutated);
+  assert.deepEqual(payload.results.map(item => item.name), ['ProductionResult']);
+  assert.equal(payload.content[0].text.includes('tests/orders.test.js'), false);
+  assert.deepEqual(JSON.parse(payload.content[0].text).results.map(item => item.name), ['ProductionResult']);
+});
+
+test('busca filtra coleções equivalentes no structuredContent e no nível superior', async () => {
+  const access = { system: false, allowedProjects: new Set(['api-pedidos']), knownProjects: new Set(['api-pedidos']) };
+  const handlers = createMcpGuardrailHandlers(() => access);
+  const result = await new Promise((resolve, reject) => handlers.checkResponse({
+    request: {
+      method: 'tools/call',
+      metadataContext: {
+        userId: 'user-1', toolName: 'search_graph', facadeTool: 'code_search_surgical',
+        originalTool: 'code_search_surgical', resolvedProject: 'api-pedidos',
+        callArgs: JSON.stringify({ project: 'api-pedidos', query: 'Order' }), includeTests: 'false'
+      },
+      mcpResponse: Buffer.from(JSON.stringify({
+        results: [{ name: 'TestTopLevel', file_path: 'tests/top.test.js' }],
+        structuredContent: { results: [{ name: 'TestStructured', file_path: 'tests/structured.test.js' }] }
+      }))
+    }
+  }, (error, value) => error ? reject(error) : resolve(value)));
+  const payload = JSON.parse(result.mutated);
+  assert.deepEqual(payload.results, []);
+  assert.deepEqual(payload.structuredContent.results, []);
+});
+
+test('trace em texto não estruturado falha fechado quando não pode filtrar referências a testes', async () => {
+  const access = { system: false, allowedProjects: new Set(['api-pedidos']), knownProjects: new Set(['api-pedidos']) };
+  const handlers = createMcpGuardrailHandlers(() => access);
+  const result = await new Promise((resolve, reject) => handlers.checkResponse({
+    request: {
+      method: 'tools/call',
+      metadataContext: {
+        userId: 'user-1', toolName: 'trace_symbol', originalTool: 'trace_symbol',
+        resolvedProject: 'api-pedidos', callArgs: JSON.stringify({ project: 'api-pedidos', symbol: 'Order' }), includeTests: 'false'
+      },
+      mcpResponse: Buffer.from(JSON.stringify({ content: [{ type: 'text', text: 'tests/orders.test.js -> src/orders.js' }] }))
+    }
+  }, (error, value) => error ? reject(error) : resolve(value)));
+  const payload = JSON.parse(result.mutated);
+  assert.equal(payload.isError, true);
+  assert.match(payload.content[0].text, /Rastreamento bloqueado/);
+});
+
+test('trace misto filtra coleções top-level e substitui texto original', async () => {
+  const access = { system: false, allowedProjects: new Set(['api-pedidos']), knownProjects: new Set(['api-pedidos']) };
+  const handlers = createMcpGuardrailHandlers(() => access);
+  const result = await new Promise((resolve, reject) => handlers.checkResponse({
+    request: {
+      method: 'tools/call',
+      metadataContext: {
+        userId: 'user-1', toolName: 'trace_symbol', originalTool: 'trace_symbol',
+        resolvedProject: 'api-pedidos', callArgs: JSON.stringify({ project: 'api-pedidos', symbol: 'Order' }), includeTests: 'false'
+      },
+      mcpResponse: Buffer.from(JSON.stringify({
+        paths: [{ file_path: 'src/orders.js' }, { file_path: 'tests/orders.test.js' }],
+        content: [{ type: 'text', text: 'raw mixed trace includes tests/orders.test.js' }]
+      }))
+    }
+  }, (error, value) => error ? reject(error) : resolve(value)));
+  const payload = JSON.parse(result.mutated);
+  assert.deepEqual(payload.paths.map(item => item.file_path), ['src/orders.js']);
+  assert.equal(payload.content[0].text.includes('tests/orders.test.js'), false);
+  assert.deepEqual(JSON.parse(payload.content[0].text).paths.map(item => item.file_path), ['src/orders.js']);
+});
+
+test('trace filtra coleções equivalentes no structuredContent e no nível superior', async () => {
+  const access = { system: false, allowedProjects: new Set(['api-pedidos']), knownProjects: new Set(['api-pedidos']) };
+  const handlers = createMcpGuardrailHandlers(() => access);
+  const result = await new Promise((resolve, reject) => handlers.checkResponse({
+    request: {
+      method: 'tools/call',
+      metadataContext: {
+        userId: 'user-1', toolName: 'trace_symbol', originalTool: 'trace_symbol',
+        resolvedProject: 'api-pedidos', callArgs: JSON.stringify({ project: 'api-pedidos', symbol: 'Order' }), includeTests: 'false'
+      },
+      mcpResponse: Buffer.from(JSON.stringify({
+        paths: [{ file_path: 'tests/top.test.js' }],
+        structuredContent: { paths: [{ file_path: 'tests/structured.test.js' }] }
+      }))
+    }
+  }, (error, value) => error ? reject(error) : resolve(value)));
+  const payload = JSON.parse(result.mutated);
+  assert.deepEqual(payload.paths, []);
+  assert.deepEqual(payload.structuredContent.paths, []);
+});
+
+test('cache local registra hits após revalidar chamada e resposta do backend', async () => {
+  clearSemanticCache();
+  const handlers = createMcpGuardrailHandlers(() => scopedAccess);
+  const request = {
+    method: 'tools/call',
+    metadataContext: {
+      userId: 'user-1', toolName: 'search_graph', facadeTool: 'code_search_surgical',
+      originalTool: 'code_search_surgical', resolvedProject: 'api-pedidos',
+      callArgs: JSON.stringify({ project: 'api-pedidos', query: 'Order' })
+    },
+    mcpResponse: Buffer.from(JSON.stringify({ structuredContent: { search_mode: 'bm25', results: [{ name: 'OrderHandler', file_path: 'src/orders.js' }] } }))
+  };
+  const invoke = () => new Promise((resolve, reject) => handlers.checkResponse({ request }, (error, value) => error ? reject(error) : resolve(value)));
+  const before = metricsText();
+  await invoke();
+  const first = metricsText();
+  await invoke();
+  const second = metricsText();
+  const metricValue = output => Number(output.match(/mcp_guardrail_cache_events_total\{cache="semantic",result="hit"\} (\d+)/)?.[1] || 0);
+  assert.ok(metricValue(second) > metricValue(first));
+  assert.ok(metricValue(first) >= metricValue(before));
+});
+
+test('retrieval opt-in preserva argumentos aceitos pelo backend e diversifica a resposta', async () => {
+  const access = {
+    system: false,
+    allowedProjects: new Set(['api-pedidos']),
+    knownProjects: new Set(['api-pedidos']),
+    projectEvidence: new Map([['api-pedidos', { status: 'fresh', indexedCommit: 'abc123' }]])
+  };
+  const handlers = createMcpGuardrailHandlers(() => access);
+  const requestParams = {
+    name: 'code_search_surgical',
+    arguments: {
+      project: 'api-pedidos', query: 'CriarPedido', retrieval_mode: 'fast', diversity_per_path: 2
+    }
+  };
+  const checkedRequest = await new Promise((resolve, reject) => handlers.checkRequest({
+    request: { method: 'tools/call', metadataContext: { userId: 'user-1' }, mcpRequest: Buffer.from(JSON.stringify(requestParams)) }
+  }, (error, value) => error ? reject(error) : resolve(value)));
+  const forwarded = JSON.parse(checkedRequest.mutated);
+  assert.equal(forwarded.name, 'search_graph');
+  assert.equal(forwarded.arguments.retrieval_mode, undefined);
+  assert.equal(forwarded.arguments.diversity_per_path, undefined);
+  assert.equal(checkedRequest.metadata.fields.retrievalMode.stringValue, 'fast');
+
+  const response = {
+    structuredContent: {
+      search_mode: 'bm25',
+      results: [
+        { name: 'TopRanked', label: 'Method', file_path: 'src/orders.cs', start_line: 10, rank: -50 },
+        { name: 'SecondRanked', label: 'Method', file_path: 'src/orders.cs', start_line: 20, rank: -40 },
+        { name: 'ThirdRanked', label: 'Method', file_path: 'src/orders.cs', start_line: 30, rank: -30 }
+      ]
+    }
+  };
+  const checkedResponse = await new Promise((resolve, reject) => handlers.checkResponse({
+    request: {
+      method: 'tools/call',
+      metadataContext: {
+        userId: 'user-1', toolName: 'search_graph', facadeTool: 'code_search_surgical', originalTool: 'code_search_surgical',
+        resolvedProject: 'api-pedidos', callArgs: JSON.stringify(forwarded.arguments), retrievalMode: 'fast', diversityPerPath: '2'
+      },
+      mcpResponse: Buffer.from(JSON.stringify(response))
+    }
+  }, (error, value) => error ? reject(error) : resolve(value)));
+  const payload = JSON.parse(checkedResponse.mutated);
+  assert.equal(payload.structuredContent.retrieval_policy.mode, 'fast');
+  assert.equal(payload.structuredContent.results.length, 2);
+  assert.deepEqual(payload.structuredContent.results.map(item => item.name), ['TopRanked', 'SecondRanked']);
+  assert.deepEqual(payload.structuredContent.results.map(item => item.provenance.path), ['src/orders.cs', 'src/orders.cs']);
+  assert.notEqual(payload.structuredContent.results[0].provenance.chunkId, payload.structuredContent.results[1].provenance.chunkId);
+  assert.ok(payload.structuredContent.results.every(item => item.provenance.indexedCommit === 'abc123'));
 });
 
 test('formatSearchResultMarkdown formata lista de itens em tabela Markdown', () => {
@@ -540,5 +898,3 @@ test('pruneSearchResultPayload remove rank e campos inúteis de AST de buscas', 
   assert.equal(pruned.results[0].lines, undefined);
   assert.equal(pruned.results[0].start_line, 10);
 });
-
-

@@ -22,3 +22,6 @@ compose.gpu.yaml.tmp
 
 # Relatórios de avaliação RAG
 rag-eval/reports/
+code-eval/reports/
+code-eval/queries.local.json
+*.semantic-graph.json

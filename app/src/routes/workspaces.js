@@ -163,6 +163,7 @@ export function register(router, ctx) {
 
   router.post('/api/workspaces/:workspaceId/repositories', async (request, response, url, params) => {
     const workspaceId = params.workspaceId;
+    ctx.workspace(workspaceId);
     const input = await body(request);
     if (!Array.isArray(input.repositories) || !input.repositories.length) throw new Error('Selecione pelo menos um repositório.');
     const available = await ctx.listGithubRepositories();

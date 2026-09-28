@@ -1,6 +1,6 @@
 /**
  * Funções auxiliares HTTP compartilhadas entre os módulos de rota.
- * Sem dependências externas — usa apenas APIs nativas do Node 22.
+ * Sem dependências externas — usa apenas APIs nativas do Node.
  */
 
 /**

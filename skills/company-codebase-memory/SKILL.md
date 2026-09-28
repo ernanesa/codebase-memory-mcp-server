@@ -16,7 +16,7 @@ Usar o Codebase Memory como mapa de navegação do código. Tratar o repositóri
 
 ## Selecionar o projeto correto
 
-1. Chamar `list_projects` no início da investigação.
+1. Chamar `list_projects` no início de uma investigação; se o projeto já foi confirmado na mesma tarefa, reutilizar o ID técnico em vez de repetir a descoberta.
 2. Considerar a resposta como a lista de projetos visíveis para a credencial atual. Tokens individuais recebem somente projetos autorizados; a credencial Sistema/Playground pode receber todos.
 3. Relacionar o repositório atual ao resultado por caminho raiz, nome, remoto Git ou outros metadados retornados.
 4. Usar exatamente o identificador técnico retornado no campo `name` ou `project`, conforme o schema da resposta. Não derivar o ID do nome `owner/repository` e não inventar slug.
@@ -37,6 +37,17 @@ Adaptar a sequência ao pedido e aos schemas publicados em `tools/list`:
 6. Consultar `index_status` e `detect_changes` quando a resposta depender de completude, atualidade ou ausência de resultados.
 7. Abrir os arquivos relevantes no repositório local e confirmar assinaturas, condições, tratamento de erros, configuração e testes.
 8. Expandir a busca somente quando a evidência atual não sustentar a conclusão.
+
+## Controlar contexto e chamadas
+
+- Usar uma conversa nova para uma tarefa independente; manter a conversa atual enquanto análise, implementação e correções pertencerem ao mesmo objetivo.
+- Iniciar com uma primeira rodada curta, normalmente até quatro chamadas MCP. Expandir apenas para resolver uma lacuna de evidência nomeada; não chamar arquitetura, schema, traces e testes por rotina.
+- Formular consultas específicas, pedir poucos resultados e recuperar snippets ou testes somente quando necessários. Evitar repetir resultados já obtidos e resumidos.
+- Para continuar em uma conversa nova, transferir um handoff compacto: objetivo, critério de conclusão, restrições, repo/commit/estado Git, arquivos ou símbolos, evidências e decisões válidas, checks pendentes e próxima ação. Não copiar o histórico nem saídas brutas.
+- Manter prefixo de instruções e ferramentas estável quando possível, mas não prolongar um histórico irrelevante só para tentar reaproveitar cache. Esta skill e o MCP não controlam criação/limpeza de conversas nem garantem cache de prompt.
+- Encerrar cada etapa com decisões ainda válidas, evidências localizadas, checks executados/pendentes, riscos e próximo passo; descartar hipóteses invalidadas e dados duplicados.
+
+Consultar [CODEX-MCP-CONTEXT.md](../../CODEX-MCP-CONTEXT.md) para o modelo de handoff, limites de cache e avaliação do fluxo.
 
 Ler [references/tools-and-recipes.md](references/tools-and-recipes.md) para escolher ferramentas e sequências por tipo de pergunta.
 

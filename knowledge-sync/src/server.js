@@ -4,6 +4,7 @@ import { readFile, mkdir, rename, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { changesAffectTarget, createServiceAccountAssertion, fileChecksum, folderRoot, fullReconciliationDue, GOOGLE_FOLDER_MIME, isTargetDue, MANAGED_ROOT, migrateTargetSchedule, migrateTargetSources, nextRunAt, normalizeTargetInput, publicTarget, sanitizeDriveName, scheduledSlot } from './lib.js';
 import { gauge, increment, log, metricsText, observe, timed } from './observability.js';
+import { retryDelayMilliseconds } from './retry.js';
 import { buildLinkDocument, DEFAULT_LINK_MAX_BYTES, DEFAULT_LINK_MAX_REDIRECTS, DEFAULT_LINK_TIMEOUT_MS, fetchWebLink, validateWebLinkDestination, WEB_LINK_ROOT, webLinkSourceKey } from './web-links.js';
 
 const PORT = Number(process.env.PORT || 3002);
@@ -141,6 +142,7 @@ async function fetchWithRetry(url, options, provider) {
   let response;
   let lastError;
   for (let attempt = 1; attempt <= HTTP_RETRY_ATTEMPTS; attempt += 1) {
+    response = undefined;
     try {
       response = await fetch(url, options);
       increment('knowledge_sync_http_requests_total', { provider, status: response.status });
@@ -150,7 +152,9 @@ async function fetchWithRetry(url, options, provider) {
       lastError = error;
       increment('knowledge_sync_http_requests_total', { provider, status: 'network_error' });
     }
-    if (attempt < HTTP_RETRY_ATTEMPTS) await wait(250 * (2 ** (attempt - 1)));
+    if (attempt < HTTP_RETRY_ATTEMPTS) {
+      await wait(retryDelayMilliseconds({ attempt, retryAfter: response?.headers?.get?.('retry-after') }));
+    }
   }
   if (response) return response;
   throw lastError;
@@ -572,11 +576,14 @@ async function processManifestEntry(target, entry, counters, operationId, force 
       durationMs: Math.round(performance.now() - started)
     };
     await persist();
+    let cleanupStateNeedsCheckpoint = false;
     if (previous?.fileId && previous.fileId !== newFileId) {
       try {
         await cleanupFiles(target.knowledgeBaseId, [previous.fileId]);
         target.files[entry.sourceKey].cleanupError = null;
+        cleanupStateNeedsCheckpoint = Boolean(previous.cleanupError);
       } catch (error) {
+        cleanupStateNeedsCheckpoint = true;
         target.files[entry.sourceKey].cleanupError = error.message;
         increment(sourceMetric, { operation: 'cleanup', status: 'failed' });
         log('warn', 'previous_file_cleanup_failed', { operationId, knowledgeBaseId: target.knowledgeBaseId, sourceKey: entry.sourceKey, error: error.message });
@@ -587,7 +594,10 @@ async function processManifestEntry(target, entry, counters, operationId, force 
       counters.added += 1;
       increment(sourceMetric, { operation: 'added', status: 'completed' });
     }
-    await persist();
+    // The replacement ID is already durable before deleting the prior remote file.
+    // Persist again only when cleanup status changed materially. Otherwise the final
+    // run checkpoint persists summary metadata, while the replacement ID is already durable.
+    if (cleanupStateNeedsCheckpoint) await persist();
     log('info', 'file_processed', { operationId, knowledgeBaseId: target.knowledgeBaseId, sourceKey: entry.sourceKey, durationMs: Math.round(performance.now() - started) });
   } catch (error) {
     target.files[entry.sourceKey] = {

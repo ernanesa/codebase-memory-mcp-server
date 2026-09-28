@@ -6,6 +6,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { assertSafeSegment, createMutex, DEFAULT_TIMEZONE, DEFAULT_WORKSPACE_CRON, cronMatches, decryptWorkspaceToken, describeCron, encryptWorkspaceToken, generateMcpToken, gitAuthEnvironment, indexRepositoryArguments, loadCredentials, loadMcpUserStore, loadSecret, loadState, mcpTokenFingerprint, nextCronOccurrence, parseCronExpression, parseLastJsonLine, publicMcpUser, publicWorkspace, reconcileRepositoryProjects, removeMcpGatewayUserKey, run, safeChild, saveCredentials, saveMcpUserStore, saveSecret, saveState, setMcpGatewayUserKey, slugify, validateTimezone } from './lib.js';
 import { clearSemanticCache, startMcpGuardrailServer } from './mcp-guardrail.js';
+import { projectEvidence, uniqueProjectNames } from './index-evidence.js';
 import { gauge, increment, log as structuredLog, metricsText, observe } from './observability.js';
 import { createAdminAuth } from './auth.js';
 import { JOB_HISTORY_RETENTION_DAYS, JOB_LOG_MAX_CHARACTERS, loadJobHistory, paginateJobs, pruneJobHistory, recoverInterruptedJobs, saveJobHistory } from './job-history.js';
@@ -122,9 +123,17 @@ const MCP_SYSTEM_USER = {
   identity: 'system@local'
 };
 
-function errorResponse(response, error, status = error.status || 400) {
-  structuredLog('error', 'request_failed', { status, error: error.message });
-  json(response, status, { error: error.message || 'Erro inesperado.' });
+function errorResponse(response, error, status = error.status || ((error.stdout !== undefined || error.stderr !== undefined || error.code !== undefined) ? 500 : 400), request = null) {
+  const correlationId = randomUUID();
+  const safeStatus = Number.isInteger(status) && status >= 400 && status <= 599 ? status : 500;
+  structuredLog('error', 'request_failed', {
+    correlationId,
+    status: safeStatus,
+    method: String(request?.method || '').slice(0, 12),
+    errorType: String(error?.name || 'Error').replace(/[^a-zA-Z0-9_.-]/g, '').slice(0, 64) || 'Error'
+  });
+  const publicMessage = safeStatus >= 500 ? 'Erro interno. Informe o identificador da solicitação ao suporte.' : String(error?.message || 'Solicitação inválida.').slice(0, 300);
+  json(response, safeStatus, { error: publicMessage, correlationId });
 }
 
 async function knowledgeSyncRequest(pathname, { method = 'GET', payload } = {}) {
@@ -285,6 +294,47 @@ async function refreshRepositoryProjects({ force = false } = {}) {
   finally { projectReconciliation = null; }
 }
 
+let evidenceRefreshCursor = 0;
+let evidenceRefreshRunning = false;
+async function refreshRepositoryEvidenceBatch() {
+  if (evidenceRefreshRunning || state.repositories.length === 0) return;
+  evidenceRefreshRunning = true;
+  try {
+    const batchSize = Math.min(20, state.repositories.length);
+    const selected = Array.from({ length: batchSize }, (_, offset) => state.repositories[(evidenceRefreshCursor + offset) % state.repositories.length]);
+    evidenceRefreshCursor = (evidenceRefreshCursor + batchSize) % state.repositories.length;
+    let changed = false;
+    for (let index = 0; index < selected.length; index += 3) {
+      await Promise.all(selected.slice(index, index + 3).map(async item => {
+        try {
+          const [commitResult, statusResult] = await Promise.all([
+            run('git', ['-C', item.path, 'rev-parse', 'HEAD']),
+            run('git', ['-C', item.path, 'status', '--porcelain=v1', '--untracked-files=normal'])
+          ]);
+          const currentCommit = commitResult.stdout.trim();
+          if (!/^[a-f0-9]{40,64}$/i.test(currentCommit)) throw new Error('Invalid revision');
+          const currentWorktreeStatus = statusResult.stdout ? 'dirty' : 'clean';
+          const observedAt = new Date().toISOString();
+          // Persist the observation timestamp even when the revision is unchanged.
+          changed = true;
+          item.currentCommit = currentCommit;
+          item.currentWorktreeStatus = currentWorktreeStatus;
+          item.worktreeObservedAt = observedAt;
+        } catch {
+          // A failed observation cannot support a freshness claim.
+          if (item.worktreeObservedAt || item.currentWorktreeStatus || item.currentCommit) changed = true;
+          delete item.worktreeObservedAt;
+          delete item.currentWorktreeStatus;
+          delete item.currentCommit;
+        }
+      }));
+    }
+    if (changed) await persist();
+  } finally {
+    evidenceRefreshRunning = false;
+  }
+}
+
 function mcpUser(id) {
   assertSafeSegment(id, 'Usuário MCP');
   const found = mcpUserStore.users.find(item => item.id === id);
@@ -315,24 +365,27 @@ function mcpRepositoryIds(input, { required = true } = {}) {
 }
 
 function mcpAccess(userId) {
-  const knownProjects = new Set(state.repositories.filter(item => item.project).map(item => item.project));
-  if (userId === MCP_SYSTEM_USER.id) return { system: true, allowedProjects: new Set(), knownProjects };
+  // The external backend authorizes by project name. A duplicated name cannot be
+  // safely mapped back to one repository, so it must never enter a scoped token.
+  const knownProjects = uniqueProjectNames(state.repositories);
+  const evidence = projectEvidence(state.repositories);
+  if (userId === MCP_SYSTEM_USER.id) return { system: true, allowedProjects: new Set(), knownProjects, projectEvidence: evidence };
   if (userId.startsWith('workspace:')) {
     const workspaceId = userId.slice('workspace:'.length);
     const selectedWorkspace = state.workspaces.find(item => item.id === workspaceId && item.mcpCredential?.status === 'active');
     if (!selectedWorkspace) return null;
     const allowedProjects = new Set(state.repositories
-      .filter(item => item.workspaceId === workspaceId && item.project)
+      .filter(item => item.workspaceId === workspaceId && knownProjects.has(item.project))
       .map(item => item.project));
-    return { system: false, allowedProjects, knownProjects };
+    return { system: false, allowedProjects, knownProjects, projectEvidence: new Map([...evidence].filter(([project]) => allowedProjects.has(project))) };
   }
   const user = mcpUserStore.users.find(item => item.id === userId && item.status === 'active');
   if (!user) return null;
   const allowedRepositoryIds = new Set(user.repositoryIds || []);
   const allowedProjects = new Set(state.repositories
-    .filter(item => allowedRepositoryIds.has(item.accessId) && item.project)
+    .filter(item => allowedRepositoryIds.has(item.accessId) && knownProjects.has(item.project))
     .map(item => item.project));
-  return { system: false, allowedProjects, knownProjects };
+  return { system: false, allowedProjects, knownProjects, projectEvidence: new Map([...evidence].filter(([project]) => allowedProjects.has(project))) };
 }
 
 async function commitMcpUserStoreOnly(nextStore) {
@@ -676,6 +729,10 @@ function pumpSyncQueue() {
         const previousCommit = (await run('git', ['rev-parse', 'HEAD'], { cwd: item.path })).stdout.trim();
         await run('git', ['pull', '--ff-only'], { cwd: item.path, env: gitAuthEnvironment(githubToken), onOutput: log });
         const currentCommit = (await run('git', ['rev-parse', 'HEAD'], { cwd: item.path })).stdout.trim();
+        const currentWorktree = await run('git', ['status', '--porcelain=v1', '--untracked-files=normal'], { cwd: item.path });
+        item.currentCommit = currentCommit;
+        item.currentWorktreeStatus = currentWorktree.stdout ? 'dirty' : 'clean';
+        item.worktreeObservedAt = new Date().toISOString();
         item.commit = currentCommit.slice(0, 7);
         item.lastSyncAt = new Date().toISOString();
         job.changed = previousCommit !== currentCommit;
@@ -684,10 +741,16 @@ function pumpSyncQueue() {
           log(job.changed
             ? '\nRepositório atualizado; iniciando reindexação...\n'
             : '\nTentando novamente a reindexação pendente...\n');
-          await indexRepository(item, log);
-          delete item.indexPending;
-          job.indexed = true;
-          log('\nReindexação concluída.\n');
+          const indexed = await indexRepository(item, log);
+          if (indexed.fresh) {
+            delete item.indexPending;
+            job.indexed = true;
+            log('\nReindexação concluída.\n');
+          } else {
+            job.indexed = false;
+            if (!indexed.changedDuringIndex) delete item.indexPending;
+            log('\nA reindexação não produziu uma revisão limpa; o índice foi marcado como desatualizado.\n');
+          }
         } else {
           log('\nRepositório sem alterações.\n');
         }
@@ -734,12 +797,45 @@ function enqueueRepositorySync(item, { source = 'manual', parentJobId = null, de
 
 async function indexRepository(item, log) {
   item.status = 'indexing';
+  const readRevision = async () => {
+    const [commit, worktree] = await Promise.all([
+      run('git', ['-C', item.path, 'rev-parse', 'HEAD']),
+      run('git', ['-C', item.path, 'status', '--porcelain=v1', '--untracked-files=normal'])
+    ]);
+    return { commit: commit.stdout.trim(), worktree: worktree.stdout ? 'dirty' : 'clean' };
+  };
+  const before = await readRevision();
   const result = await run(CBM_BIN, indexRepositoryArguments(item.path), { onOutput: log });
+  const after = await readRevision();
   const indexed = parseLastJsonLine(result.stdout);
   if (indexed?.project) item.project = indexed.project;
-  item.status = 'indexed';
+  const changedDuringIndex = before.commit !== after.commit || before.worktree !== after.worktree;
+  const cleanRevision = !changedDuringIndex && before.worktree === 'clean' && after.worktree === 'clean';
+  item.currentCommit = after.commit;
+  item.currentWorktreeStatus = after.worktree;
+  item.worktreeObservedAt = new Date().toISOString();
+  item.indexedCommit = before.commit === after.commit ? after.commit : null;
+  item.indexedWorktreeStatus = before.worktree;
+  item.status = cleanRevision ? 'indexed' : 'stale';
   item.lastIndexedAt = new Date().toISOString();
+  if (changedDuringIndex) {
+    const retries = Number.isInteger(item.indexPendingRetries) ? item.indexPendingRetries + 1 : 1;
+    if (retries <= 3) {
+      item.indexPending = true;
+      item.indexPendingRetries = retries;
+      log(`\nO repositório mudou durante a indexação; reindexação pendente (${retries}/3).\n`);
+    } else {
+      delete item.indexPending;
+      item.indexRetryExhausted = true;
+      item.indexPendingRetries = retries;
+      log('\nO repositório continuou mudando durante a indexação; novas tentativas automáticas foram interrompidas.\n');
+    }
+  } else {
+    delete item.indexPendingRetries;
+    delete item.indexRetryExhausted;
+  }
   clearSemanticCache();
+  return { fresh: cleanRevision, changedDuringIndex };
 }
 
 function runWorkspaceIndex(selectedWorkspace) {
@@ -963,6 +1059,9 @@ setInterval(() => checkWorkspaceSchedules().catch(error => console.warn('Falha a
 setInterval(() => {
   if (retainRecentJobs()) void persistJobHistory().catch(error => structuredLog('error', 'job_history_cleanup_failed', { error: error.message }));
 }, 60 * 60 * 1000).unref();
+setInterval(() => {
+  void refreshRepositoryEvidenceBatch().catch(error => structuredLog('warn', 'repository_evidence_refresh_failed', { errorType: String(error?.name || 'Error').slice(0, 64) }));
+}, 15_000).unref();
 await startMcpGuardrailServer(mcpAccess, MCP_GUARDRAIL_ADDR);
 await provisionMcpSystemToken();
 await provisionWorkspaceMcpTokens();
@@ -993,7 +1092,7 @@ const server = http.createServer(async (request, response) => {
     }
     if (!session) return redirect(response, '/login');
     serveStatic(response, url.pathname);
-  } catch (error) { errorResponse(response, error); }
+  } catch (error) { errorResponse(response, error, undefined, request); }
 });
 
 let isShuttingDown = false;
