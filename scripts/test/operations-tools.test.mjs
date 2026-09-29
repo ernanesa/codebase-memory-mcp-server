@@ -51,3 +51,25 @@ test('Ollama benchmark validates limits before sending synthetic requests', asyn
     return true;
   });
 });
+
+test('legacy source approval migration is dry-run by default and requires complete approval', async t => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'cbm-approval-migration-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const stateFile = path.join(root, 'state.json');
+  const approvalFile = path.join(root, 'approvals.json');
+  await writeFile(stateFile, JSON.stringify({
+    workspaces: [{ id: 'platform', name: 'Platform' }],
+    repositories: [{ id: 'api', workspaceId: 'platform', fullName: 'company/api', project: 'platform-api' }]
+  }));
+  await writeFile(approvalFile, JSON.stringify({ approvedBy: 'security@company.test', approvals: [{ workspaceId: 'platform', repositoryId: 'api', githubRepositoryId: '101' }] }));
+  const script = path.join(scripts, 'migrate-legacy-source-approvals.mjs');
+  const args = [script, '--state-file', stateFile, '--approval-file', approvalFile];
+  const dryRun = await run(process.execPath, args);
+  assert.deepEqual(JSON.parse(dryRun.stdout), { schema: 1, mode: 'dry_run', migrated: 1, alreadyCompliant: 0 });
+  assert.equal(JSON.parse(await readFile(stateFile, 'utf8')).repositories[0].sourceApproval, undefined);
+  const applied = await run(process.execPath, [...args, '--apply']);
+  assert.equal(JSON.parse(applied.stdout).mode, 'applied');
+  const migrated = JSON.parse(await readFile(stateFile, 'utf8'));
+  assert.equal(migrated.repositories[0].sourceApproval.status, 'approved');
+  assert.equal(migrated.workspaces[0].repositorySourceApprovals.length, 1);
+});
