@@ -7,6 +7,8 @@ Ambiente autogerenciado para disponibilizar repositórios a clientes MCP e mante
 - painel para workspaces, repositórios, indexação e sincronização Git;
 - endpoint MCP remoto protegido por tokens de workspace ou usuário;
 - controle de acesso por repositório;
+- aprovação corporativa explícita da fonte e revalidação do ID estável antes de clone, sync ou indexação;
+- ACL por chunk, isolamento entre projetos e higienização de conteúdo recuperado antes de cache ou contexto de modelo;
 - Open WebUI com chat e RAG híbrido;
 - embeddings multilíngues com `bge-m3` e reranking;
 - extração de documentos, OCR adaptativo e tabelas com Docling em CPU;
@@ -75,12 +77,31 @@ O dashboard provisionado **Codebase Memory — Operação** é aberto como pági
 
 1. Acesse o painel administrativo.
 2. Conecte um token fine-grained do GitHub.
-3. Crie um workspace e adicione repositórios.
+3. Crie um workspace, aprove cada fonte corporativa e adicione os repositórios.
 4. Aguarde os clones e inicie a primeira indexação.
 5. Crie acessos MCP por workspace ou por desenvolvedor.
 6. No Open WebUI, envie documentos ou configure pastas do Drive.
 
 O token GitHub precisa de leitura de metadados e, para repositórios privados, leitura de conteúdo. Restrinja-o à organização e aos repositórios necessários.
+
+### Migração de repositórios existentes
+
+Esta versão não autoaprova repositórios legados: isso evitaria transformar uma
+origem histórica em autorização corporativa sem evidência. Antes de atualizar
+um ambiente já em uso, um responsável precisa revisar as fontes e executar a
+migração em modo simulação, depois em modo aplicado. O arquivo de aprovação é
+privado, exige `approvedBy`, o ID estável do GitHub e cobertura exata de todos
+os repositórios legados; a saída contém somente contagens.
+
+```bash
+node scripts/migrate-legacy-source-approvals.mjs \
+  --state-file data/state.json --approval-file /caminho/privado/aprovacoes.json
+node scripts/migrate-legacy-source-approvals.mjs \
+  --state-file data/state.json --approval-file /caminho/privado/aprovacoes.json --apply
+```
+
+Consulte [Operação SOTA de RAG e MCP](docs/SOTA-RAG-OPERATIONS.md) para as
+garantias, o procedimento de backup e os critérios de promoção.
 
 ## Conectar um cliente MCP
 
@@ -125,6 +146,8 @@ A sincronização de fontes usa cron por Knowledge Base. O padrão `30 * * * *` 
 - [Configuração e manutenção](CONFIGURATION.md)
 - [Configurar Google Drive](GOOGLE-DRIVE-CONFIG.md)
 - [Avaliar a qualidade do RAG](RAG-EVALUATION.md)
+- [Operação SOTA de RAG e MCP](docs/SOTA-RAG-OPERATIONS.md)
+- [Capacidade, custos e observabilidade de IA](docs/operations-ai-capacity.md)
 - [Usar o MCP com Codex e preservar contexto](CODEX-MCP-CONTEXT.md)
 - [Skill Company Codebase Memory](skills/company-codebase-memory/)
 
@@ -137,5 +160,6 @@ A sincronização de fontes usa cron por Knowledge Base. O padrão `30 * * * *` 
 - mantenha `data/`, `.env`, chaves e tokens fora do Git;
 - restrinja a Service Account do Drive a leitura das pastas necessárias;
 - preserve `data/secrets/mcp-workspace-encryption-key` nos backups.
+- não execute a migração de fontes legadas sem uma revisão humana verificável e um backup recuperável de `data/state.json`.
 
 Em produção com Cloudflare Tunnel no host, configure os quatro hostnames com a mesma origem HTTP `http://127.0.0.1:8080` e não sobrescreva o **HTTP Host Header**. O TLS público termina na Cloudflare; nenhuma porta de entrada precisa ser aberta para o proxy.
