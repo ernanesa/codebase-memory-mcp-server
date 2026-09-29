@@ -32,7 +32,7 @@ OPENWEBUI_PREVIOUS_PASSWORD=''
 OPENWEBUI_DESIRED_PASSWORD=''
 OLLAMA_VERSION='0.32.1'
 OLLAMA_CHAT_MODEL='gemma4:e2b'
-OLLAMA_CONTEXT_LENGTH='64000'
+OLLAMA_CONTEXT_LENGTH='16384'
 OLLAMA_KV_CACHE_QUANTIZATION='fp16'
 OLLAMA_KEEP_ALIVE='5m'
 OLLAMA_RUNTIME='docker'
@@ -394,10 +394,12 @@ configure_host_ollama_command() {
     printf '    <string>%s</string>\n' "$OLLAMA_KEEP_ALIVE"
     printf '%s\n' '    <key>OLLAMA_CONTEXT_LENGTH</key>'
     printf '    <string>%s</string>\n' "$OLLAMA_CONTEXT_LENGTH"
-    if [[ "$OLLAMA_KEEP_ALIVE" == '-1' ]]; then
-      printf '%s\n' '    <key>OLLAMA_MAX_LOADED_MODELS</key>'
-      printf '%s\n' '    <string>3</string>'
-    fi
+    printf '%s\n' '    <key>OLLAMA_MAX_LOADED_MODELS</key>'
+    printf '%s\n' '    <string>1</string>'
+    printf '%s\n' '    <key>OLLAMA_NUM_PARALLEL</key>'
+    printf '%s\n' '    <string>1</string>'
+    printf '%s\n' '    <key>OLLAMA_MAX_QUEUE</key>'
+    printf '%s\n' '    <string>16</string>'
     if [[ "$OLLAMA_KV_CACHE_QUANTIZATION" == q8_0 ]]; then
       printf '%s\n' '    <key>OLLAMA_FLASH_ATTENTION</key>'
       printf '%s\n' '    <string>1</string>'
@@ -650,7 +652,7 @@ ask_ollama_context_length() {
   if [[ "$existing_context_length" =~ ^[1-9][0-9]*$ ]]; then
     OLLAMA_CONTEXT_LENGTH="$existing_context_length"
   else
-    OLLAMA_CONTEXT_LENGTH='64000'
+    OLLAMA_CONTEXT_LENGTH='16384'
   fi
 
   show_config_step 4 'Tamanho do contexto' 'Defina o número máximo de tokens de contexto usados pelo Ollama. Valores maiores consomem mais memória.'
@@ -703,7 +705,7 @@ ask_ollama_keep_alive() {
   esac
 
   show_config_step 6 'Residência dos modelos' 'Defina por quanto tempo os modelos permanecem carregados na memória da GPU.'
-  print_option 1 'Sempre' 'Recomendado para servidor dedicado; mantém até dois modelos carregados'
+  print_option 1 'Sempre' 'Mantém um modelo carregado por padrão; ajuste após medir VRAM e fila'
   print_option 2 '30 minutos' 'Equilíbrio entre latência e liberação de VRAM'
   print_option 3 '5 minutos' 'Comportamento padrão do Ollama'
   printf '\n'
@@ -725,7 +727,7 @@ ask_ollama_keep_alive() {
   done
 
   [[ "$OLLAMA_KEEP_ALIVE" == '-1' ]] && \
-    success 'Os modelos permanecerão carregados; limite simultâneo: 2' || \
+    success 'Os modelos permanecerão carregados; limite simultâneo padrão: 1' || \
     success "Os modelos permanecerão carregados por ${OLLAMA_KEEP_ALIVE}"
 }
 
@@ -1077,9 +1079,9 @@ write_ollama_quantization_compose_override() {
     printf '    environment:\n'
     printf '      OLLAMA_KEEP_ALIVE: "%s"\n' "$OLLAMA_KEEP_ALIVE"
     printf '      OLLAMA_CONTEXT_LENGTH: "%s"\n' "$OLLAMA_CONTEXT_LENGTH"
-    if [[ "$OLLAMA_KEEP_ALIVE" == '-1' ]]; then
-      printf '      OLLAMA_MAX_LOADED_MODELS: "3"\n'
-    fi
+    printf '%s\n' '      OLLAMA_MAX_LOADED_MODELS: "${OLLAMA_MAX_LOADED_MODELS:-1}"'
+    printf '%s\n' '      OLLAMA_NUM_PARALLEL: "${OLLAMA_NUM_PARALLEL:-1}"'
+    printf '%s\n' '      OLLAMA_MAX_QUEUE: "${OLLAMA_MAX_QUEUE:-16}"'
     if [[ "$OLLAMA_KV_CACHE_QUANTIZATION" == q8_0 ]]; then
       printf '      OLLAMA_FLASH_ATTENTION: "1"\n'
       printf '      OLLAMA_KV_CACHE_TYPE: q8_0\n'

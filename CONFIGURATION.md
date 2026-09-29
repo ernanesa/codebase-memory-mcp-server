@@ -57,6 +57,10 @@ RAG_TOP_K_RERANKER=8
 | `OLLAMA_CHAT_MODEL` | Modelo de chat baixado pelo instalador. |
 | `OLLAMA_KV_CACHE_QUANTIZATION` | Quantização do cache K/V: `fp16` (padrão) ou `q8_0`. |
 | `OLLAMA_KEEP_ALIVE` | Residência dos modelos: `-1` (indefinida), `30m` ou `5m` (padrão do Ollama). |
+| `OLLAMA_MAX_LOADED_MODELS` | Limite no override Docker: `1` por padrão; aumente somente após medir VRAM, latência e fila. |
+| `OLLAMA_NUM_PARALLEL` | Requisições simultâneas por modelo: `1` por padrão; maior valor aumenta o cache de contexto em memória. |
+| `OLLAMA_MAX_QUEUE` | Fila do Ollama: `16` por padrão; evita espera sem limite prático sob saturação. |
+| `OLLAMA_HOST_BIND` | Interface publicada no host: `127.0.0.1` por padrão; os containers usam a rede Compose. |
 | `OLLAMA_RUNTIME` | `docker` ou `host` no macOS. |
 | `COMPOSE_FILE` | Manifests base e overrides gerados que todo comando Compose deve carregar. |
 | `OLLAMA_GPU_MODE` | `cpu`, `all`, `selected` ou `metal`. |
@@ -70,7 +74,7 @@ RAG_TOP_K_RERANKER=8
 
 Execute novamente `./install.sh` após alterações que exijam recriação dos serviços.
 
-O instalador gera `compose.ollama.yaml` com `OLLAMA_KEEP_ALIVE` e, ao selecionar residência indefinida, limita a dois modelos simultâneos com `OLLAMA_MAX_LOADED_MODELS=2`. Ao selecionar `q8_0`, o mesmo override recebe `OLLAMA_FLASH_ATTENTION=1` e `OLLAMA_KV_CACHE_TYPE=q8_0`. No modo host do macOS, os valores equivalentes são adicionados ao LaunchAgent.
+O instalador sugere 16.384 tokens para novas instalações e preserva o valor já salvo na reinstalação. O override Docker limita inicialmente um modelo carregado e uma requisição paralela, com fila de 16. Defina `OLLAMA_MAX_LOADED_MODELS`, `OLLAMA_NUM_PARALLEL` e `OLLAMA_MAX_QUEUE` no ambiente do Compose para dimensionamento após benchmark; reiniciar o instalador recria o override, mas preserva as referências às variáveis. Ao selecionar `q8_0`, recebe também `OLLAMA_FLASH_ATTENTION=1` e `OLLAMA_KV_CACHE_TYPE=q8_0`. No modo host do macOS, os limites conservadores são gravados no LaunchAgent.
 
 ## GPU NVIDIA
 

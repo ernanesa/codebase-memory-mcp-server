@@ -1,0 +1,87 @@
+{
+  "annotations": { "list": [] },
+  "description": "Métricas agregadas de autorização, cache, tokens, custo e latência. Painéis de tokens e custo mostram dados apenas quando os chamadores registrarem uso real; métricas ausentes não equivalem a zero.",
+  "editable": false,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 5, "w": 6, "x": 0, "y": 0 },
+      "id": 1,
+      "options": { "colorMode": "value", "graphMode": "area", "justifyMode": "center", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "value_and_name" },
+      "targets": [{ "expr": "sum(increase(cbm_rag_chunk_acl_total{result=\"denied\"}[$__range]))", "refId": "A" }],
+      "title": "Trechos rejeitados por ACL", "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "percentunit" }, "overrides": [] },
+      "gridPos": { "h": 5, "w": 6, "x": 6, "y": 0 },
+      "id": 2,
+      "options": { "colorMode": "value", "graphMode": "area", "justifyMode": "center", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "value_and_name" },
+      "targets": [{ "expr": "cbm:mcp_semantic_cache_hit_ratio:15m", "refId": "A" }],
+      "title": "Hit de cache MCP", "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "percentunit" }, "overrides": [] },
+      "gridPos": { "h": 5, "w": 6, "x": 12, "y": 0 },
+      "id": 3,
+      "options": { "colorMode": "value", "graphMode": "area", "justifyMode": "center", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "value_and_name" },
+      "targets": [{ "expr": "cbm:ai_input_cache_hit_ratio:15m", "refId": "A" }],
+      "title": "Tokens de entrada em cache no provedor", "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "currencyUSD" }, "overrides": [] },
+      "gridPos": { "h": 5, "w": 6, "x": 18, "y": 0 },
+      "id": 4,
+      "options": { "colorMode": "value", "graphMode": "area", "justifyMode": "center", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "value_and_name" },
+      "targets": [{ "expr": "cbm:ai_cost_usd:1h", "refId": "A" }],
+      "title": "Custo estimado na última hora", "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 5 },
+      "id": 5,
+      "options": { "legend": { "calcs": ["lastNotNull"], "displayMode": "table", "placement": "bottom", "showLegend": true } },
+      "targets": [{ "expr": "histogram_quantile(0.95, sum by (le, route) (rate(cbm_ai_latency_seconds_bucket[5m])))", "legendFormat": "{{route}} p95", "refId": "A" }],
+      "title": "Latência p95 por rota de IA", "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 5 },
+      "id": 6,
+      "options": { "legend": { "calcs": ["sum"], "displayMode": "table", "placement": "bottom", "showLegend": true } },
+      "targets": [{ "expr": "sum by (route, kind) (increase(cbm_ai_tokens_total[$__interval]))", "legendFormat": "{{route}} / {{kind}}", "refId": "A" }],
+      "title": "Tokens por rota e tipo", "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 13 },
+      "id": 7,
+      "options": { "legend": { "calcs": ["sum"], "displayMode": "table", "placement": "bottom", "showLegend": true } },
+      "targets": [{ "expr": "sum by (cache, result) (increase(mcp_guardrail_cache_events_total[$__interval]))", "legendFormat": "{{cache}} / {{result}}", "refId": "A" }],
+      "title": "Eventos de cache do MCP", "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 13 },
+      "id": 8,
+      "options": { "legend": { "calcs": ["sum"], "displayMode": "table", "placement": "bottom", "showLegend": true } },
+      "targets": [{ "expr": "sum by (result) (increase(cbm_rag_chunk_acl_total[$__interval]))", "legendFormat": "{{result}}", "refId": "A" }],
+      "title": "Decisões de ACL sobre trechos", "type": "timeseries"
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 41,
+  "tags": ["codebase-memory", "ai-efficiency", "provisioned"],
+  "templating": { "list": [] },
+  "time": { "from": "now-24h", "to": "now" },
+  "timezone": "browser",
+  "title": "Codebase Memory — Eficiência de IA",
+  "uid": "codebase-memory-ai-efficiency",
+  "version": 1
+}

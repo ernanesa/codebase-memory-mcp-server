@@ -1,6 +1,6 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
-import { evaluateCase, extractChatResult, summarize, validateDataset } from './lib.js';
+import { estimateCostUsd, evaluateCase, extractChatResult, summarize, validateDataset } from './lib.js';
 
 const datasetPath = path.resolve(process.argv[2] || 'datasets/example.json');
 const outputPath = path.resolve(process.argv[3] || 'reports/latest.json');
@@ -10,6 +10,11 @@ const fixtureResponses = responsesFile ? JSON.parse(await readFile(path.resolve(
 const baseUrl = String(process.env.OPENWEBUI_URL || 'http://localhost:3000').replace(/\/+$/, '');
 const model = process.env.RAG_EVAL_MODEL || '';
 const chatPath = process.env.RAG_EVAL_CHAT_PATH || '/api/chat/completions';
+const pricing = dataset.pricing || {
+  inputPerMillion: Number(process.env.RAG_EVAL_INPUT_USD_PER_MILLION || 0),
+  cachedInputPerMillion: Number(process.env.RAG_EVAL_CACHED_INPUT_USD_PER_MILLION || 0),
+  outputPerMillion: Number(process.env.RAG_EVAL_OUTPUT_USD_PER_MILLION || 0)
+};
 let token = process.env.OPENWEBUI_API_KEY || '';
 
 async function authenticate() {
@@ -49,12 +54,16 @@ async function query(testCase) {
   });
   const payload = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(`Open WebUI respondeu HTTP ${response.status}: ${payload.detail || payload.error || 'erro'}.`);
-  return extractChatResult(payload, Math.round(performance.now() - started));
+  const result = extractChatResult(payload, Math.round(performance.now() - started));
+  return { ...result, costUsd: estimateCostUsd(result, pricing) };
 }
 
 const results = [];
 for (const testCase of dataset.cases) {
-  try { results.push(evaluateCase(testCase, await query(testCase))); }
+  try {
+    const result = await query(testCase);
+    results.push(evaluateCase(testCase, { ...result, costUsd: Number.isFinite(result.costUsd) ? result.costUsd : estimateCostUsd(result, pricing) }));
+  }
   catch (error) { results.push(evaluateCase(testCase, { answer: '', citations: [], latencyMs: null, error: error.message })); results.at(-1).error = error.message; }
 }
 const summary = summarize(results);
@@ -64,4 +73,4 @@ await writeFile(outputPath, `${JSON.stringify(report, null, 2)}\n`);
 console.log(JSON.stringify(summary, null, 2));
 console.log(`Relatório: ${outputPath}`);
 const minimumPassRate = Number(process.env.RAG_EVAL_MIN_PASS_RATE || dataset.minimumPassRate || 0.8);
-if (summary.passRate < minimumPassRate) process.exitCode = 1;
+if (summary.passRate < minimumPassRate || summary.securityFailures > 0) process.exitCode = 1;

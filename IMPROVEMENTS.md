@@ -21,8 +21,8 @@ instalado. Não há migração automática de SQLite/Qdrant.
 
 O cliente de IA local do Codex fixa um modelo e endpoint diferentes do stack
 deste servidor. O roteador experimental não executa operações e não substitui
-autorização. Esses serviços, templates de trading e configuração Antigravity
-não foram importados por não serem capacidades do servidor atual.
+autorização. Serviços e configurações externos não foram importados por não
+serem capacidades do servidor atual.
 
 ## Correções operacionais
 

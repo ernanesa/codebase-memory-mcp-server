@@ -1,0 +1,181 @@
+{
+  "version": "1.1.0",
+  "tools": {
+    "allowedNames": [
+      "code_search_surgical",
+      "get_architecture",
+      "get_symbol_snippet",
+      "index_status",
+      "inspect_symbol",
+      "list_projects",
+      "trace_symbol"
+    ],
+    "facades": [
+      {
+        "name": "code_search_surgical",
+        "description": "Busca cirúrgica FTS5 no grafo de conhecimento do código (definições, métodos, funções, rotas e símbolos) com ranking BM25.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "project": {
+              "type": "string",
+              "description": "Nome do projeto/repositório indexado."
+            },
+            "query": {
+              "type": "string",
+              "description": "Termo de busca cirúrgica ou símbolo a localizar via FTS5/BM25."
+            },
+            "label": {
+              "type": "string",
+              "description": "Filtro opcional por tipo de nó (Function, Method, Class, Route, etc)."
+            },
+            "file_pattern": {
+              "type": "string",
+              "description": "Filtro opcional por padrão de caminho de arquivo."
+            },
+            "limit": {
+              "type": "number",
+              "minimum": 1,
+              "maximum": 50,
+              "description": "Limite máximo de resultados (padrão adaptativo, máximo 50)."
+            },
+            "include_tests": {
+              "type": "boolean",
+              "description": "Inclui arquivos de teste na resposta; padrão false para manter a busca de produção concisa."
+            },
+            "retrieval_mode": {
+              "type": "string",
+              "enum": [
+                "fast",
+                "balanced",
+                "thorough"
+              ],
+              "description": "Política opcional de recuperação aplicada somente à apresentação dos resultados."
+            },
+            "diversity_per_path": {
+              "type": "number",
+              "description": "Máximo opcional de evidências por arquivo quando retrieval_mode estiver definido."
+            }
+          },
+          "required": [
+            "project",
+            "query"
+          ]
+        }
+      },
+      {
+        "name": "trace_symbol",
+        "description": "Rastreamento cirúrgico de callers e callees de um símbolo no grafo, com supressão automática de arquivos e fixtures de teste.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "project": {
+              "type": "string",
+              "description": "Nome do projeto/repositório indexado."
+            },
+            "symbol": {
+              "type": "string",
+              "description": "Nome do símbolo ou função a ser rastreado."
+            },
+            "direction": {
+              "type": "string",
+              "enum": [
+                "both",
+                "callers",
+                "callees"
+              ],
+              "description": "Direção do rastreamento (padrão: both)."
+            },
+            "depth": {
+              "type": "number",
+              "description": "Profundidade máxima de saltos (padrão: 2)."
+            },
+            "include_tests": {
+              "type": "boolean",
+              "description": "Inclui referências a testes; padrão false."
+            }
+          },
+          "required": [
+            "project",
+            "symbol"
+          ]
+        }
+      },
+      {
+        "name": "get_symbol_snippet",
+        "description": "Recupera o código fonte e metadados essenciais de um símbolo, higienizado sem propriedades de AST redundantes ou vazias.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "project": {
+              "type": "string",
+              "description": "Nome do projeto/repositório indexado."
+            },
+            "symbol": {
+              "type": "string",
+              "description": "Nome do símbolo ou qualified_name."
+            },
+            "include_neighbors": {
+              "type": "boolean",
+              "description": "Se deve incluir nós vizinhos no grafo."
+            }
+          },
+          "required": [
+            "project",
+            "symbol"
+          ]
+        }
+      },
+      {
+        "name": "inspect_symbol",
+        "description": "Inspeção cirúrgica completa em 1 único passo: recupera o snippet de código-fonte, assinatura e callers/callees de produção.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "project": {
+              "type": "string",
+              "description": "Nome do projeto/repositório indexado."
+            },
+            "symbol": {
+              "type": "string",
+              "description": "Nome do símbolo, método ou função a inspecionar."
+            },
+            "include_neighbors": {
+              "type": "boolean",
+              "description": "Se deve incluir referências vizinhas no grafo (padrão: true)."
+            }
+          },
+          "required": [
+            "project",
+            "symbol"
+          ]
+        }
+      }
+    ]
+  },
+  "evidence": {
+    "metaKey": "codebase-memory/evidence",
+    "fields": {
+      "project": "string",
+      "status": [
+        "fresh",
+        "stale",
+        "unknown"
+      ],
+      "indexedCommit": "string|null",
+      "indexedAt": "string|null"
+    }
+  },
+  "retrieval": {
+    "chunkAcl": {
+      "policyVersion": "1",
+      "fields": {
+        "version": "string",
+        "denied": "number",
+        "legacy_project_bindings": "number",
+        "content_policy_version": "string",
+        "unsafe_content_rejected": "number"
+      }
+    }
+  }
+}

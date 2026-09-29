@@ -196,6 +196,8 @@ async function setupTestEnvironment(t, overrides = {}) {
     async listGithubRepositories() {
       return overrides.listGithubRepositories ? overrides.listGithubRepositories() : [];
     },
+    revalidateGithubRepository: overrides.revalidateGithubRepository,
+    revokeRepositorySource: overrides.revokeRepositorySource,
     async runWorkspaceSync(selectedWorkspace, source) {
       return {
         id: 'job-sync-1',
@@ -660,6 +662,66 @@ test('POST de repositórios rejeita workspace inexistente antes de consultar Git
   assert.equal(ctx.persisted, false);
 });
 
+test('aprovação manual corporativa é obrigatória antes de clonar um repositório', async t => {
+  const remote = { id: 101, name: 'api', fullName: 'empresa/api', cloneUrl: 'https://example.test/empresa/api.git' };
+  const { router, ctx } = await setupTestEnvironment(t, {
+    workspaces: [{ id: 'corporativo', name: 'Corporativo' }],
+    listGithubRepositories: async () => [remote]
+  });
+
+  await assert.rejects(
+    () => dispatch(router, 'POST', '/api/workspaces/corporativo/repositories', { body: { repositories: [remote.fullName] } }),
+    { message: 'A fonte do repositório não possui aprovação corporativa ativa.' }
+  );
+
+  const approval = await dispatch(router, 'POST', '/api/workspaces/corporativo/repository-approvals', {
+    body: { repository: remote.fullName, approvedBy: 'admin@empresa.test' }
+  });
+  assert.equal(approval.status, 201);
+  assert.equal(approval.json.approval.githubRepositoryId, '101');
+  assert.equal(ctx.state.workspaces[0].repositorySourceApprovals.length, 1);
+
+  const clone = await dispatch(router, 'POST', '/api/workspaces/corporativo/repositories', { body: { repositories: [remote.fullName] } });
+  assert.equal(clone.status, 202);
+  assert.equal(ctx.state.repositories[0].githubRepositoryId, '101');
+  assert.equal(ctx.state.repositories[0].sourceApproval.status, 'approved');
+});
+
+test('sync e index rejeitam fonte revogada ou sem aprovação corporativa', async t => {
+  const sourceApproval = {
+    status: 'revoked', workspaceId: 'corporativo', githubRepositoryId: '101', approvedBy: 'admin@empresa.test', approvedAt: new Date().toISOString()
+  };
+  const { router } = await setupTestEnvironment(t, {
+    workspaces: [{ id: 'corporativo', name: 'Corporativo' }],
+    repositories: [{ id: 'api', workspaceId: 'corporativo', githubRepositoryId: '101', sourceApproval, fullName: 'empresa/api' }]
+  });
+
+  for (const operation of ['sync', 'index']) {
+    await assert.rejects(
+      () => dispatch(router, 'POST', `/api/workspaces/corporativo/repositories/api/${operation}`),
+      { message: 'A fonte do repositório não possui aprovação corporativa ativa.' }
+    );
+  }
+});
+
+test('revogação da aprovação aguarda purge dos repositórios afetados antes de persistir', async t => {
+  const approval = {
+    status: 'approved', workspaceId: 'corporativo', githubRepositoryId: '101', approvedBy: 'admin@empresa.test', approvedAt: new Date().toISOString()
+  };
+  const revoked = [];
+  const { router, ctx } = await setupTestEnvironment(t, {
+    workspaces: [{ id: 'corporativo', name: 'Corporativo', repositorySourceApprovals: [approval] }],
+    repositories: [{ id: 'api', workspaceId: 'corporativo', githubRepositoryId: '101', sourceApproval: approval, fullName: 'empresa/api' }],
+    revokeRepositorySource: async (repository, reason) => { revoked.push({ id: repository.id, reason }); }
+  });
+
+  const response = await dispatch(router, 'DELETE', '/api/workspaces/corporativo/repository-approvals/101');
+  assert.equal(response.status, 200);
+  assert.deepEqual(revoked, [{ id: 'api', reason: 'corporate_source_approval_revoked' }]);
+  assert.equal(ctx.state.workspaces[0].repositorySourceApprovals[0].status, 'revoked');
+  assert.equal(ctx.state.repositories[0].sourceApproval.status, 'revoked');
+});
+
 // ---------------------------------------------------------------------------
 // 1.2 OPERAÇÕES AUXILIARES DE WORKSPACE (jobs, sync, index)
 // ---------------------------------------------------------------------------
@@ -670,6 +732,8 @@ test('Operações de execução e jobs em workspaces e repositórios', async t =
     id: 'repo-sub',
     accessId: 'acc-sub',
     workspaceId: 'job-ws',
+    githubRepositoryId: '101',
+    sourceApproval: { status: 'approved', workspaceId: 'job-ws', githubRepositoryId: '101', approvedBy: 'admin@empresa.test', approvedAt: new Date().toISOString() },
     name: 'repo-sub',
     fullName: 'org/repo-sub',
     path: path.join(os.tmpdir(), 'cbm-sub-repo')
@@ -679,7 +743,8 @@ test('Operações de execução e jobs em workspaces e repositórios', async t =
 
   const { router, ctx } = await setupTestEnvironment(t, {
     workspaces: [ws],
-    repositories: [repo]
+    repositories: [repo],
+    revalidateGithubRepository: async () => ({ id: 101, cloneUrl: 'https://example.test/empresa/repo-sub.git' })
   });
 
   // Schedule run

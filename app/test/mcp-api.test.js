@@ -105,12 +105,23 @@ test('API cria, revoga, reativa e exclui usuários no AgentGateway', async t => 
   await mkdir(path.join(appDataDirectory, 'secrets'), { recursive: true });
   await writeFile(path.join(appDataDirectory, 'secrets', 'admin-jwt-secret'), `${'a'.repeat(64)}\n`);
   await writeFile(path.join(appDataDirectory, 'state.json'), JSON.stringify({
-    workspaces: [{ id: 'plataforma', name: 'Plataforma', updateSchedule: { enabled: false, cron: '0 * * * *', timezone: 'America/Maceio', lastRunAt: null, lastRunStatus: null }, createdAt: '2026-01-01T00:00:00.000Z' }],
+    workspaces: [{
+      id: 'plataforma',
+      name: 'Plataforma',
+      updateSchedule: { enabled: false, cron: '0 * * * *', timezone: 'America/Maceio', lastRunAt: null, lastRunStatus: null },
+      repositorySourceApprovals: [
+        { status: 'approved', workspaceId: 'plataforma', githubRepositoryId: '101', approvedBy: 'admin@empresa.test', approvedAt: '2026-01-01T00:00:00.000Z' },
+        { status: 'approved', workspaceId: 'plataforma', githubRepositoryId: '102', approvedBy: 'admin@empresa.test', approvedAt: '2026-01-01T00:00:00.000Z' }
+      ],
+      createdAt: '2026-01-01T00:00:00.000Z'
+    }],
     repositories: [
       {
         id: 'api',
         accessId: 'repository-access-1',
         workspaceId: 'plataforma',
+        githubRepositoryId: '101',
+        sourceApproval: { status: 'approved', workspaceId: 'plataforma', githubRepositoryId: '101', approvedBy: 'admin@empresa.test', approvedAt: '2026-01-01T00:00:00.000Z' },
         name: 'api',
         fullName: 'empresa/api',
         path: path.join(directory, 'repositories', 'plataforma', 'api'),
@@ -121,6 +132,8 @@ test('API cria, revoga, reativa e exclui usuários no AgentGateway', async t => 
         id: 'worker',
         accessId: 'repository-access-2',
         workspaceId: 'plataforma',
+        githubRepositoryId: '102',
+        sourceApproval: { status: 'approved', workspaceId: 'plataforma', githubRepositoryId: '102', approvedBy: 'admin@empresa.test', approvedAt: '2026-01-01T00:00:00.000Z' },
         name: 'worker',
         fullName: 'empresa/worker',
         path: path.join(directory, 'repositories', 'plataforma', 'worker'),

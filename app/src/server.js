@@ -13,8 +13,9 @@ import { JOB_HISTORY_RETENTION_DAYS, JOB_LOG_MAX_CHARACTERS, loadJobHistory, pag
 import { createRouter } from './router.js';
 import { json, textResponse, redirect, requestOriginAllowed, clientAddress, secureRequest } from './http.js';
 import { register as registerAuth } from './routes/auth.js';
+import { register as registerAiPolicy } from './routes/ai-policy.js';
 import { register as registerHealth } from './routes/health.js';
-import { register as registerGithub } from './routes/github.js';
+import { register as registerGithub, revalidateApprovedCorporateSource } from './routes/github.js';
 import { register as registerJobs } from './routes/jobs.js';
 import { register as registerKnowledgeSync } from './routes/knowledge-sync.js';
 import { register as registerMcpUsers } from './routes/mcp-users.js';
@@ -375,7 +376,7 @@ function mcpAccess(userId) {
     const selectedWorkspace = state.workspaces.find(item => item.id === workspaceId && item.mcpCredential?.status === 'active');
     if (!selectedWorkspace) return null;
     const allowedProjects = new Set(state.repositories
-      .filter(item => item.workspaceId === workspaceId && knownProjects.has(item.project))
+      .filter(item => item.workspaceId === workspaceId && item.sourceApproval?.status === 'approved' && knownProjects.has(item.project))
       .map(item => item.project));
     return { system: false, allowedProjects, knownProjects, projectEvidence: new Map([...evidence].filter(([project]) => allowedProjects.has(project))) };
   }
@@ -383,7 +384,7 @@ function mcpAccess(userId) {
   if (!user) return null;
   const allowedRepositoryIds = new Set(user.repositoryIds || []);
   const allowedProjects = new Set(state.repositories
-    .filter(item => allowedRepositoryIds.has(item.accessId) && knownProjects.has(item.project))
+    .filter(item => allowedRepositoryIds.has(item.accessId) && item.sourceApproval?.status === 'approved' && knownProjects.has(item.project))
     .map(item => item.project));
   return { system: false, allowedProjects, knownProjects, projectEvidence: new Map([...evidence].filter(([project]) => allowedProjects.has(project))) };
 }
@@ -394,6 +395,8 @@ async function commitMcpUserStoreOnly(nextStore) {
   try {
     await saveMcpUserStore(MCP_USERS_FILE, nextStore);
     mcpUserStore = nextStore;
+    // Permission changes must take effect even for cached read responses.
+    clearSemanticCache();
   } finally {
     mcpUserMutation = false;
   }
@@ -437,6 +440,9 @@ async function commitMcpUserChange(nextStore, changeGatewayConfig) {
       throw error;
     }
     mcpUserStore = nextStore;
+    // Token/repository grants and revocations change the authorized response
+    // surface, so do not retain entries from the previous access state.
+    clearSemanticCache();
   } finally {
     mcpUserMutation = false;
   }
@@ -649,6 +655,42 @@ async function listGithubRepositories() {
   return githubCache.repositories;
 }
 
+async function revalidateGithubRepository(repositoryId) {
+  const remote = await github(`/repositories/${encodeURIComponent(String(repositoryId))}`);
+  return {
+    id: remote.id,
+    name: remote.name,
+    fullName: remote.full_name,
+    description: remote.description,
+    private: remote.private,
+    archived: remote.archived,
+    language: remote.language,
+    defaultBranch: remote.default_branch,
+    updatedAt: remote.updated_at,
+    cloneUrl: remote.clone_url
+  };
+}
+
+async function revalidateRepositorySource(item) {
+  return revalidateApprovedCorporateSource({ githubToken, revalidateGithubRepository }, item);
+}
+
+async function revokeRepositorySource(item, reason = 'source_revoked') {
+  // Deleting the index first prevents a revoked source from being retrievable
+  // if removing its local clone later fails. This is invoked only by the
+  // explicit source-revocation route, never during ordinary synchronization.
+  if (item.project) await run(CBM_BIN, ['cli', 'delete_project', JSON.stringify({ project: item.project })]);
+  await rm(item.path, { recursive: true, force: true });
+  item.status = 'revoked';
+  item.syncStatus = 'revoked';
+  item.revokedAt = new Date().toISOString();
+  item.revocationReason = reason;
+  delete item.project;
+  delete item.indexedCommit;
+  delete item.currentCommit;
+  clearSemanticCache();
+}
+
 function createJob(type, label, lockKey, operation) {
   if (locks.has(lockKey)) throw new Error('Já existe uma operação em andamento para este recurso.');
   const job = { id: randomUUID(), type, label, status: 'queued', progress: 0, log: '', createdAt: new Date().toISOString() };
@@ -726,6 +768,7 @@ function pumpSyncQueue() {
         scheduleJobHistoryPersistence();
       };
       try {
+        await revalidateRepositorySource(item);
         const previousCommit = (await run('git', ['rev-parse', 'HEAD'], { cwd: item.path })).stdout.trim();
         await run('git', ['pull', '--ff-only'], { cwd: item.path, env: gitAuthEnvironment(githubToken), onOutput: log });
         const currentCommit = (await run('git', ['rev-parse', 'HEAD'], { cwd: item.path })).stdout.trim();
@@ -796,6 +839,7 @@ function enqueueRepositorySync(item, { source = 'manual', parentJobId = null, de
 }
 
 async function indexRepository(item, log) {
+  await revalidateRepositorySource(item);
   item.status = 'indexing';
   const readRevision = async () => {
     const [commit, worktree] = await Promise.all([
@@ -989,6 +1033,8 @@ const ctx = {
   issueWorkspaceMcpCredential,
   workspacePrincipal,
   listGithubRepositories,
+  revalidateGithubRepository,
+  revokeRepositorySource,
   indexRepository,
   locks,
   activeWorkspaceSyncs,
@@ -998,6 +1044,7 @@ const ctx = {
 };
 
 registerAuth(router, ctx);
+registerAiPolicy(router, ctx);
 registerHealth(router, ctx);
 registerGithub(router, ctx);
 registerJobs(router, ctx);

@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { Readable } from 'node:stream';
 import { createRouter } from '../src/router.js';
-import { register, github, listGithubRepositories } from '../src/routes/github.js';
+import { assertApprovedCorporateSource, register, github, listGithubRepositories, revalidateApprovedCorporateSource } from '../src/routes/github.js';
 
 function createMockResponse() {
   return {
@@ -35,6 +35,27 @@ test('github helper valida token obrigatório', async () => {
   await assert.rejects(
     async () => github('/user', null),
     { message: 'Conecte o GitHub primeiro.' }
+  );
+});
+
+test('fonte corporativa requer aprovação ativa e revalida o ID estável', async () => {
+  const repository = {
+    workspaceId: 'plataforma',
+    githubRepositoryId: '101',
+    sourceApproval: {
+      status: 'approved', workspaceId: 'plataforma', githubRepositoryId: '101', approvedBy: 'admin@empresa.test', approvedAt: '2026-09-29T00:00:00.000Z'
+    }
+  };
+  assert.equal(assertApprovedCorporateSource(repository, 'plataforma').githubRepositoryId, '101');
+  const remote = await revalidateApprovedCorporateSource({ revalidateGithubRepository: async () => ({ id: 101, cloneUrl: 'https://example.test/empresa/api.git' }) }, repository);
+  assert.equal(remote.id, 101);
+  await assert.rejects(
+    () => revalidateApprovedCorporateSource({ revalidateGithubRepository: async () => ({ id: 102 }) }, repository),
+    { message: 'A fonte revalidada não corresponde ao repositório aprovado.' }
+  );
+  assert.throws(
+    () => assertApprovedCorporateSource({ ...repository, sourceApproval: { ...repository.sourceApproval, status: 'revoked' } }, 'plataforma'),
+    { message: 'A fonte do repositório não possui aprovação corporativa ativa.' }
   );
 });
 

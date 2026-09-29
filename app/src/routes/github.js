@@ -10,6 +10,61 @@ const GITHUB_API_VERSION = '2022-11-28';
 const USER_AGENT = 'codebase-memory-admin';
 const CACHE_TTL_MS = 120_000; // 2 minutos
 
+function publicGithubRepository(item) {
+  return {
+    id: item.id,
+    name: item.name,
+    fullName: item.full_name,
+    description: item.description,
+    private: item.private,
+    archived: item.archived,
+    language: item.language,
+    defaultBranch: item.default_branch,
+    updatedAt: item.updated_at,
+    cloneUrl: item.clone_url
+  };
+}
+
+/**
+ * Exige uma aprovação corporativa explícita, vinculada ao workspace e ao ID
+ * imutável do GitHub. Entradas antigas ou incompletas falham fechadas.
+ * @param {object} repository
+ * @param {string} workspaceId
+ * @returns {object}
+ */
+export function assertApprovedCorporateSource(repository, workspaceId) {
+  const approval = repository?.sourceApproval;
+  const repositoryId = String(repository?.githubRepositoryId ?? '');
+  if (
+    !repositoryId ||
+    approval?.status !== 'approved' ||
+    approval.workspaceId !== workspaceId ||
+    String(approval.githubRepositoryId ?? '') !== repositoryId ||
+    !approval.approvedBy ||
+    !approval.approvedAt
+  ) {
+    throw new Error('A fonte do repositório não possui aprovação corporativa ativa.');
+  }
+  return approval;
+}
+
+/**
+ * Revalida no GitHub a fonte aprovada antes de operações mutáveis.
+ * @param {object} ctx
+ * @param {object} repository
+ * @returns {Promise<object>}
+ */
+export async function revalidateApprovedCorporateSource(ctx, repository) {
+  assertApprovedCorporateSource(repository, repository?.workspaceId);
+  const remote = typeof ctx?.revalidateGithubRepository === 'function'
+    ? await ctx.revalidateGithubRepository(repository.githubRepositoryId)
+    : publicGithubRepository(await github(`/repositories/${repository.githubRepositoryId}`, ctx?.github?.token ?? ctx?.githubToken));
+  if (String(remote.id) !== String(repository.githubRepositoryId)) {
+    throw new Error('A fonte revalidada não corresponde ao repositório aprovado.');
+  }
+  return remote;
+}
+
 /**
  * Faz uma requisição autenticada à API do GitHub.
  * @param {string} endpoint
@@ -71,18 +126,7 @@ export async function listGithubRepositories(ctx) {
     if (items.length < 100) break;
   }
 
-  const repositories = all.map(item => ({
-    id: item.id,
-    name: item.name,
-    fullName: item.full_name,
-    description: item.description,
-    private: item.private,
-    archived: item.archived,
-    language: item.language,
-    defaultBranch: item.default_branch,
-    updatedAt: item.updated_at,
-    cloneUrl: item.clone_url
-  })).sort((a, b) => (a.fullName || '').localeCompare(b.fullName || ''));
+  const repositories = all.map(publicGithubRepository).sort((a, b) => (a.fullName || '').localeCompare(b.fullName || ''));
 
   if (typeof ctx === 'object' && ctx !== null) {
     if (!ctx.github) ctx.github = {};

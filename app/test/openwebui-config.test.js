@@ -336,14 +336,14 @@ test('instalador sugere Gemma 4, fixa Ollama 0.32.1 e bootstrap usa o contrato a
   const compose = await readFile(path.join(root, 'compose.yaml'), 'utf8');
   assert.match(install, /OLLAMA_VERSION='0\.32\.1'/);
   assert.match(install, /OLLAMA_CHAT_MODEL='gemma4:e2b'/);
-  assert.match(install, /OLLAMA_CONTEXT_LENGTH='64000'/);
+  assert.match(install, /OLLAMA_CONTEXT_LENGTH='16384'/);
   assert.match(install, /DOCLING_VERSION='v1\.26\.0'/);
   assert.match(install, /DOCLING_CPU_THREADS='6'/);
   assert.match(install, /RAG_RERANKING_MODEL='BAAI\/bge-reranker-v2-m3'/);
   assert.match(install, /gemma4:e4b \(Gemma 4 Effective 4B\)/);
   assert.match(compose, /OLLAMA_VERSION:-0\.34\.2/);
   assert.match(compose, /OLLAMA_CHAT_MODEL:-gemma4:e2b/);
-  assert.match(compose, /OLLAMA_CONTEXT_LENGTH:-64000/);
+  assert.match(compose, /OLLAMA_CONTEXT_LENGTH:-16384/);
   assert.match(install, /ask_ollama_model/);
   assert.match(install, /ask_ollama_context_length/);
   assert.match(install, /ask_ollama_quantization/);
@@ -474,7 +474,7 @@ test('seletor de quantização usa fp16 por padrão e preserva q8_0 na reinstala
   }
 });
 
-test('seletor de contexto usa 64000 por padrão e preserva o valor na reinstalação', async () => {
+test('seletor de contexto usa 16384 por padrão e preserva o valor na reinstalação', async () => {
   const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), 'cbm-ollama-context-install-'));
   try {
     await copyFile(path.join(root, 'install.sh'), path.join(temporaryRoot, 'install.sh'));
@@ -487,7 +487,7 @@ test('seletor de contexto usa 64000 por padrão e preserva o valor na reinstala�
       ask_ollama_context_length <<< $'\\n'
       printf '%s\\n' "$OLLAMA_CONTEXT_LENGTH" >>"$2"
     `, 'test', path.join(temporaryRoot, 'install.sh'), selectionFile]);
-    assert.equal(await readFile(selectionFile, 'utf8'), '64000\n128000\n');
+    assert.equal(await readFile(selectionFile, 'utf8'), '16384\n128000\n');
   } finally {
     await rm(temporaryRoot, { recursive: true, force: true });
   }
@@ -509,8 +509,10 @@ test('override persiste residência dos modelos e adiciona quantização somente
     assert.match(override, /OLLAMA_FLASH_ATTENTION: "1"/);
     assert.match(override, /OLLAMA_KV_CACHE_TYPE: q8_0/);
     assert.match(override, /OLLAMA_KEEP_ALIVE: "-1"/);
-    assert.match(override, /OLLAMA_CONTEXT_LENGTH: "64000"/);
-    assert.match(override, /OLLAMA_MAX_LOADED_MODELS: "3"/);
+    assert.match(override, /OLLAMA_CONTEXT_LENGTH: "16384"/);
+    assert.match(override, /OLLAMA_MAX_LOADED_MODELS: "\$\{OLLAMA_MAX_LOADED_MODELS:-1\}"/);
+    assert.match(override, /OLLAMA_NUM_PARALLEL: "\$\{OLLAMA_NUM_PARALLEL:-1\}"/);
+    assert.match(override, /OLLAMA_MAX_QUEUE: "\$\{OLLAMA_MAX_QUEUE:-16\}"/);
 
     await execFileAsync('bash', ['-c', `
       source "$1"
@@ -521,7 +523,8 @@ test('override persiste residência dos modelos e adiciona quantização somente
     `, 'test', path.join(temporaryRoot, 'install.sh')]);
     const fp16Override = await readFile(path.join(temporaryRoot, 'compose.ollama.yaml'), 'utf8');
     assert.match(fp16Override, /OLLAMA_KEEP_ALIVE: "30m"/);
-    assert.doesNotMatch(fp16Override, /OLLAMA_MAX_LOADED_MODELS|OLLAMA_FLASH_ATTENTION|OLLAMA_KV_CACHE_TYPE/);
+    assert.match(fp16Override, /OLLAMA_MAX_LOADED_MODELS/);
+    assert.doesNotMatch(fp16Override, /OLLAMA_FLASH_ATTENTION|OLLAMA_KV_CACHE_TYPE/);
 
     const compose = await readFile(path.join(root, 'compose.yaml'), 'utf8');
     assert.doesNotMatch(compose, /OLLAMA_FLASH_ATTENTION|OLLAMA_KV_CACHE_TYPE/);
@@ -564,7 +567,7 @@ test('reinstalação grava e preserva OLLAMA_VERSION no ambiente', async () => {
     const environment = await readFile(path.join(temporaryRoot, '.env'), 'utf8');
     assert.match(environment, /^OLLAMA_VERSION=0\.31\.2$/m);
     assert.match(environment, /^OLLAMA_CHAT_MODEL=gemma4:e2b$/m);
-    assert.match(environment, /^OLLAMA_CONTEXT_LENGTH=64000$/m);
+    assert.match(environment, /^OLLAMA_CONTEXT_LENGTH=16384$/m);
     assert.match(environment, /^OLLAMA_KV_CACHE_QUANTIZATION=fp16$/m);
     assert.match(environment, /^OLLAMA_KEEP_ALIVE=5m$/m);
     assert.match(environment, /^OLLAMA_RUNTIME=docker$/m);
@@ -707,7 +710,7 @@ test('ambiente persiste os overrides do Compose usados para GPU e quantização 
     assert.match(environment, /^OLLAMA_KEEP_ALIVE=-1$/m);
     const ollamaOverride = await readFile(path.join(temporaryRoot, 'compose.ollama.yaml'), 'utf8');
     assert.match(ollamaOverride, /OLLAMA_KEEP_ALIVE: "-1"/);
-    assert.match(ollamaOverride, /OLLAMA_MAX_LOADED_MODELS: "3"/);
+    assert.match(ollamaOverride, /OLLAMA_MAX_LOADED_MODELS: "\$\{OLLAMA_MAX_LOADED_MODELS:-1\}"/);
   } finally {
     await rm(temporaryRoot, { recursive: true, force: true });
   }
@@ -794,8 +797,10 @@ test('modo host registra um LaunchAgent persistente para o Ollama', async () => 
     assert.match(launchAgent, /<key>OLLAMA_FLASH_ATTENTION<\/key>\s*<string>1<\/string>/);
     assert.match(launchAgent, /<key>OLLAMA_KV_CACHE_TYPE<\/key>\s*<string>q8_0<\/string>/);
     assert.match(launchAgent, /<key>OLLAMA_KEEP_ALIVE<\/key>\s*<string>-1<\/string>/);
-    assert.match(launchAgent, /<key>OLLAMA_CONTEXT_LENGTH<\/key>\s*<string>64000<\/string>/);
-    assert.match(launchAgent, /<key>OLLAMA_MAX_LOADED_MODELS<\/key>\s*<string>3<\/string>/);
+    assert.match(launchAgent, /<key>OLLAMA_CONTEXT_LENGTH<\/key>\s*<string>16384<\/string>/);
+    assert.match(launchAgent, /<key>OLLAMA_MAX_LOADED_MODELS<\/key>\s*<string>1<\/string>/);
+    assert.match(launchAgent, /<key>OLLAMA_NUM_PARALLEL<\/key>\s*<string>1<\/string>/);
+    assert.match(launchAgent, /<key>OLLAMA_MAX_QUEUE<\/key>\s*<string>16<\/string>/);
     assert.match(launchAgent, /<key>RunAtLoad<\/key>\s*<true\/>/);
     assert.match(launchAgent, /<key>KeepAlive<\/key>\s*<true\/>/);
   } finally {

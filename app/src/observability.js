@@ -1,9 +1,50 @@
+import { estimateAiCost, MODEL_ROUTES } from './ai-governance.js';
+
 const counters = new Map();
 const gauges = new Map();
 const histograms = new Map();
 const bucketConfigs = new Map();
 
 const DEFAULT_HISTOGRAM_BUCKETS = [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10];
+
+function boundedLabel(value, fallback = 'unknown') {
+  const normalized = String(value || fallback).replace(/[^a-zA-Z0-9_.-]/g, '_').slice(0, 64);
+  return normalized || fallback;
+}
+
+function nonNegative(value) {
+  return Number.isFinite(value) && value >= 0 ? value : 0;
+}
+
+/**
+ * Aggregate-only LLM accounting. Never pass prompt, completion, repository,
+ * identity, token or request id here: Prometheus labels are retained data.
+ */
+export function recordAiUsage({ route, inputTokens, outputTokens, cachedInputTokens, estimatedCostUsd, latencyMs, outcome = 'unknown', cacheHit } = {}) {
+  const safeRoute = MODEL_ROUTES.includes(route) ? route : 'unknown';
+  const safeOutcome = ['success', 'error', 'cancelled', 'unknown'].includes(outcome) ? outcome : 'unknown';
+  const labels = { route: safeRoute, outcome: safeOutcome };
+  const input = Number.isSafeInteger(inputTokens) && inputTokens >= 0 ? inputTokens : 0;
+  const output = Number.isSafeInteger(outputTokens) && outputTokens >= 0 ? outputTokens : 0;
+  const cached = Number.isSafeInteger(cachedInputTokens) && cachedInputTokens >= 0 ? Math.min(cachedInputTokens, input) : 0;
+  increment('cbm_ai_requests_total', labels);
+  increment('cbm_ai_tokens_total', { ...labels, kind: 'input' }, input);
+  increment('cbm_ai_tokens_total', { ...labels, kind: 'output' }, output);
+  increment('cbm_ai_tokens_total', { ...labels, kind: 'cached_input' }, cached);
+  const estimatedCost = Number.isFinite(estimatedCostUsd) && estimatedCostUsd >= 0 && estimatedCostUsd <= 1_000_000
+    ? estimatedCostUsd
+    : estimateAiCost({ route: safeRoute, inputTokens: input, outputTokens: output, cachedInputTokens: cached });
+  if (estimatedCost !== null) increment('cbm_ai_cost_usd_estimated_total', labels, nonNegative(estimatedCost));
+  if (Number.isFinite(latencyMs) && latencyMs >= 0 && latencyMs <= 3_600_000) observe('cbm_ai_latency_seconds', latencyMs / 1_000, labels);
+  if (typeof cacheHit === 'boolean') {
+    increment('cbm_ai_cache_events_total', { route: safeRoute, result: cacheHit ? 'hit' : 'miss' });
+  }
+}
+
+export function recordChunkAcl({ allowed = 0, denied = 0 } = {}) {
+  increment('cbm_rag_chunk_acl_total', { result: 'allowed' }, nonNegative(allowed));
+  increment('cbm_rag_chunk_acl_total', { result: 'denied' }, nonNegative(denied));
+}
 
 export function configureBuckets(name, buckets) {
   bucketConfigs.set(name, buckets);

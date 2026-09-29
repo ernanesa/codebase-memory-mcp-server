@@ -1,0 +1,7 @@
+{
+  "maxPassRateDrop": 0,
+  "maxP95LatencyGrowth": 0.2,
+  "maxCostGrowth": 0.2,
+  "maxInputTokenGrowth": 0.2,
+  "maxOutputTokenGrowth": 0.2
+}

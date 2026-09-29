@@ -1,0 +1,46 @@
+name: RAG evaluation contract
+
+on:
+  push:
+    paths:
+      - 'rag-eval/**'
+      - 'RAG-EVALUATION.md'
+      - '.github/workflows/rag-evaluation.yml'
+  pull_request:
+    paths:
+      - 'rag-eval/**'
+      - 'RAG-EVALUATION.md'
+      - '.github/workflows/rag-evaluation.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rag-evaluation-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  synthetic-evaluation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '26'
+      - name: Test evaluator
+        working-directory: rag-eval
+        run: npm test
+      - name: Evaluate synthetic baseline
+        working-directory: rag-eval
+        env:
+          RAG_EVAL_RESPONSES_FILE: fixtures/baseline-responses.json
+        run: npm run evaluate -- datasets/example.json reports/baseline.json
+      - name: Evaluate synthetic candidate
+        working-directory: rag-eval
+        env:
+          RAG_EVAL_RESPONSES_FILE: fixtures/responses.json
+        run: npm run evaluate -- datasets/example.json reports/candidate.json
+      - name: Fail on quality, security, cost, or latency regression
+        working-directory: rag-eval
+        run: npm run compare -- reports/baseline.json reports/candidate.json regression-policy.json

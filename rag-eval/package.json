@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "evaluate": "node src/run.js",
+    "compare": "node src/compare.js",
     "test": "node --test"
   },
   "engines": {

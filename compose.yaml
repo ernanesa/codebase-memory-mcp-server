@@ -146,7 +146,7 @@ services:
     volumes:
       - ollama-data:/root/.ollama
     ports:
-      - "11434:11434"
+      - "${OLLAMA_HOST_BIND:-127.0.0.1}:11434:11434"
     healthcheck:
       test: ["CMD", "ollama", "list"]
       interval: 10s
@@ -238,7 +238,7 @@ services:
       OLLAMA_URL: "${OLLAMA_BASE_URL:-http://ollama:11434}"
       OLLAMA_CHAT_MODEL: "${OLLAMA_CHAT_MODEL:-gemma4:e2b}"
       OLLAMA_BUSINESS_MODEL: "${OLLAMA_BUSINESS_MODEL:-ornith15-9b-ad:latest}"
-      OLLAMA_CONTEXT_LENGTH: "${OLLAMA_CONTEXT_LENGTH:-64000}"
+      OLLAMA_CONTEXT_LENGTH: "${OLLAMA_CONTEXT_LENGTH:-16384}"
       OLLAMA_CODE_CONTEXT_LENGTH: "${OLLAMA_CODE_CONTEXT_LENGTH:-16384}"
       OLLAMA_BUSINESS_CONTEXT_LENGTH: "${OLLAMA_BUSINESS_CONTEXT_LENGTH:-16384}"
       OLLAMA_CODE_NUM_GPU: "${OLLAMA_CODE_NUM_GPU:-48}"
@@ -296,6 +296,7 @@ services:
     command: ["--config.file=/etc/prometheus/prometheus.yml", "--storage.tsdb.path=/prometheus", "--storage.tsdb.retention.time=30d"]
     volumes:
       - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/ai-alerts.yml:/etc/prometheus/ai-alerts.yml:ro
       - prometheus-data:/prometheus
     expose:
       - "9090"

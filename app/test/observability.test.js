@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { increment, observe, metricsText } from '../src/observability.js';
+import { increment, observe, metricsText, recordAiUsage, recordChunkAcl } from '../src/observability.js';
 
 test('equivalent admin labels aggregate counters and histograms', () => {
   increment('admin_labels_test', { a: 'x', b: 'y' });
@@ -18,4 +18,22 @@ test('equivalent admin labels aggregate counters and histograms', () => {
 test('admin label newlines stay within a single exposition line', () => {
   increment('admin_escape_test', { value: 'one\ntwo\r"\\' });
   assert.ok(metricsText().includes('value="one\\ntwo\\n\\"\\\\"'));
+});
+
+test('telemetria de IA e ACL mantém somente rótulos agregados e valores numéricos', () => {
+  recordAiUsage({ route: 'hosted_general', inputTokens: 10, outputTokens: 4, cachedInputTokens: 3, estimatedCostUsd: 0.002, latencyMs: 20, outcome: 'success', cacheHit: true });
+  recordChunkAcl({ allowed: 2, denied: 1 });
+  const output = metricsText();
+  assert.match(output, /cbm_ai_tokens_total\{kind="input",outcome="success",route="hosted_general"\} 10/);
+  assert.match(output, /cbm_ai_cost_usd_estimated_total\{outcome="success",route="hosted_general"\} 0.002/);
+  assert.match(output, /cbm_ai_cache_events_total\{result="hit",route="hosted_general"\} 1/);
+  assert.match(output, /cbm_rag_chunk_acl_total\{result="denied"\} 1/);
+});
+
+test('telemetria de IA restringe labels e limites de tokens', () => {
+  recordAiUsage({ route: 'employee prompt text', inputTokens: 8, cachedInputTokens: 40, outputTokens: -2, outcome: 'customer-123' });
+  const output = metricsText();
+  assert.match(output, /cbm_ai_tokens_total\{kind="cached_input",outcome="unknown",route="unknown"\} 8/);
+  assert.match(output, /cbm_ai_tokens_total\{kind="output",outcome="unknown",route="unknown"\} 0/);
+  assert.doesNotMatch(output, /employee prompt text|customer-123/);
 });

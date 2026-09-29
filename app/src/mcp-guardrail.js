@@ -4,14 +4,27 @@ import { createHash, timingSafeEqual } from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { increment as incrementMetric, observe as observeMetric } from './observability.js';
+import { increment as incrementMetric, observe as observeMetric, recordChunkAcl } from './observability.js';
 import { buildProvenance, diversifyCandidates, planRetrieval } from './retrieval-policy.js';
+import { CHUNK_ACL_POLICY_VERSION, filterAuthorizedChunks } from './ai-governance.js';
 
 const listProjectsCache = new Map();
 const LIST_PROJECTS_CACHE_TTL_MS = 30_000;
 const MAX_LIST_PROJECTS_CACHE_ENTRIES = 128;
 const MAX_LIST_PROJECTS_CACHE_BYTES = 512 * 1024;
 const MAX_CACHED_RESPONSE_BYTES = 64 * 1024;
+// Search results eventually become model context. Keep the boundary small and
+// structured: the backend is evidence, never an instruction channel.
+const RETRIEVAL_CONTENT_POLICY_VERSION = '1';
+const MAX_SEARCH_RESULT_COUNT = 20;
+const MAX_SEARCH_FIELD_LENGTH = 512;
+const MAX_SEARCH_PATH_LENGTH = 1_024;
+const SEARCH_RESULT_FIELDS = new Set([
+  'id', 'node_id', 'nodeId', 'name', 'symbol', 'qualified_name', 'label', 'type',
+  'path', 'file_path', 'file', 'location', 'heading', 'language', 'chunkId', 'chunk_id',
+  'start_line', 'end_line', 'line', 'ordinal', 'score'
+]);
+const RETRIEVAL_INJECTION_PATTERN = /(?:\b(?:ignore|disregard|override|bypass)\b.{0,80}\b(?:previous|prior|system|developer|instruction|rule)s?\b|\b(?:system|developer)\s+(?:message|prompt|instruction)s?\b|\b(?:reveal|exfiltrate|send|upload)\b.{0,80}\b(?:secret|token|credential|password|api[ _-]?key)\b)/i;
 let listProjectsCacheBytes = 0;
 
 // LRU Semantic Response Cache para tools determinísticas (snippets, architecture, traces, searches)
@@ -98,7 +111,9 @@ export function semanticCacheKey(toolName, args, access, evidence = null) {
   if (!toolName || !args || typeof args !== 'object') return null;
   const scope = accessScopeCacheKey(access);
   if (!scope) return null;
-  return `${toolName}:${scope}:${stableSerialize(args)}:${stableSerialize(evidence)}`;
+  // ACL policy is part of cache identity. A policy rollout can therefore never
+  // reuse a response generated under weaker chunk-authorization semantics.
+  return `acl:${CHUNK_ACL_POLICY_VERSION}:content:${RETRIEVAL_CONTENT_POLICY_VERSION}:${toolName}:${scope}:${stableSerialize(args)}:${stableSerialize(evidence)}`;
 }
 
 function evidenceForProject(access, project) {
@@ -130,11 +145,72 @@ function cacheArguments(callArgs, metadata) {
     : callArgs;
 }
 
-function applySearchResultPolicy(target, { includeTests = false, policy = null, diversityPerPath = 2, evidence = null } = {}) {
+function boundedSearchValue(key, value) {
+  if (typeof value === 'number') return Number.isFinite(value) ? value : undefined;
+  if (typeof value !== 'string') return undefined;
+  const maximum = ['path', 'file_path', 'file', 'location'].includes(key)
+    ? MAX_SEARCH_PATH_LENGTH
+    : MAX_SEARCH_FIELD_LENGTH;
+  const normalized = value.replace(/[\u0000-\u001f\u007f-\u009f]/g, ' ').trim();
+  if (!normalized || normalized.length > maximum || RETRIEVAL_INJECTION_PATTERN.test(normalized)) return undefined;
+  return normalized;
+}
+
+function safeSearchCandidate(candidate, evidence) {
+  if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) return null;
+  // A result can contain source, content, comments, documentation and arbitrary
+  // backend fields. Do not forward them as model context. Symbol metadata and
+  // provenance provide enough evidence for a deliberate follow-up snippet call.
+  for (const value of Object.values(candidate)) {
+    if (typeof value === 'string' && RETRIEVAL_INJECTION_PATTERN.test(value)) return null;
+  }
+  const safe = {};
+  for (const key of SEARCH_RESULT_FIELDS) {
+    const value = boundedSearchValue(key, candidate[key]);
+    if (value !== undefined) safe[key] = value;
+  }
+  const symbol = candidate.id ?? candidate.node_id ?? candidate.nodeId ?? candidate.qualified_name ?? candidate.name;
+  const line = candidate.start_line ?? candidate.line ?? candidate.ordinal;
+  const provenance = buildProvenance({
+    ...candidate,
+    path: typeof candidate.path === 'string' ? candidate.path : candidate.file_path,
+    chunkId: candidate.chunkId ?? candidate.chunk_id ?? (symbol ? `node:${symbol}:${line ?? ''}` : undefined)
+  }, evidence || {});
+  if (!provenance.project || !provenance.chunkId) return null;
+  return { ...safe, provenance };
+}
+
+function safeSearchEnvelope(target, results, metadata) {
+  const envelope = { results, chunk_acl: metadata };
+  if (typeof target.search_mode === 'string') envelope.search_mode = boundedSearchValue('search_mode', target.search_mode) || 'unknown';
+  if (Number.isInteger(target.offset) && target.offset >= 0) envelope.offset = target.offset;
+  if (Number.isInteger(target.total) && target.total >= 0) envelope.total = Math.min(target.total, MAX_SEARCH_RESULT_COUNT);
+  return envelope;
+}
+
+function applySearchResultPolicy(target, { includeTests = false, policy = null, diversityPerPath = 2, evidence = null, access = null, project = '' } = {}) {
   if (!target || typeof target !== 'object' || !Array.isArray(target.results)) return target;
   const pruned = pruneSearchResultPayload(target, { includeTests });
-  if (!policy) return pruned;
-  const candidates = pruned.results.map((item, index) => {
+  // The upstream index can return candidates from a broad retrieval pool. Bind
+  // every emitted chunk to the already-authorized request project before any
+  // result is serialized or cached. Legacy chunks are accepted only through
+  // that project binding; explicit ACL metadata is fail-closed.
+  const authorization = filterAuthorizedChunks(pruned.results, { access, project });
+  const safeCandidates = authorization.chunks
+    .map(item => safeSearchCandidate(item, evidence))
+    .filter(Boolean)
+    .slice(0, MAX_SEARCH_RESULT_COUNT);
+  const rejectedUnsafeContent = authorization.chunks.length - safeCandidates.length;
+  recordChunkAcl({ allowed: safeCandidates.length, denied: authorization.denied + rejectedUnsafeContent });
+  const aclMetadata = {
+    version: authorization.policyVersion,
+    denied: authorization.denied,
+    legacy_project_bindings: authorization.legacyProjectBindings,
+    content_policy_version: RETRIEVAL_CONTENT_POLICY_VERSION,
+    unsafe_content_rejected: rejectedUnsafeContent
+  };
+  if (!policy) return safeSearchEnvelope(pruned, safeCandidates, aclMetadata);
+  const candidates = safeCandidates.map((item, index) => {
     const hasPath = typeof item.path === 'string' && item.path.length > 0;
     const hasScore = Number.isFinite(item.score);
     const explicitChunkId = item.chunkId ?? item.chunk_id ?? item.id;
@@ -153,7 +229,6 @@ function applySearchResultPolicy(target, { includeTests = false, policy = null, 
   });
   const selected = diversifyCandidates(candidates, Math.min(candidates.length, policy.limit), diversityPerPath)
     .map(candidate => {
-      const provenance = buildProvenance(candidate, evidence || {});
       const {
         __syntheticPath: syntheticPath,
         __syntheticScore: syntheticScore,
@@ -163,9 +238,12 @@ function applySearchResultPolicy(target, { includeTests = false, policy = null, 
       if (syntheticPath) delete item.path;
       if (syntheticScore) delete item.score;
       if (syntheticChunkId) delete item.chunkId;
-      return { ...item, provenance };
+      return item;
     });
-  return { ...pruned, results: selected, retrieval_policy: { mode: policy.mode, diversity_per_path: diversityPerPath } };
+  return {
+    ...safeSearchEnvelope(pruned, selected, aclMetadata),
+    retrieval_policy: { mode: policy.mode, diversity_per_path: diversityPerPath }
+  };
 }
 
 function applySearchResponsePolicy(payload, options) {
@@ -396,6 +474,50 @@ export const FACADE_TOOL_DEFINITIONS = [
     }
   }
 ];
+
+// Increment this version when plugin-facing tool names, facade schemas, or
+// evidence metadata change incompatibly. Keep the contract derived from the
+// same definitions used by tools/list so consumers cannot silently drift.
+export const MCP_PLUGIN_CONTRACT_VERSION = '1.1.0';
+export const MCP_EVIDENCE_META_KEY = 'codebase-memory/evidence';
+const MCP_PLUGIN_PASSTHROUGH_TOOLS = new Set([
+  'get_architecture',
+  'index_status',
+  'list_projects'
+]);
+export const MCP_PLUGIN_CONTRACT = Object.freeze({
+  version: MCP_PLUGIN_CONTRACT_VERSION,
+  tools: Object.freeze({
+    allowedNames: Object.freeze([
+      ...new Set([
+        ...MCP_PLUGIN_PASSTHROUGH_TOOLS,
+        ...FACADE_TOOL_DEFINITIONS.map(tool => tool.name)
+      ])
+    ].sort((left, right) => left < right ? -1 : left > right ? 1 : 0)),
+    facades: FACADE_TOOL_DEFINITIONS
+  }),
+  evidence: Object.freeze({
+    metaKey: MCP_EVIDENCE_META_KEY,
+    fields: Object.freeze({
+      project: 'string',
+      status: Object.freeze(['fresh', 'stale', 'unknown']),
+      indexedCommit: 'string|null',
+      indexedAt: 'string|null'
+    })
+  }),
+  retrieval: Object.freeze({
+    chunkAcl: Object.freeze({
+      policyVersion: CHUNK_ACL_POLICY_VERSION,
+      fields: Object.freeze({
+        version: 'string',
+        denied: 'number',
+        legacy_project_bindings: 'number',
+        content_policy_version: 'string',
+        unsafe_content_rejected: 'number'
+      })
+    })
+  })
+});
 
 export const UNUSED_AST_FIELDS = new Set([
   'complexity',
@@ -1103,7 +1225,9 @@ export function createMcpGuardrailHandlers(resolveAccess, { sharedSecret = SERVI
               includeTests,
               policy,
               diversityPerPath: Number.isInteger(configuredDiversity) && configuredDiversity > 0 ? configuredDiversity : 2,
-              evidence
+              evidence,
+              access,
+              project: resolvedProject
             });
           }
           modified = true;
@@ -1125,7 +1249,7 @@ export function createMcpGuardrailHandlers(resolveAccess, { sharedSecret = SERVI
             ...payload,
             _meta: {
               ...(payload._meta && typeof payload._meta === 'object' && !Array.isArray(payload._meta) ? payload._meta : {}),
-              'codebase-memory/evidence': evidence
+              [MCP_EVIDENCE_META_KEY]: evidence
             }
           };
           modified = true;

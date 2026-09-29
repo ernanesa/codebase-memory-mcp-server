@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { mkdir, readdir, rm, rmdir } from 'node:fs/promises';
 import { json, body } from '../http.js';
+import { assertApprovedCorporateSource, revalidateApprovedCorporateSource } from './github.js';
 import {
   assertSafeSegment,
   slugify,
@@ -31,6 +32,16 @@ function publicUpdateSchedule(selectedWorkspace) {
   try { description = describeCron(schedule.cron); }
   catch { description = `Cron inválido: ${schedule.cron}`; }
   return { ...schedule, description, nextRunAt, configurationError };
+}
+
+function sourceApproval(selectedWorkspace, repository) {
+  return selectedWorkspace.repositorySourceApprovals?.find(item => String(item.githubRepositoryId) === String(repository.id) && item.status === 'approved') ?? null;
+}
+
+function approvalActor(input) {
+  const approvedBy = String(input?.approvedBy ?? '').trim();
+  if (approvedBy.length < 2 || approvedBy.length > 120) throw new Error('Informe quem aprovou a fonte corporativa.');
+  return approvedBy;
 }
 
 export function register(router, ctx) {
@@ -163,12 +174,15 @@ export function register(router, ctx) {
 
   router.post('/api/workspaces/:workspaceId/repositories', async (request, response, url, params) => {
     const workspaceId = params.workspaceId;
-    ctx.workspace(workspaceId);
+    const selectedWorkspace = ctx.workspace(workspaceId);
     const input = await body(request);
     if (!Array.isArray(input.repositories) || !input.repositories.length) throw new Error('Selecione pelo menos um repositório.');
     const available = await ctx.listGithubRepositories();
     const selected = input.repositories.map(fullName => available.find(item => item.fullName === fullName));
     if (selected.some(item => !item)) throw new Error('Um dos repositórios selecionados não está disponível.');
+    if (selected.some(remote => !sourceApproval(selectedWorkspace, remote))) {
+      throw new Error('A fonte do repositório não possui aprovação corporativa ativa.');
+    }
     const requestedIds = new Map();
     for (const remote of selected) {
       const repositoryId = slugify(remote.name);
@@ -181,10 +195,11 @@ export function register(router, ctx) {
       const id = slugify(remote.name);
       if (ctx.state.repositories.some(item => item.workspaceId === workspaceId && item.id === id)) continue;
       const target = safeChild(ctx.config.REPOSITORIES_DIR, workspaceId, id);
-      const item = { id, accessId: randomUUID(), workspaceId, name: remote.name, fullName: remote.fullName, description: remote.description, private: remote.private, language: remote.language, defaultBranch: remote.defaultBranch, status: 'cloning', path: target, createdAt: new Date().toISOString() };
+      const item = { id, accessId: randomUUID(), workspaceId, githubRepositoryId: String(remote.id), sourceApproval: structuredClone(sourceApproval(selectedWorkspace, remote)), name: remote.name, fullName: remote.fullName, description: remote.description, private: remote.private, language: remote.language, defaultBranch: remote.defaultBranch, status: 'cloning', path: target, createdAt: new Date().toISOString() };
       ctx.state.repositories.push(item);
       const job = ctx.createJob('clone', `Clonando ${remote.fullName}`, `${workspaceId}/${id}`, async (currentJob, log) => {
-        await run('git', ['clone', remote.cloneUrl, target], { env: gitAuthEnvironment(ctx.githubToken), onOutput: log });
+        const verified = await revalidateApprovedCorporateSource(ctx, item);
+        await run('git', ['clone', verified.cloneUrl, target], { env: gitAuthEnvironment(ctx.githubToken), onOutput: log });
         const commit = (await run('git', ['rev-parse', '--short', 'HEAD'], { cwd: target })).stdout.trim();
         item.status = 'ready'; item.commit = commit; item.lastSyncAt = new Date().toISOString(); currentJob.progress = 100;
       });
@@ -193,6 +208,53 @@ export function register(router, ctx) {
     }
     await ctx.persist();
     return json(response, 202, { repositories: created });
+  });
+
+  router.post('/api/workspaces/:workspaceId/repository-approvals', async (request, response, url, params) => {
+    const workspaceId = params.workspaceId;
+    const selectedWorkspace = ctx.workspace(workspaceId);
+    const input = await body(request);
+    const fullName = String(input?.repository ?? '').trim();
+    if (!fullName) throw new Error('Informe o repositório a ser aprovado.');
+    const available = await ctx.listGithubRepositories();
+    const remote = available.find(item => item.fullName === fullName);
+    if (!remote?.id) throw new Error('O repositório selecionado não está disponível no GitHub conectado.');
+    const approval = {
+      status: 'approved',
+      workspaceId,
+      githubRepositoryId: String(remote.id),
+      approvedFullName: remote.fullName,
+      approvedBy: approvalActor(input),
+      approvedAt: new Date().toISOString()
+    };
+    const approvals = selectedWorkspace.repositorySourceApprovals ?? [];
+    selectedWorkspace.repositorySourceApprovals = [...approvals.filter(item => String(item.githubRepositoryId) !== approval.githubRepositoryId), approval];
+    await ctx.persist();
+    return json(response, 201, { approval });
+  });
+
+  router.delete('/api/workspaces/:workspaceId/repository-approvals/:githubRepositoryId', async (request, response, url, params) => {
+    const selectedWorkspace = ctx.workspace(params.workspaceId);
+    const repositoryId = String(params.githubRepositoryId ?? '');
+    const approvals = selectedWorkspace.repositorySourceApprovals ?? [];
+    if (!approvals.some(item => String(item.githubRepositoryId) === repositoryId && item.status === 'approved')) {
+      throw new Error('Aprovação corporativa não encontrada.');
+    }
+    const affectedRepositories = ctx.state.repositories.filter(item => item.workspaceId === selectedWorkspace.id && String(item.githubRepositoryId) === repositoryId && item.sourceApproval);
+    if (typeof ctx.revokeRepositorySource === 'function') {
+      for (const item of affectedRepositories) {
+        await ctx.revokeRepositorySource(item, 'corporate_source_approval_revoked');
+      }
+    }
+    const revokedAt = new Date().toISOString();
+    selectedWorkspace.repositorySourceApprovals = approvals.map(item => String(item.githubRepositoryId) === repositoryId
+      ? { ...item, status: 'revoked', revokedAt }
+      : item);
+    for (const item of affectedRepositories) {
+      item.sourceApproval = { ...item.sourceApproval, status: 'revoked', revokedAt };
+    }
+    await ctx.persist();
+    return json(response, 200, { revoked: true });
   });
 
   router.delete('/api/workspaces/:workspaceId/repositories/:repositoryId', async (request, response, url, params) => {
@@ -208,6 +270,7 @@ export function register(router, ctx) {
   router.post('/api/workspaces/:workspaceId/repositories/:repositoryId/sync', async (request, response, url, params) => {
     const { workspaceId, repositoryId } = params;
     const item = ctx.repository(workspaceId, repositoryId);
+    await revalidateApprovedCorporateSource(ctx, item);
     const { job } = ctx.enqueueRepositorySync(item);
     await ctx.persist();
     return json(response, 202, job);
@@ -216,6 +279,7 @@ export function register(router, ctx) {
   router.post('/api/workspaces/:workspaceId/repositories/:repositoryId/index', async (request, response, url, params) => {
     const { workspaceId, repositoryId } = params;
     const item = ctx.repository(workspaceId, repositoryId);
+    await revalidateApprovedCorporateSource(ctx, item);
     const job = ctx.createJob('index', `Indexando ${item.fullName}`, `${workspaceId}/${item.id}`, async (_job, log) => {
       await ctx.indexRepository(item, log);
     });

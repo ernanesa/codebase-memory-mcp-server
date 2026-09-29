@@ -1,0 +1,48 @@
+groups:
+  - name: codebase-memory-ai
+    interval: 30s
+    rules:
+      - record: cbm:ai_cost_usd:1h
+        expr: sum(increase(cbm_ai_cost_usd_total[1h]))
+      - record: cbm:ai_input_cache_hit_ratio:15m
+        expr: sum(increase(cbm_ai_tokens_total{kind="cached_input"}[15m])) / clamp_min(sum(increase(cbm_ai_tokens_total{kind="input"}[15m])), 1)
+      - record: cbm:mcp_semantic_cache_hit_ratio:15m
+        expr: sum(increase(mcp_guardrail_cache_events_total{cache="semantic",result="hit"}[15m])) / clamp_min(sum(increase(mcp_guardrail_cache_events_total{cache="semantic",result=~"hit|miss"}[15m])), 1)
+      - alert: CbmAdminMetricsUnavailable
+        expr: up{job="codebase-memory-admin"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: Coletor do painel administrativo indisponível
+      - alert: CbmKnowledgeSyncMetricsUnavailable
+        expr: up{job="knowledge-sync"} == 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: Coletor da sincronização indisponível
+      - alert: CbmRagAclDenialBurst
+        expr: sum(increase(cbm_rag_chunk_acl_total{result="denied"}[5m])) > 50
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: Aumento de trechos rejeitados pela ACL
+          description: Limiar piloto; verificar demanda e autorização antes de recalibrar.
+      - alert: CbmAiLatencyP95High
+        expr: histogram_quantile(0.95, sum by (le) (rate(cbm_ai_latency_seconds_bucket[10m]))) > 30 and on() sum(increase(cbm_ai_latency_seconds_count[10m])) >= 20
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: Latência p95 de IA acima de 30 segundos
+          description: Limiar piloto; classificar por rota e comparar com a qualidade da tarefa.
+      - alert: CbmAiHourlyCostHigh
+        expr: cbm:ai_cost_usd:1h > 10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Custo estimado de IA acima de US$ 10 na última hora
+          description: Limiar piloto; validar métricas do provedor e orçamento aprovado.
