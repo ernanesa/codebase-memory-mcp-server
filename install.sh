@@ -457,11 +457,17 @@ install_host_ollama() {
   fail "O Ollama nativo não ficou disponível. Consulte ${HOME}/Library/Logs/CodebaseMemoryOllama.log."
 }
 
+merge_docker_cgroupfs_config() {
+  jq '."exec-opts" = (((."exec-opts" // [])
+    | map(select(startswith("native.cgroupdriver=") | not)))
+    + ["native.cgroupdriver=cgroupfs"])' "$1"
+}
+
 configure_nvidia_runtime_command() {
   local daemon_config='/etc/docker/daemon.json'
   local daemon_config_backup='/etc/docker/daemon.json.codebase-memory-backup'
   local daemon_config_candidate
-  local cgroup_driver cgroup_version
+  local cgroup_driver cgroup_version actual_cgroup_driver
   [[ "$OLLAMA_GPU_MODE" != cpu ]] || return 0
   command -v nvidia-smi >/dev/null 2>&1 || fail 'A GPU foi habilitada, mas o driver NVIDIA não está disponível.'
   nvidia-smi -L >/dev/null || fail 'A GPU foi habilitada, mas o driver NVIDIA não respondeu.'
@@ -484,8 +490,7 @@ configure_nvidia_runtime_command() {
     daemon_config_candidate="$(mktemp "${TMPDIR:-/tmp}/cbm-docker-daemon.XXXXXX")"
     sudo test ! -f "$daemon_config" || sudo cat "$daemon_config" >"$daemon_config_candidate"
     [[ -s "$daemon_config_candidate" ]] || printf '{}\n' >"$daemon_config_candidate"
-    jq '."exec-opts" = (((."exec-opts" // []) + ["native.cgroupdriver=cgroupfs"]) | unique)' \
-      "$daemon_config_candidate" >"${daemon_config_candidate}.merged"
+    merge_docker_cgroupfs_config "$daemon_config_candidate" >"${daemon_config_candidate}.merged"
     mv "${daemon_config_candidate}.merged" "$daemon_config_candidate"
     sudo dockerd --validate --config-file="$daemon_config_candidate" >/dev/null
     sudo test ! -f "$daemon_config" || sudo cp "$daemon_config" "$daemon_config_backup"
@@ -503,8 +508,13 @@ configure_nvidia_runtime_command() {
   fi
   sudo docker info >/dev/null
   if [[ "$cgroup_driver" == systemd && "$cgroup_version" == 2 ]]; then
-    [[ "$(sudo docker info --format '{{.CgroupDriver}}')" == cgroupfs ]] || \
+    actual_cgroup_driver="$(sudo docker info --format '{{.CgroupDriver}}')"
+    if [[ "$actual_cgroup_driver" != cgroupfs ]]; then
+      warn "Driver cgroup reportado pelo Docker: ${actual_cgroup_driver:-desconhecido}."
+      warn 'Verifique sudo systemctl cat docker: o serviço pode usar outro --config-file ou --exec-opt.'
+      warn 'Verifique também sudo docker context show: o cliente pode estar consultando outro daemon.'
       fail 'O Docker reiniciou, mas não adotou o cgroup driver cgroupfs.'
+    fi
   fi
 }
 
