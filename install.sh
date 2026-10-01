@@ -1402,6 +1402,7 @@ validate_agentgateway_command() {
   docker_compose exec -T admin node --input-type=module -e '
     const { readFile } = await import("node:fs/promises");
     const http = await import("node:http");
+    const { MCP_PLUGIN_CONTRACT } = await import("./src/mcp-guardrail.js");
     const systemToken = (await readFile("/data/app/secrets/mcp-system-token", "utf8")).trim();
     if (!systemToken) throw new Error("Token MCP do sistema não foi criado.");
     const mcpEndpoint = "http://proxy:8080/";
@@ -1488,18 +1489,7 @@ validate_agentgateway_command() {
             timeoutMs: 5000
           });
 
-          const requiredTools = new Set([
-            "search_graph",
-            "query_graph",
-            "trace_path",
-            "get_code_snippet",
-            "get_graph_schema",
-            "get_architecture",
-            "search_code",
-            "list_projects",
-            "index_status",
-            "detect_changes"
-          ]);
+          const requiredTools = new Set(MCP_PLUGIN_CONTRACT.tools.allowedNames);
           const advertisedTools = new Set();
           let cursor;
           do {
@@ -1529,7 +1519,7 @@ validate_agentgateway_command() {
             const error = new Error(
               `Catálogo MCP incompatível; ferramentas ausentes: ${missingTools.join(", ")}. ` +
               `Ferramentas anunciadas: ${[...advertisedTools].sort().join(", ") || "nenhuma"}. ` +
-              "Atualize o binário codebase-memory-mcp antes de concluir a instalação."
+              `Verifique o catálogo público do guardrail e a versão dos serviços (contrato ${MCP_PLUGIN_CONTRACT.version}).`
             );
             error.code = "MCP_CATALOG_INCOMPATIBLE";
             throw error;
