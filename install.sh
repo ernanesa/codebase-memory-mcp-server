@@ -1453,7 +1453,7 @@ create_environment_file() {
   local openwebui_public_url="${OPENWEBUI_PUBLIC_URL:-}" admin_public_url="${ADMIN_PUBLIC_URL:-}" grafana_public_url="${GRAFANA_PUBLIC_URL:-}" mcp_public_url="${MCP_PUBLIC_URL:-}"
   local openwebui_public_host admin_public_host grafana_public_host mcp_public_host
   local ollama_num_parallel=1 ollama_max_loaded_models=3 ollama_max_queue=64
-  local use_cuda_docker=false whisper_device=cpu whisper_cpu_threads=6 whisper_model=medium whisper_compute_type=int8 whisper_language=pt whisper_vad_filter=true bypass_pydub_preprocessing=true whisper_initial_prompt='' audio_tts_split_on=paragraphs
+  local use_cuda_docker=false whisper_device=cpu whisper_cpu_threads=6 whisper_model=large-v3-turbo whisper_compute_type=int8 whisper_language=pt whisper_vad_filter=true bypass_pydub_preprocessing=true whisper_initial_prompt='' audio_tts_split_on=paragraphs
   if [[ -f "$ENV_FILE" ]]; then
     existing_value="$(sed -n 's/^OLLAMA_VERSION=//p' "$ENV_FILE" | tail -n 1)"
     [[ "$existing_value" =~ ^[A-Za-z0-9._-]+$ ]] && OLLAMA_VERSION="$existing_value"
