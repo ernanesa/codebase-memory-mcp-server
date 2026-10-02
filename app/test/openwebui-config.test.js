@@ -138,9 +138,9 @@ test('proxy é o único ponto de entrada e publica Open WebUI, admin, Grafana e 
   assert.match(nginx, /set \$grafana_upstream http:\/\/grafana:3000/);
   assert.match(nginx, /proxy_pass \$grafana_upstream/);
   assert.doesNotMatch(nginx, /proxy_pass http:\/\/prometheus/);
-  assert.match(nginx, /server_name \$\{OPENWEBUI_PUBLIC_HOST\}[\s\S]*proxy_pass http:\/\/open-webui:8080/);
-  assert.match(nginx, /server_name \$\{ADMIN_PUBLIC_HOST\}[\s\S]*proxy_pass http:\/\/admin:3000/);
-  assert.match(nginx, /server_name \$\{MCP_PUBLIC_HOST\}[\s\S]*location = \/ \{[\s\S]*proxy_pass http:\/\/agentgateway:\$\{UI_PORT\}\/mcp/);
+  assert.match(nginx, /server_name \$\{OPENWEBUI_PUBLIC_HOST\}[\s\S]*proxy_pass \$openwebui_upstream/);
+  assert.match(nginx, /server_name \$\{ADMIN_PUBLIC_HOST\}[\s\S]*proxy_pass \$admin_upstream/);
+  assert.match(nginx, /server_name \$\{MCP_PUBLIC_HOST\}[\s\S]*location = \/ \{[\s\S]*proxy_pass \$mcp_upstream/);
   assert.match(nginx, /location = \/api\/auth\/login \{[\s\S]*proxy_set_header X-Forwarded-Host \$http_host/);
   assert.match(nginx, /map \$uri \$public_rate_limit_key \{/);
   assert.match(nginx, /~\^\/\(\?:_app\|static\)\/ "";/);
@@ -250,10 +250,10 @@ test('presets de exemplo selecionam o padrão e carregam parâmetros e integraç
   const manifest = JSON.parse(await readFile(path.join(root, 'openwebui/bootstrap/models.json'), 'utf8'));
   assert.deepEqual(manifest.models.map(model => model.id), ['business-model-sample', 'code-model-sample']);
   assert.equal(manifest.models[0].base_model_id, 'ornith15-9b-ad:latest');
-  assert.equal(manifest.models[1].base_model_id, 'qwen2.5-coder:14b-instruct-q4_0');
-  assert.equal(manifest.models[0].params.num_ctx, 16384);
-  assert.equal(manifest.models[1].params.num_ctx, 16384);
-  assert.equal(manifest.models[1].params.num_gpu, 48);
+  assert.equal(manifest.models[1].base_model_id, 'qwen2.5-coder:7b');
+  assert.equal(manifest.models[0].params.num_ctx, 32768);
+  assert.equal(manifest.models[1].params.num_ctx, 24576);
+  assert.equal(manifest.models[1].params.num_gpu, 99);
   for (const model of manifest.models) {
     assert.equal(model.params.function_calling, 'native');
   }
@@ -509,10 +509,10 @@ test('override persiste residência dos modelos e adiciona quantização somente
     assert.match(override, /OLLAMA_FLASH_ATTENTION: "1"/);
     assert.match(override, /OLLAMA_KV_CACHE_TYPE: q8_0/);
     assert.match(override, /OLLAMA_KEEP_ALIVE: "-1"/);
-    assert.match(override, /OLLAMA_CONTEXT_LENGTH: "16384"/);
-    assert.match(override, /OLLAMA_MAX_LOADED_MODELS: "\$\{OLLAMA_MAX_LOADED_MODELS:-1\}"/);
+    assert.match(override, /OLLAMA_CONTEXT_LENGTH: "32768"/);
+    assert.match(override, /OLLAMA_MAX_LOADED_MODELS: "\$\{OLLAMA_MAX_LOADED_MODELS:-3\}"/);
     assert.match(override, /OLLAMA_NUM_PARALLEL: "\$\{OLLAMA_NUM_PARALLEL:-1\}"/);
-    assert.match(override, /OLLAMA_MAX_QUEUE: "\$\{OLLAMA_MAX_QUEUE:-16\}"/);
+    assert.match(override, /OLLAMA_MAX_QUEUE: "\$\{OLLAMA_MAX_QUEUE:-64\}"/);
 
     await execFileAsync('bash', ['-c', `
       source "$1"
@@ -567,9 +567,9 @@ test('reinstalação grava e preserva OLLAMA_VERSION no ambiente', async () => {
     const environment = await readFile(path.join(temporaryRoot, '.env'), 'utf8');
     assert.match(environment, /^OLLAMA_VERSION=0\.31\.2$/m);
     assert.match(environment, /^OLLAMA_CHAT_MODEL=gemma4:e2b$/m);
-    assert.match(environment, /^OLLAMA_CONTEXT_LENGTH=16384$/m);
-    assert.match(environment, /^OLLAMA_KV_CACHE_QUANTIZATION=fp16$/m);
-    assert.match(environment, /^OLLAMA_KEEP_ALIVE=5m$/m);
+    assert.match(environment, /^OLLAMA_CONTEXT_LENGTH=32768$/m);
+    assert.match(environment, /^OLLAMA_KV_CACHE_QUANTIZATION=q8_0$/m);
+    assert.match(environment, /^OLLAMA_KEEP_ALIVE=-1$/m);
     assert.match(environment, /^OLLAMA_RUNTIME=docker$/m);
     assert.match(environment, /^OLLAMA_BASE_URL=http:\/\/ollama:11434$/m);
     assert.deepEqual(
@@ -710,7 +710,7 @@ test('ambiente persiste os overrides do Compose usados para GPU e quantização 
     assert.match(environment, /^OLLAMA_KEEP_ALIVE=-1$/m);
     const ollamaOverride = await readFile(path.join(temporaryRoot, 'compose.ollama.yaml'), 'utf8');
     assert.match(ollamaOverride, /OLLAMA_KEEP_ALIVE: "-1"/);
-    assert.match(ollamaOverride, /OLLAMA_MAX_LOADED_MODELS: "\$\{OLLAMA_MAX_LOADED_MODELS:-1\}"/);
+    assert.match(ollamaOverride, /OLLAMA_MAX_LOADED_MODELS: "\$\{OLLAMA_MAX_LOADED_MODELS:-3\}"/);
   } finally {
     await rm(temporaryRoot, { recursive: true, force: true });
   }
@@ -797,10 +797,10 @@ test('modo host registra um LaunchAgent persistente para o Ollama', async () => 
     assert.match(launchAgent, /<key>OLLAMA_FLASH_ATTENTION<\/key>\s*<string>1<\/string>/);
     assert.match(launchAgent, /<key>OLLAMA_KV_CACHE_TYPE<\/key>\s*<string>q8_0<\/string>/);
     assert.match(launchAgent, /<key>OLLAMA_KEEP_ALIVE<\/key>\s*<string>-1<\/string>/);
-    assert.match(launchAgent, /<key>OLLAMA_CONTEXT_LENGTH<\/key>\s*<string>16384<\/string>/);
-    assert.match(launchAgent, /<key>OLLAMA_MAX_LOADED_MODELS<\/key>\s*<string>1<\/string>/);
+    assert.match(launchAgent, /<key>OLLAMA_CONTEXT_LENGTH<\/key>\s*<string>32768<\/string>/);
+    assert.match(launchAgent, /<key>OLLAMA_MAX_LOADED_MODELS<\/key>\s*<string>3<\/string>/);
     assert.match(launchAgent, /<key>OLLAMA_NUM_PARALLEL<\/key>\s*<string>1<\/string>/);
-    assert.match(launchAgent, /<key>OLLAMA_MAX_QUEUE<\/key>\s*<string>16<\/string>/);
+    assert.match(launchAgent, /<key>OLLAMA_MAX_QUEUE<\/key>\s*<string>64<\/string>/);
     assert.match(launchAgent, /<key>RunAtLoad<\/key>\s*<true\/>/);
     assert.match(launchAgent, /<key>KeepAlive<\/key>\s*<true\/>/);
   } finally {
@@ -1103,3 +1103,57 @@ test('reinstalação preserva configuração legada do Picker sem gerenciá-la n
     await rm(temporaryRoot, { recursive: true, force: true });
   }
 });
+
+test('instalador oferece modo express e modo passo a passo', async () => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), 'cbm-install-modes-'));
+  try {
+    await copyFile(path.join(root, 'install.sh'), path.join(temporaryRoot, 'install.sh'));
+    const resultFile = path.join(temporaryRoot, 'modes_result');
+    await execFileAsync('bash', ['-c', `
+      source "$1"
+      choose_installation_mode --express
+      printf 'flag:%s\\n' "$INSTALL_MODE" > "$2"
+
+      choose_installation_mode --step-by-step
+      printf 'flag-step:%s\\n' "$INSTALL_MODE" >> "$2"
+
+      choose_installation_mode <<< $'\\n'
+      printf 'default:%s\\n' "$INSTALL_MODE" >> "$2"
+
+      choose_installation_mode <<< $'2\\n'
+      printf 'step:%s\\n' "$INSTALL_MODE" >> "$2"
+    `, 'test', path.join(temporaryRoot, 'install.sh'), resultFile]);
+
+    assert.equal(
+      await readFile(resultFile, 'utf8'),
+      'flag:express\nflag-step:interactive\ndefault:express\nstep:interactive\n'
+    );
+  } finally {
+    await rm(temporaryRoot, { recursive: true, force: true });
+  }
+});
+
+test('resolve_default_configuration carrega configurações existentes de .env', async () => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), 'cbm-resolve-config-'));
+  try {
+    await copyFile(path.join(root, 'install.sh'), path.join(temporaryRoot, 'install.sh'));
+    await writeFile(
+      path.join(temporaryRoot, '.env'),
+      'CBM_MEM_BUDGET_MB=16384\nOLLAMA_CHAT_MODEL=ornith15-9b-ad-chat:latest\nOLLAMA_CONTEXT_LENGTH=32768\nOLLAMA_KV_CACHE_QUANTIZATION=q8_0\n'
+    );
+    const resultFile = path.join(temporaryRoot, 'resolved_result');
+    await execFileAsync('bash', ['-c', `
+      source "$1"
+      resolve_default_configuration
+      printf '%s|%s|%s|%s\\n' "$CBM_MEM_BUDGET_MB" "$OLLAMA_CHAT_MODEL" "$OLLAMA_CONTEXT_LENGTH" "$OLLAMA_KV_CACHE_QUANTIZATION" > "$2"
+    `, 'test', path.join(temporaryRoot, 'install.sh'), resultFile]);
+
+    assert.equal(
+      await readFile(resultFile, 'utf8'),
+      '16384|ornith15-9b-ad-chat:latest|32768|q8_0\n'
+    );
+  } finally {
+    await rm(temporaryRoot, { recursive: true, force: true });
+  }
+});
+

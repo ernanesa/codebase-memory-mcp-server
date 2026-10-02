@@ -21,6 +21,9 @@ CURRENT_USER="$(id -un)"
 SUDO_KEEPALIVE_PID=''
 ADMIN_PASSWORD=''
 ADMIN_EMAIL=''
+ADMIN_USERNAME=''
+CBM_MEM_BUDGET_MB='8192'
+INSTALL_MODE='interactive'
 OPENWEBUI_PUBLIC_URL=''
 ADMIN_PUBLIC_URL=''
 GRAFANA_PUBLIC_URL=''
@@ -32,9 +35,12 @@ OPENWEBUI_PREVIOUS_PASSWORD=''
 OPENWEBUI_DESIRED_PASSWORD=''
 OLLAMA_VERSION='0.32.1'
 OLLAMA_CHAT_MODEL='gemma4:e2b'
-OLLAMA_CONTEXT_LENGTH='16384'
-OLLAMA_KV_CACHE_QUANTIZATION='fp16'
-OLLAMA_KEEP_ALIVE='5m'
+OLLAMA_BUSINESS_MODEL='ornith15-9b-ad:latest'
+OLLAMA_CONTEXT_LENGTH='32768'
+OLLAMA_CODE_CONTEXT_LENGTH='24576'
+OLLAMA_BUSINESS_CONTEXT_LENGTH='32768'
+OLLAMA_KV_CACHE_QUANTIZATION='q8_0'
+OLLAMA_KEEP_ALIVE='-1'
 OLLAMA_RUNTIME='docker'
 OLLAMA_BASE_URL='http://ollama:11434'
 OLLAMA_COMPOSE_PROFILES='ollama-docker'
@@ -44,8 +50,8 @@ DOCLING_VERSION='v1.26.0'
 DOCLING_CPU_THREADS='6'
 RAG_RERANKING_MODEL='BAAI/bge-reranker-v2-m3'
 RAG_RERANKING_BATCH_SIZE='4'
-RAG_TOP_K='20'
-RAG_TOP_K_RERANKER='8'
+RAG_TOP_K='6'
+RAG_TOP_K_RERANKER='4'
 SYSTEM_PLATFORM=''
 SYSTEM_ARCHITECTURE="$(uname -m)"
 BREW_BIN=''
@@ -395,11 +401,11 @@ configure_host_ollama_command() {
     printf '%s\n' '    <key>OLLAMA_CONTEXT_LENGTH</key>'
     printf '    <string>%s</string>\n' "$OLLAMA_CONTEXT_LENGTH"
     printf '%s\n' '    <key>OLLAMA_MAX_LOADED_MODELS</key>'
-    printf '%s\n' '    <string>1</string>'
+    printf '%s\n' '    <string>3</string>'
     printf '%s\n' '    <key>OLLAMA_NUM_PARALLEL</key>'
     printf '%s\n' '    <string>1</string>'
     printf '%s\n' '    <key>OLLAMA_MAX_QUEUE</key>'
-    printf '%s\n' '    <string>16</string>'
+    printf '%s\n' '    <string>64</string>'
     if [[ "$OLLAMA_KV_CACHE_QUANTIZATION" == q8_0 ]]; then
       printf '%s\n' '    <key>OLLAMA_FLASH_ATTENTION</key>'
       printf '%s\n' '    <string>1</string>'
@@ -1022,6 +1028,234 @@ confirm_configuration() {
   done
 }
 
+resolve_default_configuration() {
+  local existing_budget existing_runtime existing_model existing_context_length existing_quantization existing_keep_alive existing_mode existing_devices
+  local legacy_public_url suggested_email
+
+  # 1. Memória de indexação
+  existing_budget="$(read_existing_environment_value CBM_MEM_BUDGET_MB)"
+  if [[ "$existing_budget" =~ ^[1-9][0-9]*$ ]]; then
+    CBM_MEM_BUDGET_MB="$existing_budget"
+  elif [[ -z "${CBM_MEM_BUDGET_MB:-}" ]]; then
+    CBM_MEM_BUDGET_MB='8192'
+  fi
+
+  # 2. Runtime do Ollama
+  existing_runtime="$(read_existing_environment_value OLLAMA_RUNTIME)"
+  if [[ "$existing_runtime" == docker || ( "$existing_runtime" == host && "$SYSTEM_PLATFORM" == macos ) ]]; then
+    OLLAMA_RUNTIME="$existing_runtime"
+  elif [[ "$SYSTEM_PLATFORM" == macos ]]; then
+    OLLAMA_RUNTIME='host'
+  else
+    OLLAMA_RUNTIME='docker'
+  fi
+  if [[ "$OLLAMA_RUNTIME" == host ]]; then
+    OLLAMA_BASE_URL='http://host.docker.internal:11434'
+    OLLAMA_COMPOSE_PROFILES=''
+  else
+    OLLAMA_BASE_URL='http://ollama:11434'
+    OLLAMA_COMPOSE_PROFILES='ollama-docker'
+  fi
+
+  # 3. Modelos de Linguagem (Code e Business)
+  existing_model="$(read_existing_environment_value OLLAMA_CHAT_MODEL)"
+  OLLAMA_CHAT_MODEL="${existing_model:-${OLLAMA_CHAT_MODEL:-gemma4:e2b}}"
+
+  existing_biz_model="$(read_existing_environment_value OLLAMA_BUSINESS_MODEL)"
+  OLLAMA_BUSINESS_MODEL="${existing_biz_model:-${OLLAMA_BUSINESS_MODEL:-ornith15-9b-ad:latest}}"
+
+  # 4. Contexto do Ollama (Geral, Code e Business)
+  existing_context_length="$(read_existing_environment_value OLLAMA_CONTEXT_LENGTH)"
+  if [[ "$existing_context_length" =~ ^[1-9][0-9]*$ ]]; then
+    OLLAMA_CONTEXT_LENGTH="$existing_context_length"
+  elif [[ -z "${OLLAMA_CONTEXT_LENGTH:-}" ]]; then
+    OLLAMA_CONTEXT_LENGTH='16384'
+  fi
+
+  existing_code_ctx="$(read_existing_environment_value OLLAMA_CODE_CONTEXT_LENGTH)"
+  if [[ "$existing_code_ctx" =~ ^[1-9][0-9]*$ ]]; then
+    OLLAMA_CODE_CONTEXT_LENGTH="$existing_code_ctx"
+  else
+    OLLAMA_CODE_CONTEXT_LENGTH='24576'
+  fi
+
+  existing_biz_ctx="$(read_existing_environment_value OLLAMA_BUSINESS_CONTEXT_LENGTH)"
+  if [[ "$existing_biz_ctx" =~ ^[1-9][0-9]*$ ]]; then
+    OLLAMA_BUSINESS_CONTEXT_LENGTH="$existing_biz_ctx"
+  else
+    OLLAMA_BUSINESS_CONTEXT_LENGTH='32768'
+  fi
+
+  # 5. Quantização do cache K/V
+  existing_quantization="$(read_existing_environment_value OLLAMA_KV_CACHE_QUANTIZATION)"
+  case "$existing_quantization" in
+    fp16|q8_0) OLLAMA_KV_CACHE_QUANTIZATION="$existing_quantization" ;;
+    *) OLLAMA_KV_CACHE_QUANTIZATION="${OLLAMA_KV_CACHE_QUANTIZATION:-fp16}" ;;
+  esac
+
+  # 6. Keep-alive dos modelos
+  existing_keep_alive="$(read_existing_environment_value OLLAMA_KEEP_ALIVE)"
+  case "$existing_keep_alive" in
+    -1|30m|5m) OLLAMA_KEEP_ALIVE="$existing_keep_alive" ;;
+    *) OLLAMA_KEEP_ALIVE="${OLLAMA_KEEP_ALIVE:-5m}" ;;
+  esac
+
+  # 7. Aceleração de hardware / GPUs
+  existing_mode="$(read_existing_environment_value OLLAMA_GPU_MODE)"
+  existing_devices="$(read_existing_environment_value OLLAMA_GPU_DEVICE_IDS)"
+  if [[ "$OLLAMA_RUNTIME" == host ]]; then
+    if [[ "$SYSTEM_ARCHITECTURE" == arm64 || "$SYSTEM_ARCHITECTURE" == aarch64 ]]; then
+      OLLAMA_GPU_MODE='metal'
+    else
+      OLLAMA_GPU_MODE='cpu'
+    fi
+    OLLAMA_GPU_DEVICE_IDS=''
+  elif [[ -n "$existing_mode" ]]; then
+    OLLAMA_GPU_MODE="$existing_mode"
+    OLLAMA_GPU_DEVICE_IDS="$existing_devices"
+  elif command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi --query-gpu=uuid --format=csv,noheader 2>/dev/null | grep -q 'GPU-'; then
+    OLLAMA_GPU_MODE='all'
+    OLLAMA_GPU_DEVICE_IDS=''
+  else
+    OLLAMA_GPU_MODE='cpu'
+    OLLAMA_GPU_DEVICE_IDS=''
+  fi
+
+  # 8. Credenciais administrativas
+  if [[ -f "${DATA_DIR}/secrets/openwebui.env" ]]; then
+    OPENWEBUI_PREVIOUS_EMAIL="$(sed -n 's/^WEBUI_ADMIN_EMAIL=//p' "${DATA_DIR}/secrets/openwebui.env" | tail -n 1)"
+    OPENWEBUI_PREVIOUS_NAME="$(sed -n 's/^WEBUI_ADMIN_NAME=//p' "${DATA_DIR}/secrets/openwebui.env" | tail -n 1)"
+    OPENWEBUI_PREVIOUS_PASSWORD="$(sed -n 's/^WEBUI_ADMIN_PASSWORD=//p' "${DATA_DIR}/secrets/openwebui.env" | tail -n 1)"
+  fi
+  suggested_email="${OPENWEBUI_PREVIOUS_EMAIL:-$(read_existing_environment_value ADMIN_EMAIL)}"
+  [[ "$suggested_email" == *@*.* ]] || suggested_email='joao@exemplo.com'
+  ADMIN_EMAIL="$suggested_email"
+  ADMIN_USERNAME="$ADMIN_EMAIL"
+  OPENWEBUI_ADMIN_NAME="${OPENWEBUI_PREVIOUS_NAME:-Admin}"
+  if [[ -n "$OPENWEBUI_PREVIOUS_PASSWORD" ]]; then
+    OPENWEBUI_DESIRED_PASSWORD="$OPENWEBUI_PREVIOUS_PASSWORD"
+    ADMIN_PASSWORD="$OPENWEBUI_PREVIOUS_PASSWORD"
+  fi
+
+  # 9. URLs públicas
+  legacy_public_url="$(read_existing_environment_value PUBLIC_BASE_URL)"
+  OPENWEBUI_PUBLIC_URL="$(read_existing_environment_value OPENWEBUI_PUBLIC_URL)"
+  ADMIN_PUBLIC_URL="$(read_existing_environment_value ADMIN_PUBLIC_URL)"
+  GRAFANA_PUBLIC_URL="$(read_existing_environment_value GRAFANA_PUBLIC_URL)"
+  MCP_PUBLIC_URL="$(read_existing_environment_value MCP_PUBLIC_URL)"
+
+  [[ -n "$OPENWEBUI_PUBLIC_URL" ]] || OPENWEBUI_PUBLIC_URL="${legacy_public_url:-http://openwebui.localhost:8080}"
+  [[ -n "$ADMIN_PUBLIC_URL" ]] || ADMIN_PUBLIC_URL='http://admin.localhost:8080'
+  [[ -n "$GRAFANA_PUBLIC_URL" ]] || GRAFANA_PUBLIC_URL='http://grafana.localhost:8080'
+  [[ -n "$MCP_PUBLIC_URL" ]] || MCP_PUBLIC_URL='http://mcp.localhost:8080'
+}
+
+show_configuration_summary() {
+  local ollama_execution ollama_acceleration
+  [[ "$OLLAMA_RUNTIME" == host ]] && ollama_execution='Host macOS' || ollama_execution='Docker'
+  case "$OLLAMA_GPU_MODE" in
+    all) ollama_acceleration='Todas as GPUs NVIDIA' ;;
+    selected) ollama_acceleration="GPUs ${OLLAMA_GPU_DEVICE_IDS}" ;;
+    metal) ollama_acceleration='Apple Metal' ;;
+    *) ollama_acceleration='CPU' ;;
+  esac
+
+  ACTIVE_PHASE='Resumo de configuração'
+  printf "\n${COLOR_CYAN}${COLOR_BOLD}CONFIGURAÇÕES DO SISTEMA${COLOR_RESET}  ${COLOR_MUTED}(detectadas e padronizadas)${COLOR_RESET}\n"
+  print_rule
+  printf '  Memória de indexação : %s MB\n' "$CBM_MEM_BUDGET_MB"
+  printf '  Execução do Ollama   : %s\n' "$ollama_execution"
+  printf '  Modelo Code (Chat)   : %s (contexto: %s tokens)\n' "$OLLAMA_CHAT_MODEL" "$OLLAMA_CODE_CONTEXT_LENGTH"
+  printf '  Modelo Business      : %s (contexto: %s tokens)\n' "$OLLAMA_BUSINESS_MODEL" "$OLLAMA_BUSINESS_CONTEXT_LENGTH"
+  printf '  Modelo Embeddings    : bge-m3 (execução em CPU)\n'
+  printf '  Quantização Cache K/V: %s\n' "$OLLAMA_KV_CACHE_QUANTIZATION"
+  printf '  Residência em RAM    : %s\n' "$OLLAMA_KEEP_ALIVE"
+  printf '  Aceleração Hardware  : %s\n' "$ollama_acceleration"
+  printf '  E-mail Administrativo: %s\n' "$ADMIN_EMAIL"
+  printf '  URLs dos Serviços    :\n'
+  printf '    • Open WebUI : %s\n' "$OPENWEBUI_PUBLIC_URL"
+  printf '    • Painel     : %s\n' "$ADMIN_PUBLIC_URL"
+  printf '    • Grafana    : %s\n' "$GRAFANA_PUBLIC_URL"
+  printf '    • MCP        : %s\n' "$MCP_PUBLIC_URL"
+  print_rule
+  printf '\n'
+}
+
+choose_installation_mode() {
+  local mode_arg="${1:-}" choice
+
+  if [[ "$mode_arg" == '--express' || "$mode_arg" == '-y' || "$mode_arg" == '--yes' ]]; then
+    INSTALL_MODE='express'
+    info 'Modo Express ativado via parâmetro.'
+    return 0
+  fi
+
+  if [[ "$mode_arg" == '--interactive' || "$mode_arg" == '--step-by-step' ]]; then
+    INSTALL_MODE='interactive'
+    info 'Modo Passo a Passo ativado via parâmetro.'
+    return 0
+  fi
+
+  show_configuration_summary
+
+  printf "${COLOR_BOLD}Como você deseja prosseguir com a instalação?${COLOR_RESET}\n\n"
+  printf "  ${COLOR_CYAN}${COLOR_BOLD}1${COLOR_RESET}  ${COLOR_BOLD}Instalação Expressa (Recomendada)${COLOR_RESET}\n"
+  printf "     ${COLOR_MUTED}Inicia imediatamente usando as configurações exibidas acima (sem novos prompts).${COLOR_RESET}\n\n"
+  printf "  ${COLOR_CYAN}${COLOR_BOLD}2${COLOR_RESET}  ${COLOR_BOLD}Instalação Passo a Passo${COLOR_RESET}\n"
+  printf "     ${COLOR_MUTED}Personaliza cada parâmetro manualmente (comportamento tradicional etapa por etapa).${COLOR_RESET}\n\n"
+
+  while true; do
+    prompt_value 'Escolha [1-2] (padrão: 1):'
+    read -r choice || choice='1'
+    case "${choice:-1}" in
+      1)
+        INSTALL_MODE='express'
+        break
+        ;;
+      2)
+        INSTALL_MODE='interactive'
+        break
+        ;;
+      *) warn 'Opção inválida. Escolha 1 ou 2.' ;;
+    esac
+  done
+}
+
+ensure_admin_password_for_express() {
+  if [[ -n "${OPENWEBUI_DESIRED_PASSWORD:-}" ]]; then
+    return 0
+  fi
+  if [[ -f "${DATA_DIR}/secrets/openwebui.env" ]]; then
+    OPENWEBUI_DESIRED_PASSWORD="$(sed -n 's/^WEBUI_ADMIN_PASSWORD=//p' "${DATA_DIR}/secrets/openwebui.env" | tail -n 1)"
+    if [[ -n "$OPENWEBUI_DESIRED_PASSWORD" ]]; then
+      ADMIN_PASSWORD="$OPENWEBUI_DESIRED_PASSWORD"
+      return 0
+    fi
+  fi
+
+  local password_confirmation
+  printf "\n${COLOR_CYAN}${COLOR_BOLD}CREDENCIAL ADMINISTRATIVA${COLOR_RESET}\n"
+  printf "${COLOR_MUTED}Como esta é uma nova instalação sem senha pré-existente, defina a senha para %s:${COLOR_RESET}\n\n" "$ADMIN_EMAIL"
+  while true; do
+    prompt_value 'Senha administrativa (mínimo de 6 caracteres):'
+    read -r -s ADMIN_PASSWORD
+    printf '\n'
+    if (( ${#ADMIN_PASSWORD} < 6 )); then
+      warn "A senha precisa ter pelo menos 6 caracteres."
+      continue
+    fi
+    prompt_value 'Confirme a senha:'
+    read -r -s password_confirmation
+    printf '\n'
+    if [[ "$ADMIN_PASSWORD" == "$password_confirmation" ]]; then
+      OPENWEBUI_DESIRED_PASSWORD="$ADMIN_PASSWORD"
+      break
+    fi
+    warn "As senhas não coincidem."
+  done
+  success "Credencial definida para ${ADMIN_EMAIL}"
+}
+
 create_local_structure() {
   mkdir -p "$REPOSITORIES_DIR" "$CACHE_DIR" "$DATA_DIR" "${DATA_DIR}/bin" "$AGENTGATEWAY_DATA_DIR" "${DATA_DIR}/knowledge-sync" "${DATA_DIR}/secrets/knowledge-sync"
   chmod 755 "$REPOSITORIES_DIR"
@@ -1069,6 +1303,24 @@ write_ollama_gpu_compose_override() {
     printf '      timeout: 10s\n'
     printf '      retries: 3\n'
     printf '      start_period: 30s\n'
+    printf '\n'
+    printf '  open-webui:\n'
+    printf '    deploy:\n'
+    printf '      resources:\n'
+    printf '        reservations:\n'
+    printf '          devices:\n'
+    printf '            - driver: nvidia\n'
+    if [[ "$OLLAMA_GPU_MODE" == all ]]; then
+      printf '              count: all\n'
+    else
+      printf '              device_ids:\n'
+      for device_id in "${device_ids[@]}"; do
+        printf '                - "%s"\n' "$device_id"
+      done
+    fi
+    printf '              capabilities: [gpu]\n'
+    printf '    environment:\n'
+    printf '      USE_CUDA_DOCKER: "true"\n'
   } >"$temporary_file"
   chmod 600 "$temporary_file"
   mv "$temporary_file" "$GPU_COMPOSE_FILE"
@@ -1089,9 +1341,9 @@ write_ollama_quantization_compose_override() {
     printf '    environment:\n'
     printf '      OLLAMA_KEEP_ALIVE: "%s"\n' "$OLLAMA_KEEP_ALIVE"
     printf '      OLLAMA_CONTEXT_LENGTH: "%s"\n' "$OLLAMA_CONTEXT_LENGTH"
-    printf '%s\n' '      OLLAMA_MAX_LOADED_MODELS: "${OLLAMA_MAX_LOADED_MODELS:-1}"'
+    printf '%s\n' '      OLLAMA_MAX_LOADED_MODELS: "${OLLAMA_MAX_LOADED_MODELS:-3}"'
     printf '%s\n' '      OLLAMA_NUM_PARALLEL: "${OLLAMA_NUM_PARALLEL:-1}"'
-    printf '%s\n' '      OLLAMA_MAX_QUEUE: "${OLLAMA_MAX_QUEUE:-16}"'
+    printf '%s\n' '      OLLAMA_MAX_QUEUE: "${OLLAMA_MAX_QUEUE:-64}"'
     if [[ "$OLLAMA_KV_CACHE_QUANTIZATION" == q8_0 ]]; then
       printf '      OLLAMA_FLASH_ATTENTION: "1"\n'
       printf '      OLLAMA_KV_CACHE_TYPE: q8_0\n'
@@ -1200,6 +1452,8 @@ create_environment_file() {
   local temporary_file="${ENV_FILE}.tmp" ui_port=8080 workspace_timezone=America/Maceio repository_sync_concurrency=3 existing_value compose_file compose_profiles legacy_public_url legacy_grafana_url
   local openwebui_public_url="${OPENWEBUI_PUBLIC_URL:-}" admin_public_url="${ADMIN_PUBLIC_URL:-}" grafana_public_url="${GRAFANA_PUBLIC_URL:-}" mcp_public_url="${MCP_PUBLIC_URL:-}"
   local openwebui_public_host admin_public_host grafana_public_host mcp_public_host
+  local ollama_num_parallel=1 ollama_max_loaded_models=3 ollama_max_queue=64
+  local use_cuda_docker=false whisper_device=cpu whisper_cpu_threads=6 whisper_model=medium whisper_compute_type=int8 whisper_language=pt whisper_vad_filter=true bypass_pydub_preprocessing=true whisper_initial_prompt='' audio_tts_split_on=paragraphs
   if [[ -f "$ENV_FILE" ]]; then
     existing_value="$(sed -n 's/^OLLAMA_VERSION=//p' "$ENV_FILE" | tail -n 1)"
     [[ "$existing_value" =~ ^[A-Za-z0-9._-]+$ ]] && OLLAMA_VERSION="$existing_value"
@@ -1247,6 +1501,38 @@ create_environment_file() {
     [[ "$existing_value" =~ ^[0-9]+$ ]] && (( existing_value >= 1 && existing_value <= 100 )) && RAG_TOP_K="$existing_value"
     existing_value="$(sed -n 's/^RAG_TOP_K_RERANKER=//p' "$ENV_FILE" | tail -n 1)"
     [[ "$existing_value" =~ ^[0-9]+$ ]] && (( existing_value >= 1 && existing_value <= 100 )) && RAG_TOP_K_RERANKER="$existing_value"
+    existing_value="$(sed -n 's/^OLLAMA_BUSINESS_MODEL=//p' "$ENV_FILE" | tail -n 1)"
+    [[ -n "$existing_value" ]] && OLLAMA_BUSINESS_MODEL="$existing_value"
+    existing_value="$(sed -n 's/^OLLAMA_CODE_CONTEXT_LENGTH=//p' "$ENV_FILE" | tail -n 1)"
+    [[ "$existing_value" =~ ^[0-9]+$ ]] && OLLAMA_CODE_CONTEXT_LENGTH="$existing_value"
+    existing_value="$(sed -n 's/^OLLAMA_BUSINESS_CONTEXT_LENGTH=//p' "$ENV_FILE" | tail -n 1)"
+    [[ "$existing_value" =~ ^[0-9]+$ ]] && OLLAMA_BUSINESS_CONTEXT_LENGTH="$existing_value"
+    existing_value="$(sed -n 's/^OLLAMA_NUM_PARALLEL=//p' "$ENV_FILE" | tail -n 1)"
+    [[ "$existing_value" =~ ^[0-9]+$ ]] && (( existing_value >= 1 && existing_value <= 16 )) && ollama_num_parallel="$existing_value"
+    existing_value="$(sed -n 's/^OLLAMA_MAX_LOADED_MODELS=//p' "$ENV_FILE" | tail -n 1)"
+    [[ "$existing_value" =~ ^[0-9]+$ ]] && (( existing_value >= 1 && existing_value <= 8 )) && ollama_max_loaded_models="$existing_value"
+    existing_value="$(sed -n 's/^OLLAMA_MAX_QUEUE=//p' "$ENV_FILE" | tail -n 1)"
+    [[ "$existing_value" =~ ^[0-9]+$ ]] && (( existing_value >= 1 && existing_value <= 512 )) && ollama_max_queue="$existing_value"
+    existing_value="$(sed -n 's/^USE_CUDA_DOCKER=//p' "$ENV_FILE" | tail -n 1)"
+    [[ -n "$existing_value" ]] && use_cuda_docker="$existing_value"
+    existing_value="$(sed -n 's/^WHISPER_DEVICE=//p' "$ENV_FILE" | tail -n 1)"
+    [[ -n "$existing_value" ]] && whisper_device="$existing_value"
+    existing_value="$(sed -n 's/^WHISPER_CPU_THREADS=//p' "$ENV_FILE" | tail -n 1)"
+    [[ "$existing_value" =~ ^[0-9]+$ ]] && (( existing_value >= 1 && existing_value <= 64 )) && whisper_cpu_threads="$existing_value"
+    existing_value="$(sed -n 's/^WHISPER_MODEL=//p' "$ENV_FILE" | tail -n 1)"
+    [[ -n "$existing_value" ]] && whisper_model="$existing_value"
+    existing_value="$(sed -n 's/^WHISPER_COMPUTE_TYPE=//p' "$ENV_FILE" | tail -n 1)"
+    [[ -n "$existing_value" ]] && whisper_compute_type="$existing_value"
+    existing_value="$(sed -n 's/^WHISPER_LANGUAGE=//p' "$ENV_FILE" | tail -n 1)"
+    [[ -n "$existing_value" ]] && whisper_language="$existing_value"
+    existing_value="$(sed -n 's/^WHISPER_VAD_FILTER=//p' "$ENV_FILE" | tail -n 1)"
+    [[ -n "$existing_value" ]] && whisper_vad_filter="$existing_value"
+    existing_value="$(sed -n 's/^BYPASS_PYDUB_PREPROCESSING=//p' "$ENV_FILE" | tail -n 1)"
+    [[ -n "$existing_value" ]] && bypass_pydub_preprocessing="$existing_value"
+    existing_value="$(sed -n 's/^WHISPER_INITIAL_PROMPT=//p' "$ENV_FILE" | tail -n 1)"
+    [[ -n "$existing_value" ]] && whisper_initial_prompt="$existing_value"
+    existing_value="$(sed -n 's/^AUDIO_TTS_SPLIT_ON=//p' "$ENV_FILE" | tail -n 1)"
+    [[ -n "$existing_value" ]] && audio_tts_split_on="$existing_value"
   fi
   compose_file="${BASE_DIR}/compose.yaml"
   [[ ! -f "$OLLAMA_COMPOSE_FILE" ]] || compose_file="${compose_file}:${OLLAMA_COMPOSE_FILE}"
@@ -1265,10 +1551,15 @@ create_environment_file() {
   admin_public_host="$(public_url_host "$admin_public_url")"
   grafana_public_host="$(public_url_host "$grafana_public_url")"
   mcp_public_host="$(public_url_host "$mcp_public_url")"
-  printf 'CBM_CACHE_DIR=%s\nCBM_ALLOWED_ROOT=%s\nCBM_MEM_BUDGET_MB=%s\nCBM_HOST_BIN=%s\nLOCAL_UID=%s\nLOCAL_GID=%s\nUI_PORT=%s\nOPENWEBUI_PUBLIC_URL=%s\nOPENWEBUI_PUBLIC_HOST=%s\nADMIN_PUBLIC_URL=%s\nADMIN_PUBLIC_HOST=%s\nGRAFANA_PUBLIC_URL=%s\nGRAFANA_PUBLIC_HOST=%s\nMCP_PUBLIC_URL=%s\nMCP_PUBLIC_HOST=%s\nWORKSPACE_TIMEZONE=%s\nREPOSITORY_SYNC_CONCURRENCY=%s\nADMIN_EMAIL=%s\nADMIN_USERNAME=%s\nOLLAMA_VERSION=%s\nOLLAMA_CHAT_MODEL=%s\nOLLAMA_CONTEXT_LENGTH=%s\nOLLAMA_KV_CACHE_QUANTIZATION=%s\nOLLAMA_KEEP_ALIVE=%s\nOLLAMA_RUNTIME=%s\nOLLAMA_BASE_URL=%s\nCOMPOSE_FILE=%s\nCOMPOSE_PROFILES=%s\nOLLAMA_GPU_MODE=%s\nOLLAMA_GPU_DEVICE_IDS=%s\nDOCLING_VERSION=%s\nDOCLING_CPU_THREADS=%s\nRAG_RERANKING_MODEL=%s\nRAG_RERANKING_BATCH_SIZE=%s\nRAG_TOP_K=%s\nRAG_TOP_K_RERANKER=%s\n' \
+  printf 'CBM_CACHE_DIR=%s\nCBM_ALLOWED_ROOT=%s\nCBM_MEM_BUDGET_MB=%s\nCBM_HOST_BIN=%s\nLOCAL_UID=%s\nLOCAL_GID=%s\nUI_PORT=%s\nOPENWEBUI_PUBLIC_URL=%s\nOPENWEBUI_PUBLIC_HOST=%s\nADMIN_PUBLIC_URL=%s\nADMIN_PUBLIC_HOST=%s\nGRAFANA_PUBLIC_URL=%s\nGRAFANA_PUBLIC_HOST=%s\nMCP_PUBLIC_URL=%s\nMCP_PUBLIC_HOST=%s\nWORKSPACE_TIMEZONE=%s\nREPOSITORY_SYNC_CONCURRENCY=%s\nADMIN_EMAIL=%s\nADMIN_USERNAME=%s\nOLLAMA_VERSION=%s\nOLLAMA_CHAT_MODEL=%s\nOLLAMA_BUSINESS_MODEL=%s\nOLLAMA_CONTEXT_LENGTH=%s\nOLLAMA_CODE_CONTEXT_LENGTH=%s\nOLLAMA_BUSINESS_CONTEXT_LENGTH=%s\nOLLAMA_KV_CACHE_QUANTIZATION=%s\nOLLAMA_NUM_PARALLEL=%s\nOLLAMA_MAX_LOADED_MODELS=%s\nOLLAMA_MAX_QUEUE=%s\nOLLAMA_KEEP_ALIVE=%s\nOLLAMA_RUNTIME=%s\nOLLAMA_BASE_URL=%s\nUSE_CUDA_DOCKER=%s\nWHISPER_DEVICE=%s\nWHISPER_CPU_THREADS=%s\nWHISPER_MODEL=%s\nWHISPER_COMPUTE_TYPE=%s\nWHISPER_LANGUAGE=%s\nWHISPER_VAD_FILTER=%s\nBYPASS_PYDUB_PREPROCESSING=%s\nWHISPER_INITIAL_PROMPT=%s\nAUDIO_TTS_SPLIT_ON=%s\nCOMPOSE_FILE=%s\nCOMPOSE_PROFILES=%s\nOLLAMA_GPU_MODE=%s\nOLLAMA_GPU_DEVICE_IDS=%s\nDOCLING_VERSION=%s\nDOCLING_CPU_THREADS=%s\nRAG_RERANKING_MODEL=%s\nRAG_RERANKING_BATCH_SIZE=%s\nRAG_TOP_K=%s\nRAG_TOP_K_RERANKER=%s\n' \
     "$CACHE_DIR" "$REPOSITORIES_DIR" "$CBM_MEM_BUDGET_MB" "$CBM_CONTAINER_BIN" "$(id -u)" "$(id -g)" "$ui_port" \
     "$openwebui_public_url" "$openwebui_public_host" "$admin_public_url" "$admin_public_host" "$grafana_public_url" "$grafana_public_host" "$mcp_public_url" "$mcp_public_host" \
-    "$workspace_timezone" "$repository_sync_concurrency" "$ADMIN_EMAIL" "$ADMIN_USERNAME" "$OLLAMA_VERSION" "$OLLAMA_CHAT_MODEL" "$OLLAMA_CONTEXT_LENGTH" "$OLLAMA_KV_CACHE_QUANTIZATION" "$OLLAMA_KEEP_ALIVE" "$OLLAMA_RUNTIME" "$OLLAMA_BASE_URL" "$compose_file" "$compose_profiles" "$OLLAMA_GPU_MODE" "$OLLAMA_GPU_DEVICE_IDS" "$DOCLING_VERSION" "$DOCLING_CPU_THREADS" "$RAG_RERANKING_MODEL" "$RAG_RERANKING_BATCH_SIZE" "$RAG_TOP_K" "$RAG_TOP_K_RERANKER" >"$temporary_file"
+    "$workspace_timezone" "$repository_sync_concurrency" "$ADMIN_EMAIL" "$ADMIN_USERNAME" \
+    "$OLLAMA_VERSION" "$OLLAMA_CHAT_MODEL" "$OLLAMA_BUSINESS_MODEL" "$OLLAMA_CONTEXT_LENGTH" "$OLLAMA_CODE_CONTEXT_LENGTH" "$OLLAMA_BUSINESS_CONTEXT_LENGTH" "$OLLAMA_KV_CACHE_QUANTIZATION" \
+    "$ollama_num_parallel" "$ollama_max_loaded_models" "$ollama_max_queue" \
+    "$OLLAMA_KEEP_ALIVE" "$OLLAMA_RUNTIME" "$OLLAMA_BASE_URL" \
+    "$use_cuda_docker" "$whisper_device" "$whisper_cpu_threads" "$whisper_model" "$whisper_compute_type" "$whisper_language" "$whisper_vad_filter" "$bypass_pydub_preprocessing" "$whisper_initial_prompt" "$audio_tts_split_on" \
+    "$compose_file" "$compose_profiles" "$OLLAMA_GPU_MODE" "$OLLAMA_GPU_DEVICE_IDS" "$DOCLING_VERSION" "$DOCLING_CPU_THREADS" "$RAG_RERANKING_MODEL" "$RAG_RERANKING_BATCH_SIZE" "$RAG_TOP_K" "$RAG_TOP_K_RERANKER" >"$temporary_file"
   chmod 600 "$temporary_file"
   mv "$temporary_file" "$ENV_FILE"
   success "Arquivo .env gerado com caminhos absolutos"
@@ -1838,23 +2129,33 @@ show_summary() {
 }
 
 main() {
+  local cli_mode="${1:-}"
   show_welcome
   require_supported_system
   success "Sistema compatível detectado: ${SYSTEM_PLATFORM} (${SYSTEM_ARCHITECTURE})"
-  info 'Pressione Enter para aceitar o valor padrão exibido em cada etapa.'
-  ask_memory_budget
-  ask_ollama_runtime
-  ask_ollama_model
-  ask_ollama_context_length
-  ask_ollama_quantization
-  ask_ollama_keep_alive
-  ask_ollama_gpu
-  ask_proxy_access
-  ask_public_urls
 
-  if ! confirm_configuration; then
-    printf "\n${COLOR_YELLOW}Instalação cancelada.${COLOR_RESET} Nenhuma alteração foi aplicada.\n\n"
-    return 0
+  resolve_default_configuration
+  choose_installation_mode "$cli_mode"
+
+  if [[ "$INSTALL_MODE" == 'interactive' ]]; then
+    info 'Pressione Enter para aceitar o valor padrão exibido em cada etapa.'
+    ask_memory_budget
+    ask_ollama_runtime
+    ask_ollama_model
+    ask_ollama_context_length
+    ask_ollama_quantization
+    ask_ollama_keep_alive
+    ask_ollama_gpu
+    ask_proxy_access
+    ask_public_urls
+
+    if ! confirm_configuration; then
+      printf "\n${COLOR_YELLOW}Instalação cancelada.${COLOR_RESET} Nenhuma alteração foi aplicada.\n\n"
+      return 0
+    fi
+  else
+    ensure_admin_password_for_express
+    success 'Iniciando instalação Express com configurações padronizadas.'
   fi
 
   show_install_phase 1 'Sistema e dependências' 'Validando permissões e preparando Docker e ferramentas do host.'

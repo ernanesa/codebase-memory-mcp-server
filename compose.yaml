@@ -195,12 +195,12 @@ services:
     environment:
       WEBUI_URL: "${OPENWEBUI_PUBLIC_URL:-http://openwebui.localhost:8080}"
       OLLAMA_BASE_URL: "${OLLAMA_BASE_URL:-http://ollama:11434}"
-      OPENWEBUI_HIDDEN_BASE_MODEL_IDS: "${OPENWEBUI_HIDDEN_BASE_MODEL_IDS:-ornith15-9b-ad-chat:latest,bge-m3:latest,qwen2.5-coder:14b-instruct-q4_0,batiai/gemma4-26b:iq3,qwen2.5-coder:14b-instruct-q8_0,ornith:9b-q4_K_M,qwen3.5:9b,gemma4:e2b,ornith15-9b-ad:latest,ornith15-9b-q4:latest}"
+      #OPENWEBUI_HIDDEN_BASE_MODEL_IDS: "${OPENWEBUI_HIDDEN_BASE_MODEL_IDS:-ornith15-9b-ad-chat:latest,bge-m3:latest,qwen2.5-coder:14b-instruct-q4_0,batiai/gemma4-26b:iq3,qwen2.5-coder:14b-instruct-q8_0,ornith:9b-q4_K_M,qwen3.5:9b,gemma4:e2b,ornith15-9b-ad:latest,ornith15-9b-q4:latest}"
       RAG_EMBEDDING_ENGINE: ollama
       RAG_EMBEDDING_MODEL: bge-m3
       CONTENT_EXTRACTION_ENGINE: docling
       DOCLING_SERVER_URL: http://docling:5001
-      DOCLING_PARAMS: '{"do_ocr":true,"force_ocr":false,"table_mode":"accurate","pipeline":"standard","ocr_engine":"tesseract","ocr_lang":["por","eng"]}'
+      DOCLING_PARAMS: '{"do_ocr":true,"force_ocr":false,"table_mode":"accurate","pipeline":"standard","ocr_engine":"rapidocr","ocr_lang":["por","eng"]}'
       ENABLE_RAG_HYBRID_SEARCH: "true"
       RAG_RERANKING_ENGINE: ""
       RAG_RERANKING_MODEL: "${RAG_RERANKING_MODEL-BAAI/bge-reranker-v2-m3}"
@@ -210,7 +210,26 @@ services:
       ENABLE_KB_EXEC: "true"
       ENABLE_SIGNUP: "false"
       DEFAULT_USER_ROLE: pending
+      ENABLE_RETRIEVAL_QUERY_GENERATION: "false"
+      ENABLE_SEARCH_QUERY_GENERATION: "false"
+      ENABLE_TAGS_GENERATION: "false"
+      ENABLE_FOLLOW_UP_GENERATION: "false"
       AIOHTTP_CLIENT_TIMEOUT_TOOL_SERVER: "120"
+      DATABASE_SQLITE_PRAGMA_MMAP_SIZE: "${DATABASE_SQLITE_PRAGMA_MMAP_SIZE:-2147483648}"
+      DATABASE_SQLITE_PRAGMA_SYNCHRONOUS: "${DATABASE_SQLITE_PRAGMA_SYNCHRONOUS:-NORMAL}"
+      DATABASE_SQLITE_PRAGMA_CACHE_SIZE: "${DATABASE_SQLITE_PRAGMA_CACHE_SIZE:--65536}"
+      DATABASE_SQLITE_PRAGMA_BUSY_TIMEOUT: "${DATABASE_SQLITE_PRAGMA_BUSY_TIMEOUT:-5000}"
+      USE_CUDA_DOCKER: "${USE_CUDA_DOCKER:-true}"
+      WHISPER_DEVICE: "${WHISPER_DEVICE:-cpu}"
+      WHISPER_CPU_THREADS: "${WHISPER_CPU_THREADS:-6}"
+      WHISPER_MODEL: "${WHISPER_MODEL:-medium}"
+      WHISPER_COMPUTE_TYPE: "${WHISPER_COMPUTE_TYPE:-int8}"
+      WHISPER_LANGUAGE: "${WHISPER_LANGUAGE:-pt}"
+      WHISPER_VAD_FILTER: "${WHISPER_VAD_FILTER:-true}"
+      WHISPER_INITIAL_PROMPT: "${WHISPER_INITIAL_PROMPT:-}"
+      BYPASS_PYDUB_PREPROCESSING: "true"
+      AUDIO_STT_ENGINE: "${AUDIO_STT_ENGINE:-}"
+      AUDIO_TTS_SPLIT_ON: "${AUDIO_TTS_SPLIT_ON:-paragraphs}"
     volumes:
       - openwebui-data:/app/backend/data
     expose:

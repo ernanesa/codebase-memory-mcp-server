@@ -6,17 +6,18 @@ set -eu
 : "${OLLAMA_URL:?OLLAMA_URL não configurada}"
 : "${WEBUI_ADMIN_EMAIL:?WEBUI_ADMIN_EMAIL não configurado}"
 : "${WEBUI_ADMIN_PASSWORD:?WEBUI_ADMIN_PASSWORD não configurado}"
-: "${OLLAMA_CHAT_MODEL:=qwen2.5-coder:14b-instruct-q4_0}"
+: "${OLLAMA_CHAT_MODEL:=qwen2.5-coder:7b}"
 : "${OLLAMA_BUSINESS_MODEL:=ornith15-9b-ad:latest}"
-: "${OLLAMA_CONTEXT_LENGTH:=64000}"
-: "${OLLAMA_CODE_CONTEXT_LENGTH:=16384}"
-: "${OLLAMA_BUSINESS_CONTEXT_LENGTH:=16384}"
-: "${OLLAMA_CODE_NUM_GPU:=48}"
+: "${OLLAMA_CONTEXT_LENGTH:=32768}"
+: "${OLLAMA_CODE_CONTEXT_LENGTH:=24576}"
+: "${OLLAMA_BUSINESS_CONTEXT_LENGTH:=32768}"
+: "${OLLAMA_CODE_NUM_GPU:=99}"
+: "${OLLAMA_BUSINESS_NUM_GPU:=99}"
 : "${OLLAMA_EMBEDDING_MODEL:=bge-m3}"
 : "${RAG_RERANKING_MODEL:=}"
 : "${RAG_RERANKING_BATCH_SIZE:=4}"
-: "${RAG_TOP_K:=20}"
-: "${RAG_TOP_K_RERANKER:=8}"
+: "${RAG_TOP_K:=6}"
+: "${RAG_TOP_K_RERANKER:=4}"
 : "${MCP_ADMIN_URL:?MCP_ADMIN_URL não configurada}"
 : "${MCP_SYSTEM_TOKEN_FILE:?MCP_SYSTEM_TOKEN_FILE não configurado}"
 
@@ -170,16 +171,24 @@ if [ -n "$models_response" ]; then
     m_id="$(echo "$model_id" | tr '[:upper:]' '[:lower:]')"
 
     if echo "$base_id $m_id" | grep -qE "coder|code"; then
-      updated_payload="$(echo "$item" | jq --argjson ctx "$OLLAMA_CODE_CONTEXT_LENGTH" --argjson gpu "$OLLAMA_CODE_NUM_GPU" '
-        .info | .params.num_ctx = $ctx | .params.num_gpu = $gpu
+      updated_payload="$(echo "$item" | jq --arg chat_model "$OLLAMA_CHAT_MODEL" --argjson ctx "$OLLAMA_CODE_CONTEXT_LENGTH" --argjson gpu "$OLLAMA_CODE_NUM_GPU" '
+        .info | (if .base_model_id != null and .base_model_id != "" then .base_model_id = $chat_model else . end) | .params.num_ctx = $ctx | .params.num_gpu = $gpu | .params.num_batch = 512 | .params.temperature = 0.2 | .params.repeat_penalty = 1.05 | .params.top_p = 0.85 | .params.min_p = 0.05
       ')"
       curl -fsS "$OPENWEBUI_URL/api/v1/models/model/update" \
         -H "$authorization" \
         -H 'content-type: application/json' \
         -d "$updated_payload" >/dev/null 2>&1 || true
     elif echo "$base_id $m_id" | grep -qE "ornith|business"; then
-      updated_payload="$(echo "$item" | jq --argjson ctx "$OLLAMA_BUSINESS_CONTEXT_LENGTH" '
-        .info | .params.num_ctx = $ctx
+      updated_payload="$(echo "$item" | jq --arg business_model "$OLLAMA_BUSINESS_MODEL" --argjson ctx "$OLLAMA_BUSINESS_CONTEXT_LENGTH" --argjson gpu "$OLLAMA_BUSINESS_NUM_GPU" '
+        .info | (if .base_model_id != null and .base_model_id != "" then .base_model_id = $business_model else . end) | .params.num_ctx = $ctx | .params.num_gpu = $gpu | .params.num_batch = 512 | .params.temperature = 0.3 | .params.repeat_penalty = 1.05 | .params.top_p = 0.85 | .params.min_p = 0.05
+      ')"
+      curl -fsS "$OPENWEBUI_URL/api/v1/models/model/update" \
+        -H "$authorization" \
+        -H 'content-type: application/json' \
+        -d "$updated_payload" >/dev/null 2>&1 || true
+    elif echo "$base_id $m_id" | grep -qE "bge|embed"; then
+      updated_payload="$(echo "$item" | jq '
+        .info | .params.num_gpu = 0
       ')"
       curl -fsS "$OPENWEBUI_URL/api/v1/models/model/update" \
         -H "$authorization" \
