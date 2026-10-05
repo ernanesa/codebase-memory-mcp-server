@@ -1067,6 +1067,37 @@ function validUserId(value) {
 }
 
 export function createMcpGuardrailHandlers(resolveAccess, { sharedSecret = SERVICE_CREDENTIAL } = {}) {
+  const pendingCallsByUser = new Map();
+
+  function recordPendingCall(userId, data) {
+    if (!userId) return;
+    const now = Date.now();
+    let queue = pendingCallsByUser.get(userId);
+    if (!queue) {
+      queue = [];
+      pendingCallsByUser.set(userId, queue);
+    }
+    while (queue.length > 0 && now - queue[0].createdAt > 60_000) {
+      queue.shift();
+    }
+    queue.push({ ...data, createdAt: now });
+  }
+
+  function resolvePendingCall(userId, toolName) {
+    if (!userId) return null;
+    const queue = pendingCallsByUser.get(userId);
+    if (!queue || queue.length === 0) return null;
+    const now = Date.now();
+    while (queue.length > 0 && now - queue[0].createdAt > 60_000) {
+      queue.shift();
+    }
+    const matchIndex = queue.findIndex(item => !toolName || item.toolName === toolName || item.originalTool === toolName || item.facadeTool === toolName);
+    if (matchIndex !== -1) {
+      return queue.splice(matchIndex, 1)[0];
+    }
+    return queue.shift() || null;
+  }
+
   return {
     checkRequest(call, callback) {
       const started = performance.now();
@@ -1090,6 +1121,14 @@ export function createMcpGuardrailHandlers(resolveAccess, { sharedSecret = SERVI
 
         if (shouldMutate) {
           const finalParams = mapResult.mapped ? mapResult.params : requestParams;
+          recordPendingCall(userId, {
+            toolName: mapResult.backendTool,
+            facadeTool: mapResult.facadeTool || '',
+            originalTool: params.name || '',
+            resolvedProject: decision.resolvedProject || '',
+            callArgs: JSON.stringify(finalParams.arguments || {}),
+            ...retrievalMetadata(params.arguments)
+          });
           return callback(null, {
             mutated: Buffer.from(JSON.stringify(finalParams)),
             metadata: structToProto({
@@ -1102,6 +1141,15 @@ export function createMcpGuardrailHandlers(resolveAccess, { sharedSecret = SERVI
             })
           });
         }
+
+        recordPendingCall(userId, {
+          toolName: decision.toolName || '',
+          facadeTool: '',
+          originalTool: params.name || '',
+          resolvedProject: decision.resolvedProject || '',
+          callArgs: JSON.stringify(requestParams.arguments || {}),
+          ...retrievalMetadata(params.arguments)
+        });
 
         callback(null, {
           pass: {},
@@ -1130,6 +1178,21 @@ export function createMcpGuardrailHandlers(resolveAccess, { sharedSecret = SERVI
         const access = resolveAccess(String(metadata.userId || ''));
         const method = String(call.request.method || '');
         if (method === 'tools/call' && !access) return callback(null, permissionDenied('Credencial sem cadastro de acesso MCP.'));
+
+        if (method === 'tools/call' && (!metadata.callArgs || !metadata.originalTool || !metadata.toolName)) {
+          const pending = resolvePendingCall(metadata.userId, metadata.toolName);
+          if (pending) {
+            if (!metadata.toolName) metadata.toolName = pending.toolName;
+            if (!metadata.originalTool) metadata.originalTool = pending.originalTool;
+            if (!metadata.facadeTool) metadata.facadeTool = pending.facadeTool;
+            if (!metadata.callArgs) metadata.callArgs = pending.callArgs;
+            if (!metadata.resolvedProject) metadata.resolvedProject = pending.resolvedProject;
+            if (!metadata.retrievalMode && pending.retrievalMode) metadata.retrievalMode = pending.retrievalMode;
+            if (metadata.diversityPerPath == null && pending.diversityPerPath != null) metadata.diversityPerPath = pending.diversityPerPath;
+            if (metadata.includeTests == null && pending.includeTests != null) metadata.includeTests = pending.includeTests;
+          }
+        }
+
         if (method === 'tools/call' && (!metadata.callArgs || !metadata.originalTool || !metadata.toolName)) {
           return callback(null, permissionDenied('Metadados de autorização incompletos para a resposta MCP.'));
         }
