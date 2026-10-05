@@ -109,6 +109,36 @@ if [ "$ENABLE_CONTEXT_COMPACTION" = "true" ]; then
   echo "Compressão de contexto ativada (threshold: $CONTEXT_COMPACTION_TOKEN_THRESHOLD, retenção: $CONTEXT_COMPACTION_RETENTION_PERCENTAGE%)"
 fi
 
+query_template='### Task:
+Analise o histórico e a última mensagem do usuário para determinar se há necessidade real de buscar documentos na base de conhecimento.
+
+### Regras Mandatórias de Decisão:
+1. Se a última mensagem for uma SAUDAÇÃO ou CUMPRIMENTO (ex: "oi", "olá", "e aê", "bom dia", "boa tarde", "boa noite", "fala aí"), agradecimento ("obrigado", "valeu"), despedida ("tchau", "até mais"), pergunta de identidade/apresentação ("qual o teu nome?", "quem é você?", "como você pode ajudar?"), pergunta sobre data/hora ("que dia é hoje?", "qual a data?") ou conversa casual:
+   É TERMINANTEMENTE PROIBIDO gerar buscas. Retorne OBRIGATORIAMENTE:
+   {"queries": []}
+
+2. Se a mensagem for uma pergunta técnica sobre regras de negócio, APIs, endpoints, contratos, documentação corporativa ou código que EXIJA consulta factual:
+   Gere de 1 a 3 termos de busca cirúrgicos e objetivos.
+
+3. Responda ESTRITAMENTE em formato JSON, sem comentários ou texto adicional:
+{"queries": ["termo1", "termo2"]}
+ou
+{"queries": []}
+
+### Chat History:
+<chat_history>
+{{MESSAGES:END:6}}
+</chat_history>'
+
+tasks_payload="$(jq -cn --arg tmpl "$query_template" '{
+  QUERY_GENERATION_PROMPT_TEMPLATE: $tmpl
+}')"
+curl -fsS "$OPENWEBUI_URL/api/v1/tasks/config/update" \
+  -H "$authorization" \
+  -H 'content-type: application/json' \
+  -d "$tasks_payload" >/dev/null 2>&1 || true
+echo "Roteador inteligente de buscas RAG configurado"
+
 knowledge_list="$(curl -fsS "$OPENWEBUI_URL/api/v1/knowledge/" -H "$authorization")"
 knowledge_id="$(printf '%s' "$knowledge_list" | jq -r '(.items // .)[]? | select(.name == "Knowledge Base Sample") | .id' | head -n 1)"
 if [ -z "$knowledge_id" ]; then
