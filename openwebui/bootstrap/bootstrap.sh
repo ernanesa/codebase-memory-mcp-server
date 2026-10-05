@@ -6,14 +6,17 @@ set -eu
 : "${OLLAMA_URL:?OLLAMA_URL não configurada}"
 : "${WEBUI_ADMIN_EMAIL:?WEBUI_ADMIN_EMAIL não configurado}"
 : "${WEBUI_ADMIN_PASSWORD:?WEBUI_ADMIN_PASSWORD não configurado}"
-: "${OLLAMA_CHAT_MODEL:=qwen2.5-coder:7b}"
-: "${OLLAMA_BUSINESS_MODEL:=ornith15-9b-ad:latest}"
-: "${OLLAMA_CONTEXT_LENGTH:=32768}"
-: "${OLLAMA_CODE_CONTEXT_LENGTH:=24576}"
-: "${OLLAMA_BUSINESS_CONTEXT_LENGTH:=32768}"
+: "${OLLAMA_CHAT_MODEL:=qwen2.5-coder:14b-instruct-q4_0}"
+: "${OLLAMA_BUSINESS_MODEL:=qwen2.5-coder:14b-instruct-q4_0}"
+: "${OLLAMA_CONTEXT_LENGTH:=131072}"
+: "${OLLAMA_CODE_CONTEXT_LENGTH:=131072}"
+: "${OLLAMA_BUSINESS_CONTEXT_LENGTH:=131072}"
 : "${OLLAMA_CODE_NUM_GPU:=99}"
 : "${OLLAMA_BUSINESS_NUM_GPU:=99}"
 : "${OLLAMA_EMBEDDING_MODEL:=bge-m3}"
+: "${ENABLE_CONTEXT_COMPACTION:=true}"
+: "${CONTEXT_COMPACTION_TOKEN_THRESHOLD:=100000}"
+: "${CONTEXT_COMPACTION_RETENTION_PERCENTAGE:=40}"
 : "${RAG_RERANKING_MODEL:=}"
 : "${RAG_RERANKING_BATCH_SIZE:=4}"
 : "${RAG_TOP_K:=6}"
@@ -86,6 +89,25 @@ curl -fsS "$OPENWEBUI_URL/api/v1/retrieval/config/update" \
   -H 'content-type: application/json' \
   -d "$rag_payload" >/dev/null
 echo "RAG híbrido e reranking configurados"
+
+if [ "$ENABLE_CONTEXT_COMPACTION" = "true" ]; then
+  compaction_payload="$(jq -cn \
+    --argjson threshold "$CONTEXT_COMPACTION_TOKEN_THRESHOLD" \
+    --argjson retention "$CONTEXT_COMPACTION_RETENTION_PERCENTAGE" \
+    '{
+      ENABLE_CONTEXT_COMPACTION: true,
+      CONTEXT_COMPACTION_MODEL: "",
+      CONTEXT_COMPACTION_TOKEN_THRESHOLD: $threshold,
+      CONTEXT_COMPACTION_TOKEN_CAP: $threshold,
+      CONTEXT_COMPACTION_RETENTION_PERCENTAGE: $retention,
+      CONTEXT_COMPACTION_PROMPT_TEMPLATE: ""
+    }')"
+  curl -fsS "$OPENWEBUI_URL/api/v1/chats/config/update" \
+    -H "$authorization" \
+    -H 'content-type: application/json' \
+    -d "$compaction_payload" >/dev/null 2>&1 || true
+  echo "Compressão de contexto ativada (threshold: $CONTEXT_COMPACTION_TOKEN_THRESHOLD, retenção: $CONTEXT_COMPACTION_RETENTION_PERCENTAGE%)"
+fi
 
 knowledge_list="$(curl -fsS "$OPENWEBUI_URL/api/v1/knowledge/" -H "$authorization")"
 knowledge_id="$(printf '%s' "$knowledge_list" | jq -r '(.items // .)[]? | select(.name == "Knowledge Base Sample") | .id' | head -n 1)"

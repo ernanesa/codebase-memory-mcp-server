@@ -406,11 +406,11 @@ configure_host_ollama_command() {
     printf '%s\n' '    <string>1</string>'
     printf '%s\n' '    <key>OLLAMA_MAX_QUEUE</key>'
     printf '%s\n' '    <string>64</string>'
-    if [[ "$OLLAMA_KV_CACHE_QUANTIZATION" == q8_0 ]]; then
+    if [[ "$OLLAMA_KV_CACHE_QUANTIZATION" == q8_0 || "$OLLAMA_KV_CACHE_QUANTIZATION" == q4_0 ]]; then
       printf '%s\n' '    <key>OLLAMA_FLASH_ATTENTION</key>'
       printf '%s\n' '    <string>1</string>'
       printf '%s\n' '    <key>OLLAMA_KV_CACHE_TYPE</key>'
-      printf '%s\n' '    <string>q8_0</string>'
+      printf '    <string>%s</string>\n' "$OLLAMA_KV_CACHE_QUANTIZATION"
     fi
     printf '%s\n' '  </dict>'
     printf '%s\n' '  <key>RunAtLoad</key>'
@@ -689,23 +689,29 @@ ask_ollama_quantization() {
   local choice default_choice existing_quantization
   existing_quantization="$(read_existing_environment_value OLLAMA_KV_CACHE_QUANTIZATION)"
   case "$existing_quantization" in
-    fp16|q8_0) OLLAMA_KV_CACHE_QUANTIZATION="$existing_quantization" ;;
+    fp16|q8_0|q4_0) OLLAMA_KV_CACHE_QUANTIZATION="$existing_quantization" ;;
     *) OLLAMA_KV_CACHE_QUANTIZATION='fp16' ;;
   esac
 
   show_config_step 5 'Quantização do cache K/V' 'Escolha o equilíbrio entre precisão e consumo de memória do Ollama.'
   print_option 1 'fp16' 'Maior precisão e uso de memória; padrão do Ollama'
   print_option 2 'q8_0' 'Aproximadamente metade da memória, com pequena perda de precisão'
+  print_option 3 'q4_0' 'Máxima economia de memória (1/4 da memória), ideal para contextos de 128k'
   printf '\n'
 
-  [[ "$OLLAMA_KV_CACHE_QUANTIZATION" == q8_0 ]] && default_choice=2 || default_choice=1
+  case "$OLLAMA_KV_CACHE_QUANTIZATION" in
+    q4_0) default_choice=3 ;;
+    q8_0) default_choice=2 ;;
+    *) default_choice=1 ;;
+  esac
   while true; do
-    prompt_value "Escolha [1-2] (padrão: ${default_choice}):"
+    prompt_value "Escolha [1-3] (padrão: ${default_choice}):"
     read -r choice
     case "${choice:-$default_choice}" in
       1) OLLAMA_KV_CACHE_QUANTIZATION='fp16'; break ;;
       2) OLLAMA_KV_CACHE_QUANTIZATION='q8_0'; break ;;
-      *) warn 'Opção inválida. Escolha 1 ou 2.' ;;
+      3) OLLAMA_KV_CACHE_QUANTIZATION='q4_0'; break ;;
+      *) warn 'Opção inválida. Escolha 1, 2 ou 3.' ;;
     esac
   done
 
@@ -1089,7 +1095,7 @@ resolve_default_configuration() {
   # 5. Quantização do cache K/V
   existing_quantization="$(read_existing_environment_value OLLAMA_KV_CACHE_QUANTIZATION)"
   case "$existing_quantization" in
-    fp16|q8_0) OLLAMA_KV_CACHE_QUANTIZATION="$existing_quantization" ;;
+    fp16|q8_0|q4_0) OLLAMA_KV_CACHE_QUANTIZATION="$existing_quantization" ;;
     *) OLLAMA_KV_CACHE_QUANTIZATION="${OLLAMA_KV_CACHE_QUANTIZATION:-fp16}" ;;
   esac
 
@@ -1344,9 +1350,9 @@ write_ollama_quantization_compose_override() {
     printf '%s\n' '      OLLAMA_MAX_LOADED_MODELS: "${OLLAMA_MAX_LOADED_MODELS:-3}"'
     printf '%s\n' '      OLLAMA_NUM_PARALLEL: "${OLLAMA_NUM_PARALLEL:-1}"'
     printf '%s\n' '      OLLAMA_MAX_QUEUE: "${OLLAMA_MAX_QUEUE:-64}"'
-    if [[ "$OLLAMA_KV_CACHE_QUANTIZATION" == q8_0 ]]; then
+    if [[ "$OLLAMA_KV_CACHE_QUANTIZATION" == q8_0 || "$OLLAMA_KV_CACHE_QUANTIZATION" == q4_0 ]]; then
       printf '      OLLAMA_FLASH_ATTENTION: "1"\n'
-      printf '      OLLAMA_KV_CACHE_TYPE: q8_0\n'
+      printf '      OLLAMA_KV_CACHE_TYPE: %s\n' "$OLLAMA_KV_CACHE_QUANTIZATION"
     fi
   } >"$temporary_file"
   chmod 600 "$temporary_file"
