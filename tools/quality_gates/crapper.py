@@ -19,8 +19,9 @@ import sys
 import re
 import json
 import argparse
+import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Set, Tuple
 
 class FunctionMetric:
     def __init__(self, file_path: str, name: str, start_line: int, end_line: int, cc: int, coverage: float = 0.0):
@@ -48,6 +49,114 @@ class FunctionMetric:
             "status": "PASS" if self.crap < 10.0 else "FAIL"
         }
 
+class CoverageIndex:
+    """Índice O(1) de cobertura real (Cobertura XML / LCOV) com fallback por conjunto pré-indexado de arquivos de teste."""
+    def __init__(self, root_dir: Path):
+        self.root_dir = root_dir
+        self.test_filenames: Set[str] = set()
+        self.line_coverage: Dict[str, Dict[int, int]] = {}
+        self._build_index()
+
+    def _normalize_rel(self, path_str: str) -> str:
+        return path_str.replace("\\", "/").lstrip("./")
+
+    def _build_index(self) -> None:
+        skip_dirs = {"bin", "obj", "node_modules", ".git", "Migrations", "dist"}
+        cobertura_files: List[Path] = []
+        lcov_files: List[Path] = []
+        search_roots = [self.root_dir]
+        if self.root_dir.name in ("src", "source") and self.root_dir.parent != self.root_dir:
+            search_roots.append(self.root_dir.parent)
+
+        for sroot in search_roots:
+            for p in sroot.rglob("*"):
+                if any(skip in p.parts for skip in skip_dirs):
+                    continue
+                if not p.is_file():
+                    continue
+                name_lower = p.name.lower()
+                if name_lower in ("coverage.cobertura.xml", "cobertura.xml", "coverage.xml"):
+                    cobertura_files.append(p)
+                elif name_lower == "lcov.info":
+                    lcov_files.append(p)
+                elif p.suffix in (".cs", ".ts", ".tsx", ".js", ".py"):
+                    self.test_filenames.add(p.name)
+
+        for cob in cobertura_files:
+            self._parse_cobertura(cob)
+        for lcov in lcov_files:
+            self._parse_lcov(lcov)
+
+    def _parse_cobertura(self, xml_path: Path) -> None:
+        try:
+            tree = ET.parse(xml_path)
+            for cls in tree.findall(".//class"):
+                filename = cls.attrib.get("filename")
+                if not filename:
+                    continue
+                norm = self._normalize_rel(filename)
+                lines_map = self.line_coverage.setdefault(norm, {})
+                for line_el in cls.findall(".//line"):
+                    num = int(line_el.attrib.get("number", "0"))
+                    hits = int(line_el.attrib.get("hits", "0"))
+                    if num > 0:
+                        lines_map[num] = max(lines_map.get(num, 0), hits)
+        except Exception:
+            pass
+
+    def _parse_lcov(self, lcov_path: Path) -> None:
+        try:
+            current_file: Optional[str] = None
+            with open(lcov_path, "r", encoding="utf-8", errors="ignore") as f:
+                for raw_line in f:
+                    line = raw_line.strip()
+                    if line.startswith("SF:"):
+                        sf_path = Path(line[3:].strip())
+                        try:
+                            rel = sf_path.resolve().relative_to(self.root_dir.resolve())
+                            current_file = self._normalize_rel(str(rel))
+                        except Exception:
+                            current_file = self._normalize_rel(line[3:].strip())
+                    elif line.startswith("DA:") and current_file:
+                        parts = line[3:].split(",")
+                        if len(parts) >= 2:
+                            num = int(parts[0])
+                            hits = int(parts[1])
+                            lines_map = self.line_coverage.setdefault(current_file, {})
+                            lines_map[num] = max(lines_map.get(num, 0), hits)
+                    elif line == "end_of_record":
+                        current_file = None
+        except Exception:
+            pass
+
+    def get_function_coverage(self, source_file: Path, start_line: int, end_line: int, default_if_tested: float) -> float:
+        rel = str(source_file.relative_to(self.root_dir) if source_file.is_relative_to(self.root_dir) else source_file)
+        norm_rel = self._normalize_rel(rel)
+
+        # 1. Busca cobertura real por linhas (exact ou suffix match)
+        lines_map = self.line_coverage.get(norm_rel)
+        if lines_map is None:
+            for key, val in self.line_coverage.items():
+                if key.endswith(f"/{norm_rel}") or norm_rel.endswith(f"/{key}"):
+                    lines_map = val
+                    break
+
+        if lines_map:
+            instrumented = [hits for ln, hits in lines_map.items() if start_line <= ln <= end_line]
+            if instrumented:
+                covered = sum(1 for h in instrumented if h > 0)
+                return covered / len(instrumented)
+
+        # 2. Fallback O(1) no Set pré-indexado de arquivos de teste
+        stem = source_file.stem
+        candidates = (
+            f"{stem}Test.cs", f"{stem}Tests.cs", f"{stem}.test.ts", f"{stem}.spec.ts",
+            f"{stem}.test.tsx", f"{stem}.spec.tsx", f"{stem}.test.js", f"{stem}.spec.js",
+            f"routes-{stem}.test.js", f"routes-{stem}-mcp.test.js", f"test_{stem}.py"
+        )
+        return default_if_tested if any(c in self.test_filenames for c in candidates) else 0.0
+
+
 def find_test_file_for(source_file: Path, root_dir: Path) -> Optional[Path]:
     """Tenta localizar o arquivo de teste correspondente no projeto."""
     stem = source_file.stem
@@ -61,14 +170,15 @@ def find_test_file_for(source_file: Path, root_dir: Path) -> Optional[Path]:
             return matches[0]
     return None
 
-def analyze_csharp_file(file_path: Path, root_dir: Path) -> List[FunctionMetric]:
+def analyze_csharp_file(file_path: Path, root_dir: Path, cov_index: Optional[CoverageIndex] = None) -> List[FunctionMetric]:
     metrics = []
     try:
         with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
             content = f.read()
 
-        # Verifica se existe arquivo de teste associado
-        has_test = find_test_file_for(file_path, root_dir) is not None
+        has_test = False
+        if cov_index is None:
+            has_test = find_test_file_for(file_path, root_dir) is not None
         base_coverage = 0.85 if has_test else 0.0
 
         # Regex para métodos C#
@@ -107,18 +217,21 @@ def analyze_csharp_file(file_path: Path, root_dir: Path) -> List[FunctionMetric]
                 cc = 1 + branches
 
                 rel_path = str(file_path.relative_to(root_dir) if file_path.is_relative_to(root_dir) else file_path)
-                metrics.append(FunctionMetric(rel_path, method_name, start_line, end_line, cc, base_coverage))
+                fn_cov = cov_index.get_function_coverage(file_path, start_line, end_line, 0.85) if cov_index else base_coverage
+                metrics.append(FunctionMetric(rel_path, method_name, start_line, end_line, cc, fn_cov))
     except Exception:
         pass
     return metrics
 
-def analyze_typescript_file(file_path: Path, root_dir: Path) -> List[FunctionMetric]:
+def analyze_typescript_file(file_path: Path, root_dir: Path, cov_index: Optional[CoverageIndex] = None) -> List[FunctionMetric]:
     metrics = []
     try:
         with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
             content = f.read()
 
-        has_test = find_test_file_for(file_path, root_dir) is not None
+        has_test = False
+        if cov_index is None:
+            has_test = find_test_file_for(file_path, root_dir) is not None
         base_coverage = 0.80 if has_test else 0.0
 
         # Regex para funções e métodos TS/JS
@@ -157,7 +270,8 @@ def analyze_typescript_file(file_path: Path, root_dir: Path) -> List[FunctionMet
                 cc = 1 + branches
 
                 rel_path = str(file_path.relative_to(root_dir) if file_path.is_relative_to(root_dir) else file_path)
-                metrics.append(FunctionMetric(rel_path, fn_name, start_line, end_line, cc, base_coverage))
+                fn_cov = cov_index.get_function_coverage(file_path, start_line, end_line, 0.80) if cov_index else base_coverage
+                metrics.append(FunctionMetric(rel_path, fn_name, start_line, end_line, cc, fn_cov))
     except Exception:
         pass
     return metrics
@@ -165,6 +279,7 @@ def analyze_typescript_file(file_path: Path, root_dir: Path) -> List[FunctionMet
 def scan_path(target_path: Path, max_files: int = 1000) -> List[FunctionMetric]:
     all_metrics = []
     root = target_path if target_path.is_dir() else target_path.parent
+    cov_index = CoverageIndex(root)
     files_to_scan = []
 
     if target_path.is_file():
@@ -180,9 +295,9 @@ def scan_path(target_path: Path, max_files: int = 1000) -> List[FunctionMetric]:
 
     for p in files_to_scan:
         if p.suffix == ".cs":
-            all_metrics.extend(analyze_csharp_file(p, root))
+            all_metrics.extend(analyze_csharp_file(p, root, cov_index))
         elif p.suffix in [".ts", ".tsx", ".js"]:
-            all_metrics.extend(analyze_typescript_file(p, root))
+            all_metrics.extend(analyze_typescript_file(p, root, cov_index))
 
     all_metrics.sort(key=lambda m: m.crap, reverse=True)
     return all_metrics

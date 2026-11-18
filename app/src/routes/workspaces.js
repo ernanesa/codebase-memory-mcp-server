@@ -20,6 +20,26 @@ function publicRepository(item) {
   return { ...item, path: undefined };
 }
 
+function createSemaphore(maxConcurrency = 3) {
+  let active = 0;
+  const waiting = [];
+  return async function withSemaphore(fn) {
+    if (active >= maxConcurrency) {
+      await new Promise(resolve => waiting.push(resolve));
+    }
+    active += 1;
+    try {
+      return await fn();
+    } finally {
+      active -= 1;
+      const next = waiting.shift();
+      if (next) next();
+    }
+  };
+}
+
+const withCloneSlot = createSemaphore(Math.max(1, Math.min(20, Number.parseInt(process.env.REPOSITORY_SYNC_CONCURRENCY || '3', 10) || 3)));
+
 function publicUpdateSchedule(selectedWorkspace) {
   const schedule = selectedWorkspace.updateSchedule;
   let nextRunAt = null;
@@ -198,10 +218,12 @@ export function register(router, ctx) {
       const item = { id, accessId: randomUUID(), workspaceId, githubRepositoryId: String(remote.id), sourceApproval: structuredClone(sourceApproval(selectedWorkspace, remote)), name: remote.name, fullName: remote.fullName, description: remote.description, private: remote.private, language: remote.language, defaultBranch: remote.defaultBranch, status: 'cloning', path: target, createdAt: new Date().toISOString() };
       ctx.state.repositories.push(item);
       const job = ctx.createJob('clone', `Clonando ${remote.fullName}`, `${workspaceId}/${id}`, async (currentJob, log) => {
-        const verified = await revalidateApprovedCorporateSource(ctx, item);
-        await run('git', ['clone', verified.cloneUrl, target], { env: gitAuthEnvironment(ctx.githubToken), onOutput: log });
-        const commit = (await run('git', ['rev-parse', '--short', 'HEAD'], { cwd: target })).stdout.trim();
-        item.status = 'ready'; item.commit = commit; item.lastSyncAt = new Date().toISOString(); currentJob.progress = 100;
+        await withCloneSlot(async () => {
+          const verified = await revalidateApprovedCorporateSource(ctx, item);
+          await run('git', ['clone', verified.cloneUrl, target], { env: gitAuthEnvironment(ctx.githubToken), onOutput: log });
+          const commit = (await run('git', ['rev-parse', '--short', 'HEAD'], { cwd: target })).stdout.trim();
+          item.status = 'ready'; item.commit = commit; item.lastSyncAt = new Date().toISOString(); currentJob.progress = 100;
+        });
       });
       item.activeJobId = job.id;
       created.push(publicRepository(item));

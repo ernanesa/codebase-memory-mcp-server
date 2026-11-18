@@ -145,12 +145,37 @@ Quando precisar investigar a arquitetura, buscar símbolos, seguir chamadores ou
 mkdir -p "$HOME/.cursor/rules"
 echo "$RULE_CONTENT" > "$HOME/.cursor/rules/codebase-memory.mdc"
 
+# 5. Configuração do VS Code, Codex (Corporativo/Pessoal) e Antigravity
+for SKILL_BASE in "$HOME/.codex/skills" "$HOME/.codex_personal/skills" "$HOME/.gemini/config/skills"; do
+  if [ -d "$(dirname "$SKILL_BASE")" ]; then
+    mkdir -p "$SKILL_BASE/company-codebase-memory"
+    echo "$RULE_CONTENT" > "$SKILL_BASE/company-codebase-memory/SKILL.md"
+    echo "✔ Skill company-codebase-memory sincronizada em $SKILL_BASE"
+  fi
+done
+
 # Se estiver em um projeto git local, grava também na raiz do projeto
 if [ -d ".git" ]; then
-  mkdir -p .cursor/rules .agent/skills/company-codebase-memory
+  mkdir -p .cursor/rules .agent/skills/company-codebase-memory .vscode
   echo "$RULE_CONTENT" > .cursor/rules/codebase-memory.mdc
   echo "$RULE_CONTENT" > .agent/skills/company-codebase-memory/SKILL.md
-  echo "✔ Regras e Skills de IA instaladas no projeto (.cursor/rules/ e .agent/skills/)"
+  if [ ! -f ".vscode/mcp.json" ]; then
+    cat <<EOF > ".vscode/mcp.json"
+{
+  "servers": {
+    "codebase-memory": {
+      "type": "http",
+      "url": "$MCP_URL",
+      "headers": {
+        "Authorization": "Bearer $TOKEN"
+      }
+    }
+  }
+}
+EOF
+    chmod 600 ".vscode/mcp.json"
+  fi
+  echo "✔ Regras e Skills de IA instaladas no projeto (.cursor/rules/, .agent/skills/ e .vscode/mcp.json)"
 fi
 
 echo "==================================================================="

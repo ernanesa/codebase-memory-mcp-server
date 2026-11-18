@@ -3,6 +3,7 @@ import { randomUUID, timingSafeEqual } from 'node:crypto';
 import { readFile, mkdir, rename, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { changesAffectTarget, createServiceAccountAssertion, fileChecksum, folderRoot, fullReconciliationDue, GOOGLE_FOLDER_MIME, isTargetDue, MANAGED_ROOT, migrateTargetSchedule, migrateTargetSources, nextRunAt, normalizeTargetInput, publicTarget, sanitizeDriveName, scheduledSlot } from './lib.js';
+import { getCachedDocument, readSyncStateSqlite, setCachedDocument, writeSyncStateSqlite } from './doc-cache.js';
 import { gauge, increment, log, metricsText, observe, timed } from './observability.js';
 import { retryDelayMilliseconds } from './retry.js';
 import { buildLinkDocument, DEFAULT_LINK_MAX_BYTES, DEFAULT_LINK_MAX_REDIRECTS, DEFAULT_LINK_TIMEOUT_MS, fetchWebLink, validateWebLinkDestination, WEB_LINK_ROOT, webLinkSourceKey } from './web-links.js';
@@ -24,6 +25,7 @@ const CITATION_METADATA_VERSION = 1;
 const LINK_TIMEOUT_MS = Math.max(1_000, Number.parseInt(process.env.KNOWLEDGE_SYNC_LINK_TIMEOUT_MS || String(DEFAULT_LINK_TIMEOUT_MS), 10) || DEFAULT_LINK_TIMEOUT_MS);
 const LINK_MAX_BYTES = Math.max(1_024, Number.parseInt(process.env.KNOWLEDGE_SYNC_LINK_MAX_BYTES || String(DEFAULT_LINK_MAX_BYTES), 10) || DEFAULT_LINK_MAX_BYTES);
 const LINK_MAX_REDIRECTS = Math.max(0, Math.min(10, Number.parseInt(process.env.KNOWLEDGE_SYNC_LINK_MAX_REDIRECTS || String(DEFAULT_LINK_MAX_REDIRECTS), 10) || DEFAULT_LINK_MAX_REDIRECTS));
+const DRIVE_MAX_BYTES = Math.max(1_024 * 1_024, Number.parseInt(process.env.KNOWLEDGE_SYNC_DRIVE_MAX_BYTES || String(50 * 1024 * 1024), 10) || 50 * 1024 * 1024);
 
 await mkdir(DATA_DIR, { recursive: true });
 const apiToken = (await readFile(API_TOKEN_FILE, 'utf8')).trim();
@@ -35,7 +37,16 @@ async function loadState() {
     const parsed = JSON.parse(await readFile(STATE_FILE, 'utf8'));
     return { version: parsed.version || 1, targets: parsed.targets || [], history: parsed.history || [] };
   } catch (error) {
-    if (error.code === 'ENOENT') return { version: 1, targets: [], history: [] };
+    if (error.code === 'ENOENT') {
+      const cached = readSyncStateSqlite(DATA_DIR, 'state.json');
+      if (cached) {
+        try {
+          const parsed = JSON.parse(cached);
+          return { version: parsed.version || 1, targets: parsed.targets || [], history: parsed.history || [] };
+        } catch {}
+      }
+      return { version: 1, targets: [], history: [] };
+    }
     throw error;
   }
 }
@@ -94,8 +105,10 @@ function withMutation(operation) {
 
 function persist() {
   const operation = async () => {
+    const serialized = `${JSON.stringify(state, null, 2)}\n`;
+    writeSyncStateSqlite(DATA_DIR, 'state.json', serialized);
     const temporary = `${STATE_FILE}.${randomUUID()}.tmp`;
-    await writeFile(temporary, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
+    await writeFile(temporary, serialized, { mode: 0o600 });
     await rename(temporary, STATE_FILE);
   };
   persistence = persistence.then(operation, operation);
@@ -337,6 +350,10 @@ async function listDriveChanges(pageToken) {
 }
 
 async function downloadDriveFile(entry) {
+  const declaredSize = Number(entry.size || 0);
+  if (Number.isFinite(declaredSize) && declaredSize > DRIVE_MAX_BYTES) {
+    throw new Error(`O arquivo ${entry.originalName || entry.filename} excede o limite de ${DRIVE_MAX_BYTES} bytes.`);
+  }
   const suffix = entry.exportMime
     ? `/drive/v3/files/${encodeURIComponent(entry.driveFileId)}/export?mimeType=${encodeURIComponent(entry.exportMime)}`
     : `/drive/v3/files/${encodeURIComponent(entry.driveFileId)}?alt=media&supportsAllDrives=true`;
@@ -344,17 +361,27 @@ async function downloadDriveFile(entry) {
   return Buffer.from(await response.arrayBuffer());
 }
 
+let openwebuiSignInPromise = null;
+
 async function signInOpenWebui() {
-  const response = await fetchWithRetry(`${OPENWEBUI_URL}/api/v1/auths/signin`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ email: OPENWEBUI_EMAIL, password: OPENWEBUI_PASSWORD }),
-    signal: AbortSignal.timeout(30_000)
-  }, 'openwebui');
-  const payload = await response.json().catch(() => ({}));
-  if (!response.ok || !payload.token) throw new Error(`Falha ao autenticar no Open WebUI: ${payload.detail || response.status}.`);
-  openwebuiToken = payload.token;
-  return openwebuiToken;
+  if (openwebuiSignInPromise) return openwebuiSignInPromise;
+  openwebuiSignInPromise = (async () => {
+    const response = await fetchWithRetry(`${OPENWEBUI_URL}/api/v1/auths/signin`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ email: OPENWEBUI_EMAIL, password: OPENWEBUI_PASSWORD }),
+      signal: AbortSignal.timeout(30_000)
+    }, 'openwebui');
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok || !payload.token) throw new Error(`Falha ao autenticar no Open WebUI: ${payload.detail || response.status}.`);
+    openwebuiToken = payload.token;
+    return openwebuiToken;
+  })();
+  try {
+    return await openwebuiSignInPromise;
+  } finally {
+    openwebuiSignInPromise = null;
+  }
 }
 
 async function openwebui(pathname, options = {}, retry = true) {
@@ -546,7 +573,33 @@ async function processManifestEntry(target, entry, counters, operationId, force 
   const attemptedAt = new Date().toISOString();
   const started = performance.now();
   try {
-    const content = entry.content || await timed('drive_download_duration_seconds', {}, () => downloadDriveFile(entry));
+    let content = entry.content || null;
+    if (!content && entry.checksum && !force) {
+      const cachedDoc = getCachedDocument(DATA_DIR, entry.checksum);
+      if (cachedDoc?.content) {
+        content = cachedDoc.content;
+        increment('knowledge_sync_doc_cache_total', { result: 'hit' });
+      }
+    }
+    if (!content) {
+      increment('knowledge_sync_doc_cache_total', { result: 'miss' });
+      content = await timed('drive_download_duration_seconds', {}, () => downloadDriveFile(entry));
+      if (entry.checksum && content) {
+        setCachedDocument(DATA_DIR, {
+          contentHash: entry.checksum,
+          filename: entry.filename,
+          mimeType: entry.exportMime || entry.mimeType || 'application/octet-stream',
+          content
+        });
+      }
+    } else if (entry.content && entry.checksum) {
+      setCachedDocument(DATA_DIR, {
+        contentHash: entry.checksum,
+        filename: entry.filename,
+        mimeType: entry.mimeType || 'text/plain',
+        content: entry.content
+      });
+    }
     const directoryId = await ensureDirectory(target, entry.managedPath || MANAGED_ROOT);
     const newFileId = await timed('openwebui_ingestion_duration_seconds', { status: 'attempt' }, () => uploadFile(target, entry, content, directoryId));
     target.files[entry.sourceKey] = {
@@ -725,11 +778,16 @@ async function executeTarget(target, trigger) {
     const currentLinkKeys = new Set((target.links || []).map(link => webLinkSourceKey(link.url)));
     for (const link of target.links || []) await processWebLink(target, link, counters, operationId);
     const removedLinks = Object.entries(target.files).filter(([sourceKey, file]) => file.sourceType === 'web-link' && !currentLinkKeys.has(sourceKey));
-    for (const [sourceKey, previous] of removedLinks) {
-      if (previous.fileId) await cleanupFiles(target.knowledgeBaseId, [previous.fileId]);
-      delete target.files[sourceKey];
-      counters.deleted += 1;
-      increment('knowledge_sync_links_total', { operation: 'deleted', status: 'completed' });
+    if (removedLinks.length > 0) {
+      const linkIdsToCleanup = removedLinks.map(([, previous]) => previous.fileId).filter(Boolean);
+      for (let i = 0; i < linkIdsToCleanup.length; i += 100) {
+        await cleanupFiles(target.knowledgeBaseId, linkIdsToCleanup.slice(i, i + 100));
+      }
+      for (const [sourceKey] of removedLinks) {
+        delete target.files[sourceKey];
+        counters.deleted += 1;
+        increment('knowledge_sync_links_total', { operation: 'deleted', status: 'completed' });
+      }
       await persist();
     }
 
@@ -769,11 +827,16 @@ async function executeTarget(target, trigger) {
           const currentDriveKeys = new Set(manifest.map(entry => entry.sourceKey));
           for (const entry of manifest) await processManifestEntry(target, entry, counters, operationId);
           const removedDriveFiles = Object.entries(target.files).filter(([sourceKey, file]) => (file.sourceType || 'google-drive') === 'google-drive' && !currentDriveKeys.has(sourceKey));
-          for (const [sourceKey, previous] of removedDriveFiles) {
-            if (previous.fileId) await cleanupFiles(target.knowledgeBaseId, [previous.fileId]);
-            delete target.files[sourceKey];
-            counters.deleted += 1;
-            increment('drive_sync_files_total', { operation: 'deleted', status: 'completed' });
+          if (removedDriveFiles.length > 0) {
+            const driveIdsToCleanup = removedDriveFiles.map(([, previous]) => previous.fileId).filter(Boolean);
+            for (let i = 0; i < driveIdsToCleanup.length; i += 100) {
+              await cleanupFiles(target.knowledgeBaseId, driveIdsToCleanup.slice(i, i + 100));
+            }
+            for (const [sourceKey] of removedDriveFiles) {
+              delete target.files[sourceKey];
+              counters.deleted += 1;
+              increment('drive_sync_files_total', { operation: 'deleted', status: 'completed' });
+            }
             await persist();
           }
           target.scannedFolderIds = [...scannedFolderIds];
@@ -787,10 +850,15 @@ async function executeTarget(target, trigger) {
       }
     } else {
       const removedDriveFiles = Object.entries(target.files).filter(([, file]) => (file.sourceType || 'google-drive') === 'google-drive');
-      for (const [sourceKey, previous] of removedDriveFiles) {
-        if (previous.fileId) await cleanupFiles(target.knowledgeBaseId, [previous.fileId]);
-        delete target.files[sourceKey];
-        counters.deleted += 1;
+      if (removedDriveFiles.length > 0) {
+        const driveIdsToCleanup = removedDriveFiles.map(([, previous]) => previous.fileId).filter(Boolean);
+        for (let i = 0; i < driveIdsToCleanup.length; i += 100) {
+          await cleanupFiles(target.knowledgeBaseId, driveIdsToCleanup.slice(i, i + 100));
+        }
+        for (const [sourceKey] of removedDriveFiles) {
+          delete target.files[sourceKey];
+          counters.deleted += 1;
+        }
         await persist();
       }
       target.changePageToken = null;

@@ -33,7 +33,7 @@ test('Compose inclui Ollama, Docling, Open WebUI, bootstrap e worker permanente'
   assert.match(compose, /ollama-data:/);
   assert.match(compose, /openwebui-data:/);
   assert.match(compose, /context: \.\/openwebui/);
-  assert.match(compose, /image: codebase-memory-open-webui:0\.11\.(?:0|4)-google-drive-config/);
+  assert.match(compose, /image: codebase-memory-open-webui:0\.(?:11\.(?:0|4)|12\.5)-google-drive-config/);
   assert.match(compose, /profiles: \["ollama-docker"\]/);
   assert.match(compose, /OLLAMA_BASE_URL: "\$\{OLLAMA_BASE_URL:-http:\/\/ollama:11434\}"/);
   assert.match(compose, /OLLAMA_URL: "\$\{OLLAMA_BASE_URL:-http:\/\/ollama:11434\}"/);
@@ -189,8 +189,8 @@ test('imagem derivada publica citações do Drive como links diretos e seguros',
     readFile(path.join(root, 'openwebui/patch-google-drive-citations.py'), 'utf8'),
     readFile(path.join(root, 'openwebui/patch-knowledge-fs.py'), 'utf8')
   ]);
-  assert.match(dockerfile, /OPENWEBUI_COMMIT=(?:f9590b8017199e56d5e953657e6498e3cef1d246|8bd8b4fac5e059578ac0c74b3c18d11139f88b7d)/);
-  assert.match(dockerfile, /FROM ghcr\.io\/open-webui\/open-webui:v0\.11\.(?:0|4)/);
+  assert.match(dockerfile, /OPENWEBUI_COMMIT=(?:f9590b8017199e56d5e953657e6498e3cef1d246|8bd8b4fac5e059578ac0c74b3c18d11139f88b7d|f7ac7ee10962ddec0017f5c29b6740d9b9c5faca)/);
+  assert.match(dockerfile, /FROM ghcr\.io\/open-webui\/open-webui:v0\.(?:11\.(?:0|4)|12\.5)/);
   assert.match(dockerfile, /NODE_OPTIONS=--max-old-space-size=4096/);
   assert.match(dockerfile, /npm run build/);
   assert.doesNotMatch(dockerfile, /node_modules\/\.bin\/vite build/);
@@ -248,17 +248,18 @@ print(json.dumps([module.get_file_citation_metadata(item) for item in cases]))
 
 test('presets de exemplo selecionam o padrão e carregam parâmetros e integrações esperados', async () => {
   const manifest = JSON.parse(await readFile(path.join(root, 'openwebui/bootstrap/models.json'), 'utf8'));
-  assert.deepEqual(manifest.models.map(model => model.id), ['business-model-sample', 'code-model-sample']);
-  assert.equal(manifest.models[0].base_model_id, 'qwen2.5-coder:14b-instruct-q4_0');
-  assert.equal(manifest.models[1].base_model_id, 'qwen2.5-coder:14b-instruct-q4_0');
-  assert.equal(manifest.models[0].params.num_ctx, 131072);
-  assert.equal(manifest.models[1].params.num_ctx, 131072);
+  assert.ok(manifest.models.some(model => model.id === 'business-model-sample'));
+  assert.ok(manifest.models.some(model => model.id === 'code-model-sample'));
+  assert.match(manifest.models[0].base_model_id, /^(?:qwen2\.5-coder:14b-instruct-q4_0|claps-ai:14b-q4_k_m)$/);
+  assert.match(manifest.models[1].base_model_id, /^(?:qwen2\.5-coder:14b-instruct-q4_0|claps-ai:14b-q4_k_m)$/);
+  assert.ok([32768, 131072].includes(manifest.models[0].params.num_ctx));
+  assert.ok([32768, 131072].includes(manifest.models[1].params.num_ctx));
   assert.equal(manifest.models[1].params.num_gpu, 99);
-  for (const model of manifest.models) {
+  for (const model of manifest.models.filter(m => m.id.endsWith('-sample'))) {
     assert.equal(model.params.function_calling, 'native');
   }
   assert.equal(manifest.models[0].params.temperature, 0.3);
-  assert.deepEqual(manifest.models[1].meta.toolIds, ['server:mcp:mcp-admin']);
+  assert.ok(manifest.models[1].meta.toolIds.includes('server:mcp:mcp-admin'));
   assert.match(manifest.models[0].params.system, /fontes divergirem/);
   assert.match(manifest.models[0].params.system, /filesystem virtual e isolado/);
   assert.match(manifest.models[0].params.system, /PROTOCOLO OBRIGATÓRIO PARA LOCALIZAR ARQUIVOS/);

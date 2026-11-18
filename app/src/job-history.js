@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { chmod, mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import path from 'node:path';
+import { readSqliteKv, writeSqliteKv } from './lib.js';
 
 export const JOB_HISTORY_RETENTION_DAYS = 7;
 export const JOB_HISTORY_RETENTION_MS = JOB_HISTORY_RETENTION_DAYS * 24 * 60 * 60 * 1000;
@@ -55,15 +56,26 @@ export async function loadJobHistory(file) {
     const parsed = JSON.parse(await readFile(file, 'utf8'));
     return Array.isArray(parsed) ? parsed : Array.isArray(parsed.jobs) ? parsed.jobs : [];
   } catch (error) {
-    if (error.code === 'ENOENT') return [];
+    if (error.code === 'ENOENT') {
+      const cached = readSqliteKv(file, `jobs:${path.basename(file)}`);
+      if (cached) {
+        try {
+          const parsed = JSON.parse(cached);
+          return Array.isArray(parsed) ? parsed : Array.isArray(parsed.jobs) ? parsed.jobs : [];
+        } catch {}
+      }
+      return [];
+    }
     throw error;
   }
 }
 
 export async function saveJobHistory(file, jobs) {
   await mkdir(path.dirname(file), { recursive: true });
+  const serialized = `${JSON.stringify({ version: 1, jobs }, null, 2)}\n`;
+  writeSqliteKv(file, `jobs:${path.basename(file)}`, serialized);
   const temporary = `${file}.${randomUUID()}.tmp`;
-  await writeFile(temporary, `${JSON.stringify({ version: 1, jobs }, null, 2)}\n`, { mode: 0o600 });
+  await writeFile(temporary, serialized, { mode: 0o600 });
   await chmod(temporary, 0o600);
   await rename(temporary, file);
 }

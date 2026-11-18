@@ -1018,3 +1018,37 @@ test('pruneSearchResultPayload remove rank e campos inúteis de AST de buscas', 
   assert.equal(pruned.results[0].lines, undefined);
   assert.equal(pruned.results[0].start_line, 10);
 });
+
+test('pruneSnippetPayload poda neighbors recursivamente, remove testes e suporta skeletonOnly e maxLines', () => {
+  const rawSnippet = {
+    qualified_name: 'Claps.Contrato.OrderService',
+    source: 'public class OrderService {\n  public void Process() {\n    var x = 1;\n    var y = 2;\n  }\n}',
+    complexity: 9,
+    neighbors: [
+      { name: 'SaveOrder', file_path: 'src/OrderRepository.cs', complexity: 4, source: '// MIT License\npublic void SaveOrder() {}' },
+      { name: 'OrderServiceTests', file_path: 'tests/OrderServiceTests.cs', complexity: 2 }
+    ]
+  };
+  const pruned = pruneSnippetPayload(rawSnippet, { skeletonOnly: true, maxLines: 3 });
+  assert.equal(pruned.complexity, undefined);
+  assert.equal(pruned.neighbors.length, 1);
+  assert.equal(pruned.neighbors[0].name, 'SaveOrder');
+  assert.equal(pruned.neighbors[0].complexity, undefined);
+  assert.ok(!pruned.neighbors[0].source.includes('MIT License'));
+  assert.ok(pruned.source.includes('/* ... */'));
+  assert.ok(pruned.source.includes('linhas omitidas'));
+});
+
+test('mapFacadeRequest dimensiona limit do backend de acordo com retrieval_mode', () => {
+  const fastReq = mapFacadeRequest({
+    name: 'code_search_surgical',
+    arguments: { project: 'api-pedidos', query: 'Order', retrieval_mode: 'fast' }
+  });
+  assert.equal(fastReq.params.arguments.limit, 16);
+
+  const thoroughReq = mapFacadeRequest({
+    name: 'code_search_surgical',
+    arguments: { project: 'api-pedidos', query: 'Order', retrieval_mode: 'thorough' }
+  });
+  assert.equal(thoroughReq.params.arguments.limit, 50);
+});

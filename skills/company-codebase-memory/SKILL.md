@@ -27,14 +27,14 @@ Reutilizar o projeto selecionado nas chamadas seguintes. Não alternar de projet
 
 ## Executar a investigação
 
-Adaptar a sequência ao pedido e aos schemas publicados em `tools/list`:
+Adaptar a sequência ao pedido e aos schemas publicados em `tools/list` (contrato facade v1.1.0):
 
 1. Obter visão geral com `get_architecture` quando a pergunta envolver módulos, camadas, componentes ou responsabilidades amplas.
-2. Usar `search_graph` para encontrar conceitos, símbolos e relações; usar `query_graph` quando for necessária uma consulta estrutural precisa.
-3. Usar `trace_path` para seguir chamadores, chamadas e caminhos internos. Com token individual, não selecionar o modo `cross_service`, pois ele pode atravessar repositórios e exige credencial de sistema.
-4. Usar `search_code` para localizar texto, símbolos ou implementações e `get_code_snippet` para recuperar o trecho relevante.
-5. Usar `get_graph_schema` antes de montar consultas quando os tipos de nós, relações ou argumentos não estiverem claros.
-6. Consultar `index_status` e `detect_changes` quando a resposta depender de completude, atualidade ou ausência de resultados.
+2. Usar `code_search_surgical` para localizar definições, classes, métodos, rotas e símbolos via FTS5/BM25 (`retrieval_mode: "fast" | "balanced" | "thorough"`, `include_tests: false` por padrão).
+3. Usar `inspect_symbol` para inspeção cirúrgica em 1 único passo (recupera código-fonte higienizado, assinatura e vizinhos/callers/callees de produção).
+4. Usar `get_symbol_snippet` para obter apenas o trecho de código de um símbolo específico (suporta `skeleton_only: true` e `max_lines` para economia de tokens em classes extensas).
+5. Usar `trace_symbol` para seguir chamadores (`callers`) e chamadas (`callees`) com supressão automática de arquivos de teste (`include_tests: false` por padrão). Com token individual, não selecionar o modo `cross_service`, pois ele pode atravessar repositórios e exige credencial de sistema.
+6. Consultar `index_status` quando a resposta depender de completude, atualidade ou ausência de resultados.
 7. Abrir os arquivos relevantes no repositório local e confirmar assinaturas, condições, tratamento de erros, configuração e testes.
 8. Expandir a busca somente quando a evidência atual não sustentar a conclusão.
 

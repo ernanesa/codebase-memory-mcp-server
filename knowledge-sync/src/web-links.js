@@ -125,14 +125,17 @@ function htmlToText(html) {
   const withoutNoise = html
     .replace(/<!--([\s\S]*?)-->/g, ' ')
     .replace(/<(script|style|noscript|svg|template)\b[^>]*>[\s\S]*?<\/\1>/gi, ' ');
-  const main = /<(main|article)\b[^>]*>([\s\S]*?)<\/\1>/i.exec(withoutNoise)?.[2]
-    || /<body\b[^>]*>([\s\S]*?)<\/body>/i.exec(withoutNoise)?.[1]
-    || withoutNoise;
-  const text = cleanText(main
+  const mainMatch = /<(main|article)\b[^>]*>([\s\S]*?)<\/\1>/i.exec(withoutNoise)?.[2];
+  const rawScope = mainMatch
+    || (/<\bbody\b[^>]*>([\s\S]*?)<\/body>/i.exec(withoutNoise)?.[1] || withoutNoise)
+      .replace(/<(nav|footer|aside)\b[^>]*>[\s\S]*?<\/\1>/gi, ' ');
+  const structured = rawScope
+    .replace(/<pre\b[^>]*>\s*(?:<code\b[^>]*>)?([\s\S]*?)(?:<\/code>)?\s*<\/pre>/gi, (_m, code) => `\n\`\`\`\n${code.replace(/<[^>]+>/g, '')}\n\`\`\`\n`)
+    .replace(/<\/(td|th)>\s*<(td|th)\b[^>]*>/gi, ' | ')
     .replace(/<(br|hr)\b[^>]*\/?>/gi, '\n')
-    .replace(/<\/(p|div|section|article|main|header|footer|nav|aside|li|tr|h[1-6]|pre|blockquote)>/gi, '\n')
-    .replace(/<[^>]+>/g, ' '));
-  return { title: cleanText(titleMatch?.[1] || ''), text };
+    .replace(/<\/(p|div|section|article|main|header|footer|nav|aside|li|tr|h[1-6]|pre|blockquote|table)>/gi, '\n')
+    .replace(/<[^>]+>/g, ' ');
+  return { title: cleanText(titleMatch?.[1] || ''), text: cleanText(structured) };
 }
 
 function responseCharset(contentType) {
@@ -203,6 +206,12 @@ export async function validateWebLinkDestination(url, options = {}) {
   return normalized.toString();
 }
 
+const keepAliveHttpsAgent = new https.Agent({
+  keepAlive: true,
+  keepAliveMsecs: 30_000,
+  maxSockets: 16
+});
+
 function requestOnce(url, headers, timeoutMs, maxBytes) {
   return new Promise(async (resolve, reject) => {
     let addresses;
@@ -211,6 +220,7 @@ function requestOnce(url, headers, timeoutMs, maxBytes) {
     const selected = addresses[0];
     const request = https.request(url, {
       method: 'GET',
+      agent: keepAliveHttpsAgent,
       headers: { accept: 'text/html, application/json, application/xml, text/plain, text/markdown, */*;q=0.1', 'user-agent': 'Codebase-Memory-Knowledge-Sync/1.0', ...headers },
       lookup: (_hostname, lookupOptions, callback) => lookupOptions?.all
         ? callback(null, addresses)

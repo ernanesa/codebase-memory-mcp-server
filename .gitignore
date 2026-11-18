@@ -1,5 +1,7 @@
 # Configuração local e segredos
 .env
+.vscode/mcp.json
+.cursor/mcp.json
 
 # Dados gerados pelo instalador
 /cache/

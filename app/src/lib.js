@@ -1,7 +1,9 @@
 import { spawn } from 'node:child_process';
 import { createCipheriv, createDecipheriv, createHash, randomBytes, randomUUID } from 'node:crypto';
+import { chmodSync, existsSync, readdirSync } from 'node:fs';
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import path from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 
 const MCP_USER_MANAGER = 'codebase-memory-admin';
 const MCP_GUARDRAIL_HOST = process.env.MCP_GUARDRAIL_HOST || 'admin:3001';
@@ -129,21 +131,24 @@ function zonedDateParts(date, timezone) {
   return { minute, hour, day, month, weekday };
 }
 
-export function cronMatches(expression, date, timezone) {
-  const cron = typeof expression === 'string' ? parseCronExpression(expression) : expression;
-  const zone = validateTimezone(timezone);
-  const local = zonedDateParts(date, zone);
+function calendarDayMatches(cron, local) {
   const dayMatches = cron.day.values.has(local.day);
   const weekdayMatches = cron.weekday.values.has(local.weekday);
-  const calendarMatches = cron.day.unrestricted && cron.weekday.unrestricted
+  return cron.day.unrestricted && cron.weekday.unrestricted
     ? true
     : cron.day.unrestricted ? weekdayMatches
       : cron.weekday.unrestricted ? dayMatches
         : dayMatches || weekdayMatches;
+}
+
+export function cronMatches(expression, date, timezone) {
+  const cron = typeof expression === 'string' ? parseCronExpression(expression) : expression;
+  const zone = validateTimezone(timezone);
+  const local = zonedDateParts(date, zone);
   return cron.minute.values.has(local.minute)
     && cron.hour.values.has(local.hour)
     && cron.month.values.has(local.month)
-    && calendarMatches;
+    && calendarDayMatches(cron, local);
 }
 
 export function nextCronOccurrence(expression, timezone, after = new Date()) {
@@ -152,9 +157,24 @@ export function nextCronOccurrence(expression, timezone, after = new Date()) {
   const cursor = new Date(after);
   cursor.setUTCSeconds(0, 0);
   cursor.setUTCMinutes(cursor.getUTCMinutes() + 1);
-  const limit = 366 * 24 * 60;
-  for (let index = 0; index < limit; index += 1) {
-    if (cronMatches(cron, cursor, zone)) return new Date(cursor);
+  const maxTimestamp = cursor.getTime() + 366 * 24 * 60 * 60_000;
+  while (cursor.getTime() <= maxTimestamp) {
+    const local = zonedDateParts(cursor, zone);
+    if (!cron.month.values.has(local.month) || !calendarDayMatches(cron, local)) {
+      // Jump safely towards the end of the local day (accounting for potential 1h DST shift)
+      const remainingHours = Math.max(0, 22 - local.hour);
+      const stepMinutes = remainingHours * 60 + Math.max(1, 60 - local.minute);
+      cursor.setUTCMinutes(cursor.getUTCMinutes() + stepMinutes);
+      continue;
+    }
+    if (!cron.hour.values.has(local.hour)) {
+      const stepMinutes = Math.max(1, 60 - local.minute);
+      cursor.setUTCMinutes(cursor.getUTCMinutes() + stepMinutes);
+      continue;
+    }
+    if (cron.minute.values.has(local.minute)) {
+      return new Date(cursor);
+    }
     cursor.setUTCMinutes(cursor.getUTCMinutes() + 1);
   }
   throw new Error('O cron não possui uma próxima execução no período de um ano.');
@@ -223,20 +243,119 @@ export function reconcileRepositoryProjects(repositories, projects) {
   return { repositories: reconciled, changed };
 }
 
+const sqliteStatePools = new Map();
+
+function getSqliteStateDb(jsonFile) {
+  const dbPath = path.join(path.dirname(path.resolve(jsonFile)), 'cbm-state.sqlite');
+  let db = sqliteStatePools.get(dbPath);
+  if (db) return db;
+  try {
+    db = new DatabaseSync(dbPath);
+    try { chmodSync(dbPath, 0o600); } catch {}
+    db.exec('PRAGMA busy_timeout = 5000;');
+    db.exec('PRAGMA journal_mode = WAL;');
+    try { chmodSync(`${dbPath}-wal`, 0o600); chmodSync(`${dbPath}-shm`, 0o600); } catch {}
+    db.exec('PRAGMA synchronous = NORMAL;');
+    db.exec('PRAGMA cache_size = -16000;');
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS kv_store (
+        key TEXT PRIMARY KEY,
+        payload TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+    `);
+    sqliteStatePools.set(dbPath, db);
+    return db;
+  } catch {
+    return null;
+  }
+}
+
+export function writeSqliteKv(jsonFile, key, payloadString) {
+  const db = getSqliteStateDb(jsonFile);
+  if (!db) return false;
+  try {
+    db.prepare('INSERT INTO kv_store (key, payload, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET payload = excluded.payload, updated_at = excluded.updated_at')
+      .run(key, payloadString, new Date().toISOString());
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function readSqliteKv(jsonFile, key) {
+  const db = getSqliteStateDb(jsonFile);
+  if (!db) return null;
+  try {
+    const row = db.prepare('SELECT payload FROM kv_store WHERE key = ?').get(key);
+    return typeof row?.payload === 'string' ? row.payload : null;
+  } catch {
+    return null;
+  }
+}
+
+export function optimizeSqliteDatabase(dbPath) {
+  if (!dbPath || !existsSync(dbPath)) return false;
+  let db;
+  try {
+    db = new DatabaseSync(dbPath);
+    try { chmodSync(dbPath, 0o600); } catch {}
+    db.exec('PRAGMA busy_timeout = 5000;');
+    db.exec('PRAGMA journal_mode = WAL;');
+    try { chmodSync(`${dbPath}-wal`, 0o600); chmodSync(`${dbPath}-shm`, 0o600); } catch {}
+    db.exec('PRAGMA synchronous = NORMAL;');
+    db.exec('PRAGMA mmap_size = 2147483648;');
+    db.exec('PRAGMA cache_size = -64000;');
+    db.exec('PRAGMA optimize;');
+    return true;
+  } catch {
+    return false;
+  } finally {
+    if (db) {
+      try { db.close(); } catch {}
+    }
+  }
+}
+
+export function optimizeSqliteCacheDir(cacheDir) {
+  if (!cacheDir || !existsSync(cacheDir)) return 0;
+  let count = 0;
+  try {
+    const entries = readdirSync(cacheDir).filter(file => file.endsWith('.db') && !file.startsWith('.'));
+    for (const file of entries) {
+      if (optimizeSqliteDatabase(path.join(cacheDir, file))) count += 1;
+    }
+  } catch {
+    // non-fatal
+  }
+  return count;
+}
+
 export async function loadState(file) {
   try {
     const parsed = JSON.parse(await readFile(file, 'utf8'));
     return { workspaces: parsed.workspaces ?? [], repositories: parsed.repositories ?? [] };
   } catch (error) {
-    if (error.code === 'ENOENT') return { workspaces: [], repositories: [] };
+    if (error.code === 'ENOENT') {
+      const cached = readSqliteKv(file, `state:${path.basename(file)}`);
+      if (cached) {
+        try {
+          const parsed = JSON.parse(cached);
+          return { workspaces: parsed.workspaces ?? [], repositories: parsed.repositories ?? [] };
+        } catch {}
+      }
+      return { workspaces: [], repositories: [] };
+    }
     throw error;
   }
 }
 
 export async function saveState(file, state) {
   await mkdir(path.dirname(file), { recursive: true });
+  const serialized = `${JSON.stringify(state, null, 2)}\n`;
+  writeSqliteKv(file, `state:${path.basename(file)}`, serialized);
   const temporary = `${file}.${randomUUID()}.tmp`;
-  await writeFile(temporary, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
+  await writeFile(temporary, serialized, { mode: 0o600 });
   await rename(temporary, file);
 }
 

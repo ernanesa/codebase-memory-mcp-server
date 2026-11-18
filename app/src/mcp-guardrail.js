@@ -1,6 +1,7 @@
 import grpc from '@grpc/grpc-js';
 import protoLoader from '@grpc/proto-loader';
-import { createHash, timingSafeEqual } from 'node:crypto';
+import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
+import { rmSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -161,12 +162,16 @@ function safeSearchCandidate(candidate, evidence) {
   // A result can contain source, content, comments, documentation and arbitrary
   // backend fields. Do not forward them as model context. Symbol metadata and
   // provenance provide enough evidence for a deliberate follow-up snippet call.
-  for (const value of Object.values(candidate)) {
-    if (typeof value === 'string' && RETRIEVAL_INJECTION_PATTERN.test(value)) return null;
+  for (const [key, value] of Object.entries(candidate)) {
+    if (SEARCH_RESULT_FIELDS.has(key)) continue;
+    if (typeof value === 'string' && RETRIEVAL_INJECTION_PATTERN.test(value.replace(/[\u0000-\u001f\u007f-\u009f]/g, ' '))) return null;
   }
   const safe = {};
   for (const key of SEARCH_RESULT_FIELDS) {
     const value = boundedSearchValue(key, candidate[key]);
+    if (candidate[key] !== undefined && value === undefined && typeof candidate[key] === 'string' && RETRIEVAL_INJECTION_PATTERN.test(candidate[key].replace(/[\u0000-\u001f\u007f-\u009f]/g, ' '))) {
+      return null;
+    }
     if (value !== undefined) safe[key] = value;
   }
   const symbol = candidate.id ?? candidate.node_id ?? candidate.nodeId ?? candidate.qualified_name ?? candidate.name;
@@ -709,51 +714,28 @@ function resolveProjectAliasMatch(requestedProject, knownProjects) {
   return { project: null, ambiguous: false };
 }
 
+const TEST_PATH_PATTERN = /(?:\.(?:spec|test)\.[a-z0-9]+$|[._-]test\.[a-z0-9]+$|[^/\\]+_?test\.py$|test_[^/\\]+\.py$|[^/\\]+Tests?\.cs$|(?:^|[/\\])(?:__tests__|tests?)(?:[/\\]|$))/i;
+const TEST_QN_PATTERN = /(?:(?:^|[._])tests?(?:[._]|$)|\.Tests?\.|Tests?(?:\.|$)|Test\.[^.]*Tests)/i;
+const TEST_NAME_PATTERN = /(?:^test_|_test$|Tests?$)/i;
+
 export function isTestFileOrSymbol(item) {
   if (!item || typeof item !== 'object') return false;
   if (item.is_test === true) return true;
 
-  const paths = [
-    item.file_path,
-    item.filePath,
-    item.file,
-    item.path,
-    item.location
-  ].filter(s => typeof s === 'string' && s.length > 0);
-
-  for (const p of paths) {
-    if (
-      /\.spec\.[a-z0-9]+$/i.test(p) ||
-      /\.test\.[a-z0-9]+$/i.test(p) ||
-      /[._-]test\.[a-z0-9]+$/i.test(p) ||
-      /[^/\\]+test\.py$/i.test(p) ||
-      /[^/\\]+_test\.py$/i.test(p) ||
-      /test_[^/\\]+\.py$/i.test(p) ||
-      /[^/\\]+Tests?\.cs$/i.test(p) ||
-      /(^|[/\\])__tests__([/\\]|$)/i.test(p) ||
-      /(^|[/\\])tests?([/\\]|$)/i.test(p)
-    ) {
-      return true;
-    }
+  const rawPaths = [item.file_path, item.filePath, item.file, item.path, item.location];
+  let lastPath = '';
+  for (let i = 0; i < rawPaths.length; i++) {
+    const p = rawPaths[i];
+    if (typeof p !== 'string' || p.length === 0 || p === lastPath) continue;
+    lastPath = p;
+    if (TEST_PATH_PATTERN.test(p)) return true;
   }
 
   const qn = typeof item.qualified_name === 'string' ? item.qualified_name : (typeof item.qn === 'string' ? item.qn : '');
-  if (qn) {
-    if (
-      /(^|[._])tests?([._]|$)/i.test(qn) ||
-      /\.Test\./i.test(qn) ||
-      /\.Tests\./i.test(qn) ||
-      /Tests?(\.|$)/i.test(qn) ||
-      /Test\.[^.]*Tests/i.test(qn)
-    ) {
-      return true;
-    }
-  }
+  if (qn && TEST_QN_PATTERN.test(qn)) return true;
 
   const name = typeof item.name === 'string' ? item.name : '';
-  if (name && /(^test_|_test$|Tests?$)/i.test(name)) {
-    return true;
-  }
+  if (name && TEST_NAME_PATTERN.test(name)) return true;
 
   return false;
 }
@@ -811,28 +793,115 @@ export function pruneArchitecturePayload(payload) {
   return pruned;
 }
 
-export function sliceCodeSnippet(source) {
-  if (typeof source !== 'string' || !source) return source;
+const LICENSE_HEADER_KEYWORDS = /\b(?:license|copyright|all rights reserved|apache|mit|spdx-license-identifier)\b/i;
 
-  // 1. Remove license/boilerplate headers at the top of snippet (e.g. /* ... License ... */ or lines of //)
-  let cleaned = source.replace(/^\s*(?:\/\*[\s\S]*?(?:license|copyright|all rights reserved|apache|mit)[\s\S]*?\*\/\s*|\/\/[^\n]*(?:license|copyright)[\s\S]*?\n\s*)+/i, '');
-
-  // 2. Colapsa múltiplas linhas vazias consecutivas (máximo 1 linha em branco)
-  cleaned = cleaned.replace(/\n{3,}/g, '\n\n');
-
-  // 3. Remove trailing whitespace por linha
-  cleaned = cleaned.replace(/[ \t]+$/gm, '');
-
-  return cleaned.trim();
+function stripLeadingLicenseComments(source) {
+  let offset = 0;
+  const length = source.length;
+  while (offset < length) {
+    let cursor = offset;
+    while (cursor < length && (source[cursor] === ' ' || source[cursor] === '\t' || source[cursor] === '\r' || source[cursor] === '\n')) {
+      cursor += 1;
+    }
+    if (source.startsWith('/*', cursor)) {
+      const end = source.indexOf('*/', cursor + 2);
+      if (end === -1) break;
+      const block = source.slice(cursor, end + 2);
+      if (!LICENSE_HEADER_KEYWORDS.test(block)) break;
+      offset = end + 2;
+      continue;
+    }
+    if (source.startsWith('//', cursor)) {
+      let blockEnd = cursor;
+      let hasKeyword = false;
+      while (blockEnd < length && source.startsWith('//', blockEnd)) {
+        const lineEnd = source.indexOf('\n', blockEnd);
+        const nextEnd = lineEnd === -1 ? length : lineEnd + 1;
+        const line = source.slice(blockEnd, nextEnd);
+        if (LICENSE_HEADER_KEYWORDS.test(line)) hasKeyword = true;
+        blockEnd = nextEnd;
+        while (blockEnd < length && (source[blockEnd] === ' ' || source[blockEnd] === '\t' || source[blockEnd] === '\r')) {
+          blockEnd += 1;
+        }
+      }
+      if (!hasKeyword) break;
+      offset = blockEnd;
+      continue;
+    }
+    break;
+  }
+  return offset > 0 ? source.slice(offset) : source;
 }
 
-export function pruneSnippetObject(obj) {
+export function collapseMethodBodies(source) {
+  if (typeof source !== 'string' || !source) return source;
+  const lines = source.split('\n');
+  const out = [];
+  let depth = 0;
+  let collapsedAtDepth = 0;
+  for (const line of lines) {
+    const opens = (line.match(/\{/g) || []).length;
+    const closes = (line.match(/\}/g) || []).length;
+    if (collapsedAtDepth > 0) {
+      depth += opens - closes;
+      if (depth < collapsedAtDepth) {
+        collapsedAtDepth = 0;
+        out.push(line.replace(/^\s*/, match => `${match}/* ... */ `));
+      }
+      continue;
+    }
+    out.push(line);
+    const nextDepth = depth + opens - closes;
+    if (opens > closes && depth >= 1 && !/\b(?:class|interface|struct|namespace|enum|record)\b/.test(line)) {
+      collapsedAtDepth = nextDepth;
+    }
+    depth = nextDepth;
+  }
+  return out.join('\n');
+}
+
+export function sliceCodeSnippet(source, { maxLines = 0, skeletonOnly = false } = {}) {
+  if (typeof source !== 'string' || !source) return source;
+
+  // 1. Remove license/boilerplate headers at the top of snippet (linear scan without backtracking)
+  let cleaned = stripLeadingLicenseComments(source);
+
+  // 2. Opcionalmente colapsa corpos de métodos no modo skeleton
+  if (skeletonOnly) {
+    cleaned = collapseMethodBodies(cleaned);
+  }
+
+  // 3. Colapsa múltiplas linhas vazias consecutivas (máximo 1 linha em branco)
+  cleaned = cleaned.replace(/\n{3,}/g, '\n\n');
+
+  // 4. Remove trailing whitespace por linha
+  cleaned = cleaned.replace(/[ \t]+$/gm, '').trim();
+
+  // 5. Aplica teto opcional de linhas
+  if (Number.isInteger(maxLines) && maxLines > 0) {
+    const lines = cleaned.split('\n');
+    if (lines.length > maxLines) {
+      cleaned = `${lines.slice(0, maxLines).join('\n')}\n// ... [${lines.length - maxLines} linhas omitidas]`;
+    }
+  }
+
+  return cleaned;
+}
+
+export function pruneSnippetObject(obj, options = {}) {
   if (!obj || typeof obj !== 'object') return obj;
   const cleaned = {};
+  const includeTests = options.includeTests === true;
   for (const [k, v] of Object.entries(obj)) {
     if (UNUSED_AST_FIELDS.has(k)) continue;
     if (k === 'source' && typeof v === 'string') {
-      cleaned[k] = sliceCodeSnippet(v);
+      cleaned[k] = sliceCodeSnippet(v, options);
+      continue;
+    }
+    if ((k === 'neighbors' || k === 'callers' || k === 'callees') && Array.isArray(v)) {
+      cleaned[k] = v
+        .filter(item => includeTests || !isTestFileOrSymbol(item))
+        .map(item => pruneSnippetObject(item, options));
       continue;
     }
     cleaned[k] = v;
@@ -840,17 +909,17 @@ export function pruneSnippetObject(obj) {
   return cleaned;
 }
 
-export function pruneSnippetPayload(payload) {
+export function pruneSnippetPayload(payload, options = {}) {
   if (!payload || typeof payload !== 'object') return payload;
   if (Array.isArray(payload)) {
-    return payload.map(pruneSnippetObject);
+    return payload.map(item => pruneSnippetObject(item, options));
   }
-  const result = pruneSnippetObject(payload);
+  const result = pruneSnippetObject(payload, options);
   if (Array.isArray(result.results)) {
-    result.results = result.results.map(pruneSnippetObject);
+    result.results = result.results.map(item => pruneSnippetObject(item, options));
   }
   if (Array.isArray(result.suggestions)) {
-    result.suggestions = result.suggestions.map(pruneSnippetObject);
+    result.suggestions = result.suggestions.map(item => pruneSnippetObject(item, options));
   }
   return result;
 }
@@ -946,11 +1015,18 @@ export function mapFacadeRequest(params) {
     // Só aplica o filtro quando o cliente o informou explicitamente.
 
     // Limites adaptativos:
-    // Se a query for muito curta / ampla (<= 3 chars, ou sem filtros), limita para 10 para proteger a janela de contexto
+    // Se retrieval_mode foi informado sem limit explícito, dimensiona o lote do backend de acordo com o modo.
     const requestedLimit = Number(args.limit);
+    const retrievalMode = typeof args.retrieval_mode === 'string' ? args.retrieval_mode.trim().toLowerCase() : '';
     let limit = Number.isInteger(requestedLimit) && requestedLimit > 0 ? Math.min(50, requestedLimit) : 30;
-    if (args.limit == null && (rawQuery.length <= 3 || !label && !args.file_pattern)) {
-      limit = 15;
+    if (args.limit == null) {
+      if (retrievalMode === 'thorough') {
+        limit = 50;
+      } else if (retrievalMode === 'fast') {
+        limit = 16;
+      } else if (rawQuery.length <= 3 || !label && !args.file_pattern) {
+        limit = 15;
+      }
     }
 
     const mappedArgs = {
@@ -1083,7 +1159,7 @@ export function createMcpGuardrailHandlers(resolveAccess, { sharedSecret = SERVI
     queue.push({ ...data, createdAt: now });
   }
 
-  function resolvePendingCall(userId, toolName) {
+  function resolvePendingCall(userId, toolName, requestId = '') {
     if (!userId) return null;
     const queue = pendingCallsByUser.get(userId);
     if (!queue || queue.length === 0) return null;
@@ -1091,9 +1167,14 @@ export function createMcpGuardrailHandlers(resolveAccess, { sharedSecret = SERVI
     while (queue.length > 0 && now - queue[0].createdAt > 60_000) {
       queue.shift();
     }
-    const matchIndex = queue.findIndex(item => !toolName || item.toolName === toolName || item.originalTool === toolName || item.facadeTool === toolName);
-    if (matchIndex !== -1) {
-      return queue.splice(matchIndex, 1)[0];
+    if (queue.length === 0) return null;
+    if (requestId) {
+      const idIndex = queue.findIndex(item => item.requestId === requestId);
+      if (idIndex !== -1) return queue.splice(idIndex, 1)[0];
+    }
+    if (toolName) {
+      const matchIndex = queue.findIndex(item => item.toolName === toolName || item.originalTool === toolName || item.facadeTool === toolName);
+      return matchIndex !== -1 ? queue.splice(matchIndex, 1)[0] : null;
     }
     return queue.shift() || null;
   }
@@ -1111,54 +1192,56 @@ export function createMcpGuardrailHandlers(resolveAccess, { sharedSecret = SERVI
         const decision = authorizeToolCall(params, resolveAccess(userId));
         if (!decision.allowed) return callback(null, permissionDenied(decision.reason));
 
-        const requestParams = structuredClone(params);
-        if (decision.resolvedProject && requestParams.arguments && typeof requestParams.arguments === 'object') {
-          requestParams.arguments.project = decision.resolvedProject;
-        }
+        const projectMutated = Boolean(decision.resolvedProject && decision.resolvedProject !== params?.arguments?.project);
+        const requestParams = projectMutated && params.arguments && typeof params.arguments === 'object'
+          ? { ...params, arguments: { ...params.arguments, project: decision.resolvedProject } }
+          : params;
 
         const mapResult = mapFacadeRequest(requestParams);
-        const shouldMutate = mapResult.mapped || (decision.resolvedProject && decision.resolvedProject !== params?.arguments?.project);
+        const shouldMutate = mapResult.mapped || projectMutated;
+        const requestId = randomUUID();
+        const extraMeta = retrievalMetadata(params.arguments);
 
         if (shouldMutate) {
           const finalParams = mapResult.mapped ? mapResult.params : requestParams;
-          recordPendingCall(userId, {
+          const serializedArgs = JSON.stringify(finalParams.arguments || {});
+          const pendingMeta = {
+            requestId,
             toolName: mapResult.backendTool,
             facadeTool: mapResult.facadeTool || '',
             originalTool: params.name || '',
             resolvedProject: decision.resolvedProject || '',
-            callArgs: JSON.stringify(finalParams.arguments || {}),
-            ...retrievalMetadata(params.arguments)
-          });
+            callArgs: serializedArgs,
+            ...extraMeta
+          };
+          recordPendingCall(userId, pendingMeta);
           return callback(null, {
             mutated: Buffer.from(JSON.stringify(finalParams)),
-            metadata: structToProto({
-              toolName: mapResult.backendTool,
-              facadeTool: mapResult.facadeTool || '',
-              originalTool: params.name || '',
-              resolvedProject: decision.resolvedProject || '',
-              callArgs: JSON.stringify(finalParams.arguments || {}),
-              ...retrievalMetadata(params.arguments)
-            })
+            metadata: structToProto(pendingMeta)
           });
         }
 
-        recordPendingCall(userId, {
+        const serializedArgs = JSON.stringify(requestParams.arguments || {});
+        const pendingMeta = {
+          requestId,
           toolName: decision.toolName || '',
           facadeTool: '',
           originalTool: params.name || '',
           resolvedProject: decision.resolvedProject || '',
-          callArgs: JSON.stringify(requestParams.arguments || {}),
-          ...retrievalMetadata(params.arguments)
-        });
+          callArgs: serializedArgs,
+          ...extraMeta
+        };
+        recordPendingCall(userId, pendingMeta);
 
         callback(null, {
           pass: {},
           metadata: structToProto({
+            requestId,
             toolName: decision.toolName || '',
             originalTool: params.name || '',
             resolvedProject: decision.resolvedProject || '',
-            callArgs: JSON.stringify(requestParams.arguments || {}),
-            ...retrievalMetadata(params.arguments)
+            callArgs: serializedArgs,
+            ...extraMeta
           })
         });
       } catch (error) {
@@ -1179,8 +1262,8 @@ export function createMcpGuardrailHandlers(resolveAccess, { sharedSecret = SERVI
         const method = String(call.request.method || '');
         if (method === 'tools/call' && !access) return callback(null, permissionDenied('Credencial sem cadastro de acesso MCP.'));
 
-        if (method === 'tools/call' && (!metadata.callArgs || !metadata.originalTool || !metadata.toolName)) {
-          const pending = resolvePendingCall(metadata.userId, metadata.toolName);
+        if (method === 'tools/call') {
+          const pending = resolvePendingCall(metadata.userId, metadata.toolName, metadata.requestId);
           if (pending) {
             if (!metadata.toolName) metadata.toolName = pending.toolName;
             if (!metadata.originalTool) metadata.originalTool = pending.originalTool;
@@ -1235,8 +1318,10 @@ export function createMcpGuardrailHandlers(resolveAccess, { sharedSecret = SERVI
         }
 
         // Semantic LRU cache check for deterministic read operations
-        if (callArgs && !isError) {
-          const semKey = semanticCacheKey(effectiveTool, cacheArguments(callArgs, metadata), access, evidence);
+        const semKey = callArgs && !isError
+          ? semanticCacheKey(effectiveTool, cacheArguments(callArgs, metadata), access, evidence)
+          : null;
+        if (semKey) {
           const cachedBuffer = getCachedSemanticResponse(semKey, rawHash);
           if (cachedBuffer) {
             return callback(null, { mutated: cachedBuffer });
@@ -1246,11 +1331,15 @@ export function createMcpGuardrailHandlers(resolveAccess, { sharedSecret = SERVI
         let modified = false;
         let payload = result;
 
-        const detectedKind = detectMcpPayloadKind(result);
-        const isTrace = effectiveTool === 'trace_path' || effectiveTool === 'trace_symbol' || detectedKind === 'trace';
-        const isArch = effectiveTool === 'get_architecture' || detectedKind === 'architecture';
-        const isSnippet = effectiveTool === 'get_code_snippet' || effectiveTool === 'get_symbol_snippet' || effectiveTool === 'inspect_symbol' || detectedKind === 'snippet';
-        const isSearch = effectiveTool === 'code_search_surgical' || effectiveTool === 'search_graph' || detectedKind === 'search';
+        const knownTrace = effectiveTool === 'trace_path' || effectiveTool === 'trace_symbol';
+        const knownArch = effectiveTool === 'get_architecture';
+        const knownSnippet = effectiveTool === 'get_code_snippet' || effectiveTool === 'get_symbol_snippet' || effectiveTool === 'inspect_symbol';
+        const knownSearch = effectiveTool === 'code_search_surgical' || effectiveTool === 'search_graph';
+        const detectedKind = (knownTrace || knownArch || knownSnippet || knownSearch) ? null : detectMcpPayloadKind(result);
+        const isTrace = knownTrace || detectedKind === 'trace';
+        const isArch = knownArch || detectedKind === 'architecture';
+        const isSnippet = knownSnippet || detectedKind === 'snippet';
+        const isSearch = knownSearch || detectedKind === 'search';
 
         if (isTrace) {
           const includeTests = metadata.includeTests === 'true';
@@ -1269,7 +1358,12 @@ export function createMcpGuardrailHandlers(resolveAccess, { sharedSecret = SERVI
           payload = applyPayloadPruning(payload, pruneArchitecturePayload);
           modified = true;
         } else if (isSnippet) {
-          payload = applyPayloadPruning(payload, pruneSnippetPayload);
+          const snippetOptions = {
+            includeTests: metadata.includeTests === 'true',
+            skeletonOnly: callArgs?.skeleton_only === true,
+            maxLines: Number.isInteger(callArgs?.max_lines) && callArgs.max_lines > 0 ? callArgs.max_lines : 0
+          };
+          payload = applyPayloadPruning(payload, value => pruneSnippetPayload(value, snippetOptions));
           modified = true;
         } else if (isSearch) {
           const includeTests = metadata.includeTests === 'true';
@@ -1321,11 +1415,8 @@ export function createMcpGuardrailHandlers(resolveAccess, { sharedSecret = SERVI
         if (modified) {
           const mutatedBuffer = Buffer.from(JSON.stringify(payload));
           if (cacheKey && !isError) setCachedListProjectsResponse(cacheKey, mutatedBuffer, rawHash);
-          if (callArgs && ['code_search_surgical', 'search_graph', 'get_code_snippet', 'get_symbol_snippet', 'inspect_symbol', 'trace_symbol', 'trace_path', 'get_architecture'].includes(effectiveTool)) {
-            const semKey = semanticCacheKey(effectiveTool, cacheArguments(callArgs, metadata), access, evidence);
-            if (semKey && !isError) {
-              setCachedSemanticResponse(semKey, mutatedBuffer, rawHash);
-            }
+          if (semKey && !isError && ['code_search_surgical', 'search_graph', 'get_code_snippet', 'get_symbol_snippet', 'inspect_symbol', 'trace_symbol', 'trace_path', 'get_architecture'].includes(effectiveTool)) {
+            setCachedSemanticResponse(semKey, mutatedBuffer, rawHash);
           }
           return callback(null, { mutated: mutatedBuffer });
         }
@@ -1358,11 +1449,17 @@ export async function startMcpGuardrailServer(resolveAccess, address = '0.0.0.0:
     CheckRequest: handlers.checkRequest,
     CheckResponse: handlers.checkResponse
   });
+  if (typeof address === 'string' && address.startsWith('unix:')) {
+    const socketPath = address.slice(5);
+    if (socketPath) {
+      try { rmSync(socketPath, { force: true }); } catch {}
+    }
+  }
   server.boundPort = await new Promise((resolve, reject) => {
     server.bindAsync(address, grpc.ServerCredentials.createInsecure(), (error, port) => {
       if (error) reject(error);
-      else if (!port) reject(new Error(`Não foi possível abrir o guardrail MCP em ${address}.`));
-      else resolve(port);
+      else if (!port && !String(address).startsWith('unix:')) reject(new Error(`Não foi possível abrir o guardrail MCP em ${address}.`));
+      else resolve(port || address);
     });
   });
   return server;

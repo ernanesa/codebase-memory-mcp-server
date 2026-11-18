@@ -4,9 +4,10 @@ import { chmod, mkdir, readFile, readdir, rename, rm, rmdir, stat, unlink, write
 import { createReadStream } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { assertSafeSegment, createMutex, DEFAULT_TIMEZONE, DEFAULT_WORKSPACE_CRON, cronMatches, decryptWorkspaceToken, describeCron, encryptWorkspaceToken, generateMcpToken, gitAuthEnvironment, indexRepositoryArguments, loadCredentials, loadMcpUserStore, loadSecret, loadState, mcpTokenFingerprint, nextCronOccurrence, parseCronExpression, parseLastJsonLine, publicMcpUser, publicWorkspace, reconcileRepositoryProjects, removeMcpGatewayUserKey, run, safeChild, saveCredentials, saveMcpUserStore, saveSecret, saveState, setMcpGatewayUserKey, slugify, validateTimezone } from './lib.js';
+import { assertSafeSegment, createMutex, DEFAULT_TIMEZONE, DEFAULT_WORKSPACE_CRON, cronMatches, decryptWorkspaceToken, describeCron, encryptWorkspaceToken, generateMcpToken, gitAuthEnvironment, indexRepositoryArguments, loadCredentials, loadMcpUserStore, loadSecret, loadState, mcpTokenFingerprint, nextCronOccurrence, optimizeSqliteCacheDir, optimizeSqliteDatabase, parseCronExpression, parseLastJsonLine, publicMcpUser, publicWorkspace, reconcileRepositoryProjects, removeMcpGatewayUserKey, run, safeChild, saveCredentials, saveMcpUserStore, saveSecret, saveState, setMcpGatewayUserKey, slugify, validateTimezone } from './lib.js';
 import { clearSemanticCache, startMcpGuardrailServer } from './mcp-guardrail.js';
 import { projectEvidence, uniqueProjectNames } from './index-evidence.js';
+import { normalizeSemanticGraph } from './semantic-graph.js';
 import { gauge, increment, log as structuredLog, metricsText, observe } from './observability.js';
 import { createAdminAuth } from './auth.js';
 import { JOB_HISTORY_RETENTION_DAYS, JOB_LOG_MAX_CHARACTERS, loadJobHistory, paginateJobs, pruneJobHistory, recoverInterruptedJobs, saveJobHistory } from './job-history.js';
@@ -25,6 +26,7 @@ const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const PUBLIC_DIR = path.join(ROOT, 'public');
 const DATA_DIR = process.env.APP_DATA_DIR || '/data/app';
 const REPOSITORIES_DIR = process.env.CBM_ALLOWED_ROOT || '/data/repositories';
+const CACHE_DIR = process.env.CBM_CACHE_DIR || path.join(ROOT, '..', 'cache');
 const STATE_FILE = path.join(DATA_DIR, 'state.json');
 const JOB_HISTORY_FILE = path.join(DATA_DIR, 'jobs.json');
 const GITHUB_CREDENTIALS_FILE = path.join(DATA_DIR, 'secrets', 'github-credentials.json');
@@ -297,6 +299,8 @@ async function refreshRepositoryProjects({ force = false } = {}) {
 
 let evidenceRefreshCursor = 0;
 let evidenceRefreshRunning = false;
+const gitStatCache = new Map();
+
 async function refreshRepositoryEvidenceBatch() {
   if (evidenceRefreshRunning || state.repositories.length === 0) return;
   evidenceRefreshRunning = true;
@@ -308,6 +312,28 @@ async function refreshRepositoryEvidenceBatch() {
     for (let index = 0; index < selected.length; index += 3) {
       await Promise.all(selected.slice(index, index + 3).map(async item => {
         try {
+          const nowMs = Date.now();
+          const observedAt = new Date(nowMs).toISOString();
+          const [headStat, indexStat, rootStat] = await Promise.all([
+            stat(path.join(item.path, '.git', 'HEAD')).catch(() => null),
+            stat(path.join(item.path, '.git', 'index')).catch(() => null),
+            stat(item.path).catch(() => null)
+          ]);
+          const cachedStat = gitStatCache.get(item.path);
+          if (
+            headStat &&
+            cachedStat &&
+            nowMs - cachedStat.checkedAt < 60_000 &&
+            cachedStat.headMtimeMs === headStat.mtimeMs &&
+            cachedStat.indexMtimeMs === (indexStat?.mtimeMs ?? 0) &&
+            cachedStat.rootMtimeMs === (rootStat?.mtimeMs ?? 0) &&
+            item.currentCommit &&
+            item.currentWorktreeStatus
+          ) {
+            // Fast-path: .git/HEAD, .git/index and worktree root mtimes unchanged within 60s window.
+            item.worktreeObservedAt = observedAt;
+            return;
+          }
           const [commitResult, statusResult] = await Promise.all([
             run('git', ['-C', item.path, 'rev-parse', 'HEAD']),
             run('git', ['-C', item.path, 'status', '--porcelain=v1', '--untracked-files=normal'])
@@ -315,14 +341,23 @@ async function refreshRepositoryEvidenceBatch() {
           const currentCommit = commitResult.stdout.trim();
           if (!/^[a-f0-9]{40,64}$/i.test(currentCommit)) throw new Error('Invalid revision');
           const currentWorktreeStatus = statusResult.stdout ? 'dirty' : 'clean';
-          const observedAt = new Date().toISOString();
-          // Persist the observation timestamp even when the revision is unchanged.
-          changed = true;
+          if (item.currentCommit !== currentCommit || item.currentWorktreeStatus !== currentWorktreeStatus || !item.worktreeObservedAt) {
+            changed = true;
+          }
           item.currentCommit = currentCommit;
           item.currentWorktreeStatus = currentWorktreeStatus;
           item.worktreeObservedAt = observedAt;
+          if (headStat) {
+            gitStatCache.set(item.path, {
+              headMtimeMs: headStat.mtimeMs,
+              indexMtimeMs: indexStat?.mtimeMs ?? 0,
+              rootMtimeMs: rootStat?.mtimeMs ?? 0,
+              checkedAt: nowMs
+            });
+          }
         } catch {
           // A failed observation cannot support a freshness claim.
+          gitStatCache.delete(item.path);
           if (item.worktreeObservedAt || item.currentWorktreeStatus || item.currentCommit) changed = true;
           delete item.worktreeObservedAt;
           delete item.currentWorktreeStatus;
@@ -545,12 +580,13 @@ async function commitWorkspaceChange(nextState, changeGatewayConfig) {
     changeGatewayConfig(nextConfig);
     await agentGatewayConfig(nextConfig);
     try {
-      await saveState(STATE_FILE, nextState);
+      await stateMutex(() => saveState(STATE_FILE, nextState));
     } catch (error) {
       await agentGatewayConfig(previousConfig).catch(rollbackError => console.error('Falha ao restaurar configuração do AgentGateway:', rollbackError));
       throw error;
     }
     state = nextState;
+    clearSemanticCache();
   } finally {
     mcpUserMutation = false;
   }
@@ -580,12 +616,13 @@ async function provisionWorkspaceMcpTokens() {
     }
     if (JSON.stringify(nextConfig) !== JSON.stringify(previousConfig)) await agentGatewayConfig(nextConfig);
     if (issuedTokens.size) {
-      try { await saveState(STATE_FILE, nextState); }
+      try { await stateMutex(() => saveState(STATE_FILE, nextState)); }
       catch (error) {
         await agentGatewayConfig(previousConfig).catch(rollbackError => console.error('Falha ao restaurar configuração do AgentGateway:', rollbackError));
         throw error;
       }
       state = nextState;
+      clearSemanticCache();
     }
   } finally {
     mcpUserMutation = false;
@@ -878,6 +915,22 @@ async function indexRepository(item, log) {
     delete item.indexPendingRetries;
     delete item.indexRetryExhausted;
   }
+  if (item.project) {
+    optimizeSqliteDatabase(path.join(CACHE_DIR, `${item.project}.db`));
+  }
+  for (const graphRelPath of ['.cbm/semantic-graph.json', 'semantic-graph.json']) {
+    try {
+      const rawGraph = await readFile(path.join(item.path, graphRelPath), 'utf8');
+      const normalizedGraph = normalizeSemanticGraph(JSON.parse(rawGraph), {
+        workspace: item.path,
+        project: item.project || item.id
+      });
+      item.semanticGraphEdges = normalizedGraph.statistics.acceptedRelations;
+      break;
+    } catch {
+      // Optional semantic graph artifact
+    }
+  }
   clearSemanticCache();
   return { fresh: cleanRevision, changedDuringIndex };
 }
@@ -889,26 +942,29 @@ function runWorkspaceIndex(selectedWorkspace) {
     job.totalRepositories = repositories.length;
     job.completedRepositories = 0;
     const failures = [];
-    for (const item of repositories) {
-      const repositoryLock = `${item.workspaceId}/${item.id}`;
-      if (locks.has(repositoryLock)) {
-        log(`${item.fullName}: ignorado porque já existe uma operação em andamento.\n`);
-      } else {
-        locks.add(repositoryLock);
-        item.activeJobId = job.id;
-        log(`\nIndexando ${item.fullName}...\n`);
-        try {
-          await indexRepository(item, log);
-        } catch (error) {
-          item.status = 'error';
-          failures.push(`${item.fullName}: ${error.message}`);
-          log(`${item.fullName}: ${error.message}\n`);
-        } finally {
-          locks.delete(repositoryLock);
+    for (let index = 0; index < repositories.length; index += REPOSITORY_SYNC_CONCURRENCY) {
+      const batch = repositories.slice(index, index + REPOSITORY_SYNC_CONCURRENCY);
+      await Promise.all(batch.map(async item => {
+        const repositoryLock = `${item.workspaceId}/${item.id}`;
+        if (locks.has(repositoryLock)) {
+          log(`${item.fullName}: ignorado porque já existe uma operação em andamento.\n`);
+        } else {
+          locks.add(repositoryLock);
+          item.activeJobId = job.id;
+          log(`\nIndexando ${item.fullName}...\n`);
+          try {
+            await indexRepository(item, log);
+          } catch (error) {
+            item.status = 'error';
+            failures.push(`${item.fullName}: ${error.message}`);
+            log(`${item.fullName}: ${error.message}\n`);
+          } finally {
+            locks.delete(repositoryLock);
+          }
         }
-      }
-      job.completedRepositories += 1;
-      job.progress = Math.round(job.completedRepositories / repositories.length * 100);
+        job.completedRepositories += 1;
+        job.progress = Math.round(job.completedRepositories / repositories.length * 100);
+      }));
       await persist();
     }
     if (failures.length) throw new Error(`${failures.length} repositório(s) falharam durante a indexação.`);
