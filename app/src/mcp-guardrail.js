@@ -460,7 +460,9 @@ export const FACADE_TOOL_DEFINITIONS = [
       properties: {
         project: { type: 'string', description: 'Nome do projeto/repositório indexado.' },
         symbol: { type: 'string', description: 'Nome do símbolo ou qualified_name.' },
-        include_neighbors: { type: 'boolean', description: 'Se deve incluir nós vizinhos no grafo.' }
+        include_neighbors: { type: 'boolean', description: 'Se deve incluir nós vizinhos no grafo.' },
+        skeleton_only: { type: 'boolean', description: 'Retorna apenas assinatura e estrutura sem corpo completo do método para economizar tokens.' },
+        max_lines: { type: 'number', minimum: 1, description: 'Limite opcional de linhas do snippet retornado.' }
       },
       required: ['project', 'symbol']
     }
@@ -473,7 +475,9 @@ export const FACADE_TOOL_DEFINITIONS = [
       properties: {
         project: { type: 'string', description: 'Nome do projeto/repositório indexado.' },
         symbol: { type: 'string', description: 'Nome do símbolo, método ou função a inspecionar.' },
-        include_neighbors: { type: 'boolean', description: 'Se deve incluir referências vizinhas no grafo (padrão: true).' }
+        include_neighbors: { type: 'boolean', description: 'Se deve incluir referências vizinhas no grafo (padrão: true).' },
+        skeleton_only: { type: 'boolean', description: 'Retorna apenas assinatura e estrutura sem corpo completo do método para economizar tokens.' },
+        max_lines: { type: 'number', minimum: 1, description: 'Limite opcional de linhas do snippet retornado.' }
       },
       required: ['project', 'symbol']
     }

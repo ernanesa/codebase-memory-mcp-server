@@ -118,6 +118,15 @@
             "include_neighbors": {
               "type": "boolean",
               "description": "Se deve incluir nós vizinhos no grafo."
+            },
+            "skeleton_only": {
+              "type": "boolean",
+              "description": "Retorna apenas assinatura e estrutura sem corpo completo do método para economizar tokens."
+            },
+            "max_lines": {
+              "type": "number",
+              "minimum": 1,
+              "description": "Limite opcional de linhas do snippet retornado."
             }
           },
           "required": [
@@ -143,6 +152,15 @@
             "include_neighbors": {
               "type": "boolean",
               "description": "Se deve incluir referências vizinhas no grafo (padrão: true)."
+            },
+            "skeleton_only": {
+              "type": "boolean",
+              "description": "Retorna apenas assinatura e estrutura sem corpo completo do método para economizar tokens."
+            },
+            "max_lines": {
+              "type": "number",
+              "minimum": 1,
+              "description": "Limite opcional de linhas do snippet retornado."
             }
           },
           "required": [
